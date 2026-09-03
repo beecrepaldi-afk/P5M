@@ -140,7 +140,6 @@ class VrStreamActivity: ComponentActivity()
 	private var lastDropped = 0L
 	private var preferredDeviceId: Int? = null
 	private var rumble: Rumble? = null
-	/** Fontes de evento ja anotadas no diario, para nao repetir a cada toque. */
 	/**
 	 * O touchpad do controle. Mesma classe do modo janela, de proposito: dois
 	 * tratamentos para o mesmo botao acabariam divergindo.
@@ -769,6 +768,191 @@ class VrStreamActivity: ComponentActivity()
 			KeyEvent.ACTION_UP -> setTouchpadPressed(false)
 		}
 		return true
+	}
+
+	/**
+	 * Registra toda tecla de gamepad que entra, antes de qualquer tratamento.
+	 *
+	 * O log de teclas sem mapeamento nao bastava: ele so ve o que o chiaki
+	 * recusa, e o que o chiaki aceita -- justamente o que precisamos conferir
+	 * contra o que o controle deveria emitir -- passava invisivel. Sao poucos
+	 * eventos, um por toque, entao nao ha o que limitar.
+	 */
+	private fun logIncomingKey(event: KeyEvent)
+	{
+		if(event.action != KeyEvent.ACTION_DOWN || event.repeatCount > 0)
+			return
+		trace("Key received: ${KeyEvent.keyCodeToString(event.keyCode)} " +
+				"(${event.keyCode}) from '${event.device?.name}' source=0x${event.source.toString(16)}")
+	}
+
+	/**
+	 * Registra no logcat e no diário em arquivo.
+	 *
+	 * O diário existe porque o buffer do logcat gira rápido demais em sessão: o
+	 * chiaki escreve centenas de linhas por segundo, e o que aconteceu durante o
+	 * jogo já sumiu quando a tela de diagnóstico abre depois.
+	 */
+	private fun trace(message: String) = Trace.log(this, message)
+
+	/**
+	 * Registra tecla de gamepad que ninguem consumiu.
+	 *
+	 * Serve para descobrir o que os botoes extras de um controle emitem sem ter
+	 * o hardware em maos: aperte o botao, leia o keycode no logcat, mapeie com
+	 * certeza em vez de adivinhar.
+	 */
+	private fun logUnmappedKey(event: KeyEvent)
+	{
+		if(event.action != KeyEvent.ACTION_DOWN)
+			return
+		if(event.source and InputDevice.SOURCE_GAMEPAD != InputDevice.SOURCE_GAMEPAD &&
+				event.source and InputDevice.SOURCE_JOYSTICK != InputDevice.SOURCE_JOYSTICK)
+			return
+		Log.i(TAG, "Unmapped gamepad key: keyCode=${event.keyCode} " +
+				"(${KeyEvent.keyCodeToString(event.keyCode)}) from '${event.device?.name}'")
+	}
+
+	/**
+	 * Lista o que o sistema considera controle no momento em que o stream sobe.
+	 *
+	 * Responde de uma vez a pergunta que nenhuma teoria resolve: o controle
+	 * esta pareado com o headset (e passa por aqui) ou com o console (e nunca
+	 * chega)? Se a lista vier vazia, o input nao e nosso -- e o modo de ajuste
+	 * jamais vai responder, por mais correto que o codigo esteja.
+	 */
+	private fun logInputDevices()
+	{
+		val ids = InputDevice.getDeviceIds()
+		val named = mutableListOf<Int>()
+		var gamepads = 0
+		for(id in ids)
+		{
+			val device = InputDevice.getDevice(id) ?: continue
+			val isGamepad = device.sources and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD ||
+					device.sources and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
+			if(!isGamepad)
+			{
+				// O touchpad do DualSense entra como dispositivo separado, e
+				// nao se declara gamepad. Contando so gamepad, ele era
+				// invisivel no diario -- e a ausencia parecia prova de que o
+				// controle nao mandava nada, quando mandava por outra porta.
+				if(device.sources and (InputDevice.SOURCE_MOUSE or
+								InputDevice.SOURCE_TOUCHPAD or
+								InputDevice.SOURCE_TOUCHSCREEN) != 0)
+					trace("Pointer device '${device.name}' id=$id " +
+							"sources=0x${device.sources.toString(16)}")
+				continue
+			}
+			gamepads++
+			// Os controles Touch do headset entram sem nome de HID, no formato
+			// "Device 0x...". Um gamepad pareado se identifica.
+			if(!device.name.startsWith("Device 0x"))
+				named.add(id)
+
+			// hasKeys responde o que o driver realmente expoe. Se L3 e R3 vierem
+			// false, o acorde do modo de ajuste e impossivel neste controle e o
+			// problema nao esta no codigo que o trata.
+			val keys = device.hasKeys(
+				KeyEvent.KEYCODE_BUTTON_THUMBL,
+				KeyEvent.KEYCODE_BUTTON_THUMBR,
+				KeyEvent.KEYCODE_BUTTON_A,
+				KeyEvent.KEYCODE_BUTTON_MODE
+			)
+			// Quais das teclas candidatas ao touchpad este driver expoe. Se
+			// vierem todas false e o clique tambem nao aparecer como ponteiro,
+			// o controle nao entrega esse botao e nao ha o que mapear.
+			val extras = device.hasKeys(*TOUCHPAD_KEYCODES.toIntArray())
+			val presentes = TOUCHPAD_KEYCODES.filterIndexed { i, _ -> extras[i] }
+					.joinToString(",") { KeyEvent.keyCodeToString(it) }
+			trace("Gamepad '${device.name}' id=$id sources=0x${device.sources.toString(16)} " +
+					"L3=${keys[0]} R3=${keys[1]} Cross=${keys[2]} PS=${keys[3]} " +
+					"eixos=${device.motionRanges.size} " +
+					"touchpad keys=${if(presentes.isEmpty()) "none" else presentes}")
+		}
+		trace("Input devices: ${ids.size} in total, $gamepads gamepad(s)")
+
+		// Nomeado ganha de anonimo, e o primeiro nomeado ganha dos demais.
+		preferredDeviceId = named.firstOrNull()
+		if(preferredDeviceId != null)
+			trace("Sticks taken from '${InputDevice.getDevice(preferredDeviceId!!)?.name}' " +
+					"(id=$preferredDeviceId); the others are ignored for axes")
+		else
+			trace("No named gamepad; accepting axes from all of them")
+		if(gamepads == 0)
+			trace("No gamepad visible to the app: the controller is probably " +
+					"paired with the console instead of the headset")
+	}
+
+	/**
+	 * Confirma que a etiqueta do FrameSync chegou ao APK.
+	 *
+	 * Lida do próprio manifesto empacotado, e não de uma constante nossa: uma
+	 * constante diria o que eu quis, e o que interessa é o que foi instalado.
+	 * Sem esta linha, "liguei o FrameSync" e "achei que liguei" ficariam
+	 * indistinguíveis — que é exatamente o erro que a linha do filtro
+	 * automático cometeu por semanas.
+	 *
+	 * Isto confirma o pedido, não o atendimento: se o Horizon OS desta versão
+	 * honra a etiqueta é outra coisa, e quem responde é o contador de latência
+	 * do painel.
+	 */
+	private fun logFrameSync()
+	{
+		val declared = try
+		{
+			packageManager.getApplicationInfo(packageName, PackageManager.GET_META_DATA)
+				.metaData?.getBoolean("com.oculus.enable_frame_sync", false) ?: false
+		}
+		catch(e: Exception)
+		{
+			false
+		}
+		Log.i(TAG, "FrameSync requested in the manifest: $declared")
+	}
+
+	/**
+	 * A zona morta saiu daqui.
+	 *
+	 * Ela vivia nesta activity, com um número fixo de 10% escolhido a partir de
+	 * um controle só. Agora é medida por controle na tela de calibração e
+	 * aplicada dentro do `StreamInput` (patch 0019), que é o único ponto por
+	 * onde os dois modos passam -- o imersivo tinha zona morta e o modo janela
+	 * não tinha nenhuma, com o mesmo controle gasto andando sozinho num e não
+	 * no outro.
+	 *
+	 * Aplicar aqui também faria a conta duas vezes: a segunda reescala comeria
+	 * mais um pedaço do curso, e o analógico ficaria curto sem nada na tela
+	 * explicando por quê.
+	 */
+
+	/**
+	 * Amostra o estado que sai daqui para o console.
+	 *
+	 * Uma linha por segundo, no maximo: serve para separar "o botao nao chegou
+	 * ao app" de "chegou, foi enviado, e o console ignorou" -- que sao problemas
+	 * em lados opostos da rede.
+	 */
+	private var lastStateLine: String? = null
+
+	private fun logControllerState(state: ControllerState)
+	{
+		val now = SystemClock.elapsedRealtime()
+		if(now - lastStateLogMs < STATE_LOG_INTERVAL_MS)
+			return
+		// toLong antes do toString: buttons e UInt, e a sobrecarga com radix
+		// nos tipos sem sinal ainda e experimental no Kotlin desta build.
+		val linha = "State -> console: buttons=0x${state.buttons.toLong().toString(16)} " +
+				"L2=${state.l2State} R2=${state.r2State} " +
+				"LX=${state.leftX} LY=${state.leftY} RX=${state.rightX} RY=${state.rightY}"
+		// Uma linha por segundo com o controle parado enche o diário de zeros e
+		// empurra para fora justamente o que se foi ler. O que interessa é que o
+		// estado *mudou*; parado, uma linha só já disse tudo.
+		if(linha == lastStateLine)
+			return
+		lastStateLogMs = now
+		lastStateLine = linha
+		trace(linha)
 	}
 
 	override fun onWindowFocusChanged(hasFocus: Boolean)
