@@ -97,6 +97,11 @@ panel would pop open mid-fight. If that combination gets in your way, **Settings
 chord** in the launcher switches it to plain L3 + R3, or to holding both sticks
 for a second.
 
+To **end the session**, open that panel and hold Circle for a second. Closing
+the app from the system menu works too, but it kills the process without
+telling the console, and then your PS5 spends a while thinking Remote Play is
+still in use.
+
 ### Pair your controller with the headset, not with the console
 
 This is the thing that trips up almost everyone. A DualSense paired to the PS5 is invisible

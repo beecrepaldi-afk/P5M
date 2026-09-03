@@ -103,6 +103,13 @@ class VrStreamActivity: ComponentActivity()
 		private const val TOUCHPAD_CLICK_MS = 80L
 
 		/**
+		 * Quanto tempo o Circle precisa ficar apertado para encerrar a sessao.
+		 * Um segundo: longe de um toque, perto o bastante para nao parecer que o
+		 * botao nao respondeu.
+		 */
+		private const val QUIT_HOLD_MS = 1000L
+
+		/**
 		 * Teclas que valem como clique do touchpad do DualSense.
 		 *
 		 * O chiaki-ng nao mapeia o touchpad em gamepad nenhum: a constante
@@ -278,6 +285,7 @@ class VrStreamActivity: ComponentActivity()
 	private var thumbLDown = false
 	private var thumbRDown = false
 	private var r1Down = false
+	private var quitArmed = false
 
 	override fun onCreate(savedInstanceState: Bundle?)
 	{
@@ -1152,6 +1160,56 @@ class VrStreamActivity: ComponentActivity()
 	 * primeiro ja foi encaminhado como pressionado. Sem este desfazer, o estado
 	 * do console fica com L3 (0x400) ou R3 (0x800) ligado indefinidamente.
 	 */
+	/**
+	 * Circle dentro do painel: solta fecha o painel, segurar encerra a sessao.
+	 *
+	 * Encerrar precisava existir. Nao havia saida nenhuma no modo imersivo: a
+	 * unica forma era o botao do sistema, que mata o processo pelo lado de fora
+	 * -- e matar o processo nao manda Disconnect nenhum ao console, que segue
+	 * achando que o Remote Play esta em uso. O `Remote is already in use` da
+	 * proxima tentativa nascia ai.
+	 *
+	 * Segurar, e nao um botao proprio, porque o painel ja usa todos: dez botoes
+	 * para dez ajustes. E porque encerrar por engano custa a sessao inteira, o
+	 * que um toque acidental nao pode poder fazer.
+	 */
+	private fun handleQuitHold(event: KeyEvent): Boolean
+	{
+		if(event.action == KeyEvent.ACTION_DOWN)
+		{
+			// repeatCount > 0 e a repeticao automatica do sistema, e nao um novo
+			// aperto: agendar de novo a cada uma adiaria o encerramento para
+			// sempre.
+			if(event.repeatCount == 0)
+			{
+				quitArmed = true
+				handler.postDelayed(quitTick, QUIT_HOLD_MS)
+			}
+			return true
+		}
+		if(event.action == KeyEvent.ACTION_UP)
+		{
+			handler.removeCallbacks(quitTick)
+			// O soltar segue para o console mesmo com o painel aberto: quem
+			// apertou Circle fora do painel e soltou dentro dele deixaria o
+			// botao presa la do outro lado. Mesma armadilha que prendeu o L3.
+			input?.dispatchKeyEvent(event)
+			if(quitArmed)
+			{
+				quitArmed = false
+				adjustMode = false
+			}
+		}
+		return true
+	}
+
+	private val quitTick = Runnable {
+		quitArmed = false
+		trace("Ending the session from the tuning panel")
+		adjustMode = false
+		finish()
+	}
+
 	private fun releaseChordButtons()
 	{
 		val streamInput = input ?: return
@@ -1170,6 +1228,8 @@ class VrStreamActivity: ComponentActivity()
 		// soltar foi engolido aqui. Foi o que aconteceu com o L3 do acorde --
 		// ele ficou preso, e L3 preso e corrida ou mira travada na maior parte
 		// dos jogos.
+		if(event.keyCode == KeyEvent.KEYCODE_BUTTON_B)
+			return handleQuitHold(event)
 		if(event.action == KeyEvent.ACTION_UP)
 		{
 			input?.dispatchKeyEvent(event)
@@ -1312,8 +1372,6 @@ class VrStreamActivity: ComponentActivity()
 				adjustMode = false
 				clickTouchpad()
 			}
-			KeyEvent.KEYCODE_BUTTON_B -> // Circle: sair do modo de ajuste
-				adjustMode = false
 			else -> return true
 		}
 		applyScreenParams()
@@ -1473,7 +1531,7 @@ class VrStreamActivity: ComponentActivity()
 					"3D strength — ${(qualityPrefs.stereoStrength * 100).toInt()}%"
 				else "3D is off (turn it on in the launcher)",
 			"PS" to "click the touchpad (map, inventory) and close this",
-			"Circle" to "leave tuning mode"
+			"Circle" to "close this  ·  hold it to end the session"
 		)
 
 		var y = 178f

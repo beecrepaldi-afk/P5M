@@ -594,6 +594,13 @@ aqui antes de procurar longe:
    propósito: ele lista títulos de commit, que são em português por contrato
    deste projeto. Quem cortar uma tag escreve o "o que mudou" à mão, em inglês.
 
+29. **Segurar Circle no painel encerra a sessão.** Não havia saída nenhuma no
+   modo imersivo: a única forma era o botão do sistema, que mata o processo
+   pelo lado de fora, sem mandar Disconnect. O console seguia achando que o
+   Remote Play estava em uso, e o `Remote is already in use` da tentativa
+   seguinte nascia daí. Segurar, e não um botão próprio, porque o painel já
+   usa os dez que tem, e porque encerrar por engano custa a sessão inteira.
+
 ## Onde as coisas estão paradas
 
 Aberto, em ordem de quanto incomoda:
