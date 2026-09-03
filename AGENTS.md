@@ -587,6 +587,13 @@ aqui antes de procurar longe:
    desligado. Ou seja, o `glDrawBuffers` explícito do build 128 **ainda não foi
    testado**: o caminho com shader na janela continua sem confirmação.
 
+28. **A página de releases é em inglês, escrita à mão.** É a primeira coisa que
+   alguém de fora lê, antes até do README. O corpo dos dois releases (o rolante
+   `dev` e o versionado por tag) vive no workflow, em inglês e em voz de gente,
+   sem travessão. O `generate_release_notes` saiu do release versionado de
+   propósito: ele lista títulos de commit, que são em português por contrato
+   deste projeto. Quem cortar uma tag escreve o "o que mudou" à mão, em inglês.
+
 ## Onde as coisas estão paradas
 
 Aberto, em ordem de quanto incomoda:

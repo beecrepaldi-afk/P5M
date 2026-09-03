@@ -195,6 +195,10 @@ jobs:
 
       # Release definitivo, so em tag. Fica na lista de releases para sempre,
       # com o APK daquela versao exata anexado.
+      #
+      # Sem generate_release_notes: ele lista os titulos dos commits, que sao em
+      # portugues por contrato. A pagina de releases e a primeira coisa que
+      # alguem de fora le, e ela e em ingles.
       - name: Publicar release versionado
         if: steps.version.outputs.tagged == 'true'
         uses: softprops/action-gh-release@v2
@@ -202,7 +206,34 @@ jobs:
           name: P5M ${{ steps.version.outputs.version }}
           files: p5m-${{ steps.version.outputs.version }}.apk
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          body: |
+            P5M **${{ steps.version.outputs.version }}**, a tagged release.
+
+            ## Installing
+
+            Open this page in the Quest browser and install
+            `p5m-${{ steps.version.outputs.version }}.apk`. No PC needed. From a
+            PC: `adb install -r p5m-${{ steps.version.outputs.version }}.apk`.
+
+            It shows up in your library under **Unknown Sources**, as "P5M".
+
+            ## Before you start
+
+            **Pair your controller with the headset, not with the console.** A
+            DualSense paired to your PS5 is invisible to the Quest, so the app
+            gets no input and looks broken.
+
+            While you play, **L3 + R3 + R1** opens the settings panel. The same
+            chord closes it, and the launcher can change it.
+
+            ## When something goes wrong
+
+            Open the app and hit **Report a problem**.
+
+            ## Supporting it
+
+            P5M is free and the source is open. If you want to keep it moving:
+            <https://patreon.com/gblandro>
 
       # O release rolante acumularia um APK versionado por push. Limpa os
       # antigos antes de anexar o novo, para a pagina ficar com exatamente dois
@@ -228,44 +259,56 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: dev
-          name: P5M - build mais recente
+          name: Latest build
           prerelease: true
           files: |
             p5m.apk
             p5m-${{ steps.version.outputs.version }}.apk
           fail_on_unmatched_files: true
           body: |
-            Build de desenvolvimento **${{ steps.version.outputs.version }}**,
-            gerado automaticamente a cada push. Para versoes estaveis, veja a
-            lista de releases.
+            This is the newest development build, **${{ steps.version.outputs.version }}**.
+            It is rebuilt on every push, so it moves fast and it can break.
 
-            **Commit:** ${{ github.sha }}
+            Built from commit ${{ github.sha }}.
 
-            ### Instalar
+            ## Installing
 
-            Baixe pelo navegador do proprio Quest e instale direto no
-            headset -- nao precisa de PC. Dois arquivos, mesmo conteudo:
+            Open this page in the Quest browser and install the download. No PC
+            needed. Both files below are the same build:
 
-            - `p5m-${{ steps.version.outputs.version }}.apk` -- nome com a
-              versao, para saber depois qual e qual na pasta de downloads.
-            - `p5m.apk` -- nome fixo, para quem quiser sempre a mesma URL.
+            - `p5m.apk` keeps the same name and the same link forever, so you
+              can bookmark it.
+            - `p5m-${{ steps.version.outputs.version }}.apk` carries the version
+              in the name, which helps when you have a few of them sitting in
+              your downloads folder.
 
-            Pelo PC, se preferir:
+            From a PC, if you have one handy:
 
             ```
             adb install -r p5m.apk
             ```
 
-            Aparece na biblioteca do Quest em **Fontes desconhecidas**, como
-            "P5M".
+            It shows up in your library under **Unknown Sources**, as "P5M".
 
-            ### Antes de abrir
+            ## Before you start
 
-            Pareie o controle: chave de modo em "D", Home para ligar, segure
-            Star por 3 s, e pareie pelo Bluetooth do Quest.
+            **Pair your controller with the headset, not with the console.** A
+            DualSense that is paired to your PS5 is invisible to the Quest, so
+            the app gets no input at all and looks broken. Put the pad in
+            pairing mode and add it from the Quest Bluetooth settings.
 
-            ### Se algo falhar
+            While you play, **L3 + R3 + R1** opens the settings panel: screen
+            size, distance, sharpness, passthrough, 3D. The same chord closes
+            it, and you can change the chord in the launcher.
 
-            ```
-            adb logcat -v time P5MVR:V Chiaki:V AndroidRuntime:E DEBUG:E *:S
-            ```
+            ## When something goes wrong
+
+            Open the app and hit **Report a problem**. It packs up what
+            happened and opens a pre-filled issue in the browser. Say what you
+            were doing and send it. That is by far the most useful thing you
+            can do for this project.
+
+            ## Supporting it
+
+            P5M is free and the source is open. If you want to keep it moving:
+            <https://patreon.com/gblandro>
