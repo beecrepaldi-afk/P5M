@@ -274,6 +274,18 @@ class StreamQualityPrefs(context: Context)
 		get() = prefs.getBoolean(KEY_HAPTIC_RUMBLE, false)
 		set(value) { prefs.edit().putBoolean(KEY_HAPTIC_RUMBLE, value).apply() }
 
+	/**
+	 * Qual acorde abre o painel de ajustes dentro do jogo.
+	 *
+	 * Virou escolha porque L3+R3 nao e um atalho livre: ha jogo que usa os dois
+	 * cliques de analogico ao mesmo tempo, e nesse jogo o painel abriria no meio
+	 * de uma acao. Nao existe combinacao que nenhum jogo use, entao o certo e
+	 * deixar quem esta jogando decidir qual atrapalha menos no que ele joga.
+	 */
+	var tuningChord: Int
+		get() = prefs.getInt(KEY_CHORD, CHORD_L3_R3_R1).coerceIn(0, CHORD_NAMES.size - 1)
+		set(value) { prefs.edit().putInt(KEY_CHORD, value).apply() }
+
 	/** Opacidade do passthrough: abaixo de 1.0 escurece o quarto. */
 	var passthroughOpacity: Float
 		get() = prefs.getFloat(KEY_PT_OPACITY, 1.0f).coerceIn(0.1f, 1.0f)
@@ -295,6 +307,7 @@ class StreamQualityPrefs(context: Context)
 		private const val KEY_TONE_MAP = "tone_mapped"
 		private const val KEY_SHARPNESS = "layer_sharpness"
 		private const val KEY_PT_OPACITY = "passthrough_opacity"
+		private const val KEY_CHORD = "tuning_chord"
 		private const val KEY_HAPTIC_RUMBLE = "haptic_rumble"
 		private const val KEY_STEREO = "stereo_mode"
 		private const val KEY_SYNTH_3D = "synthetic_stereo"
@@ -315,6 +328,19 @@ class StreamQualityPrefs(context: Context)
 		private const val KEY_SPATIAL = "spatial_audio"
 		private const val KEY_BRIGHTNESS = "video_brightness"
 		private const val KEY_EXTRAPOLATION = "frame_extrapolation"
+
+		/** Os tres acordes possiveis para abrir o painel de ajustes. */
+		const val CHORD_L3_R3 = 0
+		const val CHORD_L3_R3_R1 = 1
+		const val CHORD_HOLD_L3_R3 = 2
+		val CHORD_NAMES = listOf("L3 + R3", "L3 + R3 + R1", "hold L3 + R3")
+
+		/**
+		 * Quanto tempo os dois analogicos precisam ficar apertados no acorde de
+		 * segurar. Setecentos milissegundos: bem acima do clique acidental e de
+		 * qualquer toque de jogo, e curto o bastante para nao parecer travado.
+		 */
+		const val CHORD_HOLD_MS = 700L
 
 		const val DEFAULT_BITRATE = 25000
 

@@ -172,6 +172,11 @@ class LauncherActivity: Activity()
 			Log.i(TAG, "Spatial audio: ${prefs.spatialAudio} "
 					+ "(${StreamQualityPrefs.SPATIAL_NAMES[prefs.spatialAudio]})")
 		})
+		coluna.addView(linha("Settings chord",
+				{ StreamQualityPrefs.CHORD_NAMES[prefs.tuningChord] }, { chordHint() }) {
+			prefs.tuningChord = (prefs.tuningChord + 1) % StreamQualityPrefs.CHORD_NAMES.size
+			Log.i(TAG, "Tuning chord: ${StreamQualityPrefs.CHORD_NAMES[prefs.tuningChord]}")
+		})
 		coluna.addView(navegacao("Stick calibration",
 				"Measures where each stick rests and how much it jitters, and sets the "
 						+ "deadzone from that. Worth doing once per controller.") {
@@ -249,21 +254,21 @@ class LauncherActivity: Activity()
 	 */
 	private fun cartaoDoAcorde(): View
 	{
+		val acorde = TextView(this).apply {
+			setTextColor(COR_DESTAQUE)
+			setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+			typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+			setPadding(0, 0, dp(14), 0)
+		}
 		val fila = LinearLayout(this).apply {
 			orientation = LinearLayout.HORIZONTAL
 			gravity = Gravity.CENTER_VERTICAL
 			setPadding(dp(18), dp(14), dp(18), dp(14))
 			background = fundoArredondado(COR_DESTAQUE_FUNDO)
+			addView(acorde)
 			addView(TextView(context).apply {
-				text = "L3 + R3"
-				setTextColor(COR_DESTAQUE)
-				setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
-				typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
-				setPadding(0, 0, dp(14), 0)
-			})
-			addView(TextView(context).apply {
-				text = "While playing, press both stick buttons to move, resize and "
-						.plus("sharpen the screen.")
+				text = "While playing, this opens the panel that moves, resizes and "
+						.plus("sharpens the screen, and clicks the touchpad.")
 				setTextColor(COR_TEXTO)
 				setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
 				setLineSpacing(dp(3).toFloat(), 1f)
@@ -271,6 +276,7 @@ class LauncherActivity: Activity()
 			layoutParams = comMargem(0, dp(22))
 		}
 		atualizacoes += {
+			acorde.text = StreamQualityPrefs.CHORD_NAMES[prefs.tuningChord]
 			fila.visibility = if(currentMode() == DisplayMode.IMMERSIVE) View.VISIBLE else View.GONE
 		}
 		return fila
@@ -502,6 +508,19 @@ class LauncherActivity: Activity()
 	private fun convergenceHint() =
 		"What sits exactly on the screen. Lower makes more of the scene pop out toward "
 				.plus("you; higher pushes the scene behind the screen.")
+
+	private fun chordHint() = when(prefs.tuningChord)
+	{
+		StreamQualityPrefs.CHORD_L3_R3 ->
+			"Both stick buttons. Fastest one, but some games use that combination "
+					.plus("themselves, and there the panel opens in the middle of a fight.")
+		StreamQualityPrefs.CHORD_L3_R3_R1 ->
+			"Both stick buttons plus R1. Three fingers, and almost no game asks for "
+					.plus("that shape, so it stays out of the way.")
+		else ->
+			"Hold both stick buttons for about a second. Nothing to memorise, but the "
+					.plus("game still sees the clicks while you hold them.")
+	}
 
 	private fun rumbleHint() = if(prefs.hapticRumble)
 		"The console sends raw haptics and we guess the strength from the envelope. It "

@@ -98,6 +98,9 @@ class VrStreamActivity: ComponentActivity()
 		 */
 		private const val HINT_MS = 7000L
 
+		/** Duracao de um clique de touchpad disparado por nos. */
+		private const val TOUCHPAD_CLICK_MS = 80L
+
 		/**
 		 * Teclas que valem como clique do touchpad do DualSense.
 		 *
@@ -136,6 +139,9 @@ class VrStreamActivity: ComponentActivity()
 	private var lastDropped = 0L
 	private var preferredDeviceId: Int? = null
 	private var rumble: Rumble? = null
+	/** Fontes de evento ja anotadas no diario, para nao repetir a cada toque. */
+	private val seenSources = HashSet<Int>()
+	private var touchpadDown = false
 
 	/**
 	 * Modo de ajuste. O setter e que cuida do painel: nao ha caminho para ligar
@@ -267,6 +273,7 @@ class VrStreamActivity: ComponentActivity()
 	private var hatY = 0
 	private var thumbLDown = false
 	private var thumbRDown = false
+	private var r1Down = false
 
 	override fun onCreate(savedInstanceState: Bundle?)
 	{
@@ -713,21 +720,114 @@ class VrStreamActivity: ComponentActivity()
 	 * O getter controllerState do chiaki ja combina esse estado com o do
 	 * teclado e o dos analogicos, entao basta ligar o bit e reenviar.
 	 */
+	/**
+	 * Aperta ou solta o botao do touchpad do lado do console.
+	 *
+	 * Um so lugar porque ele passou a ter tres entradas -- tecla de gamepad,
+	 * clique de mouse e toque -- e o estado preso e o modo de falha classico
+	 * deste botao: apertar por um caminho e soltar por outro deixaria o mapa
+	 * aberto para sempre.
+	 */
+	private fun setTouchpadPressed(pressed: Boolean)
+	{
+		if(pressed == touchpadDown)
+			return
+		val streamInput = input ?: return
+		touchpadDown = pressed
+		val state = streamInput.touchControllerState
+		state.buttons = if(pressed) state.buttons or ControllerState.BUTTON_TOUCHPAD
+			else state.buttons and ControllerState.BUTTON_TOUCHPAD.inv()
+		session?.setControllerState(streamInput.controllerState)
+		trace("Touchpad click: ${if(pressed) "down" else "up"}")
+	}
+
+	/**
+	 * Um clique completo, para quem chega por um caminho que so avisa uma vez.
+	 *
+	 * Oitenta milissegundos: o console precisa ver o botao apertado por pelo
+	 * menos um pacote de estado, e o intervalo de envio e bem menor que isso.
+	 */
+	private fun clickTouchpad()
+	{
+		setTouchpadPressed(true)
+		handler.postDelayed({ setTouchpadPressed(false) }, TOUCHPAD_CLICK_MS)
+	}
+
 	private fun handleTouchpadKey(event: KeyEvent): Boolean
 	{
 		if(event.keyCode !in TOUCHPAD_KEYCODES)
 			return false
 		val streamInput = input ?: return false
 
-		val state = streamInput.touchControllerState
-		state.buttons = when(event.action)
+		when(event.action)
 		{
-			KeyEvent.ACTION_DOWN -> state.buttons or ControllerState.BUTTON_TOUCHPAD
-			KeyEvent.ACTION_UP -> state.buttons and ControllerState.BUTTON_TOUCHPAD.inv()
-			else -> return true
+			KeyEvent.ACTION_DOWN -> setTouchpadPressed(true)
+			KeyEvent.ACTION_UP -> setTouchpadPressed(false)
 		}
-		session?.setControllerState(streamInput.controllerState)
 		return true
+	}
+
+	/**
+	 * O clique do touchpad do DualSense, que nao chega como tecla de gamepad.
+	 *
+	 * O driver do kernel expoe o touchpad como um **dispositivo separado**, ao
+	 * lado do gamepad, e o clique fisico dele sai como botao primario de mouse
+	 * nesse outro dispositivo. Por isso a tecla nunca apareceu: nao existe
+	 * tecla. Foi tambem por isso que o diario nunca mostrou nada -- o log de
+	 * dispositivos so contava os que se declaram gamepad, e o touchpad nao se
+	 * declara.
+	 *
+	 * Aceita qualquer fonte porque a classificacao varia: mouse, touchpad e
+	 * touchscreen aparecem em relatos diferentes do mesmo controle. Nada mais
+	 * nesta activity usa ponteiro, entao nao ha o que roubar.
+	 */
+	private fun handlePointer(event: MotionEvent): Boolean
+	{
+		if(isGamepadSource(event.source))
+			return false
+		noteSource(event)
+		if(adjustMode)
+			return false
+
+		when(event.actionMasked)
+		{
+			MotionEvent.ACTION_BUTTON_PRESS -> setTouchpadPressed(true)
+			MotionEvent.ACTION_BUTTON_RELEASE -> setTouchpadPressed(false)
+			// Sem ACTION_BUTTON_*, um clique de touchpad chega como toque comum.
+			// Ai vale o toque inteiro, e nao o botao: e o que sobra.
+			MotionEvent.ACTION_DOWN ->
+				if(event.buttonState != 0 || event.source and InputDevice.SOURCE_TOUCHPAD ==
+						InputDevice.SOURCE_TOUCHPAD)
+					setTouchpadPressed(true)
+				else
+					return false
+			MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+				if(touchpadDown)
+					setTouchpadPressed(false)
+				else
+					return false
+			else -> return false
+		}
+		return true
+	}
+
+	private fun isGamepadSource(source: Int): Boolean =
+		source and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD ||
+				source and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
+
+	/**
+	 * Anota uma fonte de ponteiro nova no diario, uma vez so.
+	 *
+	 * Sem isso nao ha como descobrir por onde o clique entra neste aparelho, e
+	 * com isso a cada toque o diario viraria uma parede de linhas iguais.
+	 */
+	private fun noteSource(event: MotionEvent)
+	{
+		val marca = event.source * 31 + event.deviceId
+		if(!seenSources.add(marca))
+			return
+		trace("Pointer input from '${event.device?.name}' source=0x${event.source.toString(16)} " +
+				"action=${event.actionMasked} buttons=0x${event.buttonState.toString(16)}")
 	}
 
 	/**
@@ -792,7 +892,18 @@ class VrStreamActivity: ComponentActivity()
 			val isGamepad = device.sources and InputDevice.SOURCE_GAMEPAD == InputDevice.SOURCE_GAMEPAD ||
 					device.sources and InputDevice.SOURCE_JOYSTICK == InputDevice.SOURCE_JOYSTICK
 			if(!isGamepad)
+			{
+				// O touchpad do DualSense entra como dispositivo separado, e
+				// nao se declara gamepad. Contando so gamepad, ele era
+				// invisivel no diario -- e a ausencia parecia prova de que o
+				// controle nao mandava nada, quando mandava por outra porta.
+				if(device.sources and (InputDevice.SOURCE_MOUSE or
+								InputDevice.SOURCE_TOUCHPAD or
+								InputDevice.SOURCE_TOUCHSCREEN) != 0)
+					trace("Pointer device '${device.name}' id=$id " +
+							"sources=0x${device.sources.toString(16)}")
 				continue
+			}
 			gamepads++
 			// Os controles Touch do headset entram sem nome de HID, no formato
 			// "Device 0x...". Um gamepad pareado se identifica.
@@ -808,9 +919,16 @@ class VrStreamActivity: ComponentActivity()
 				KeyEvent.KEYCODE_BUTTON_A,
 				KeyEvent.KEYCODE_BUTTON_MODE
 			)
+			// Quais das teclas candidatas ao touchpad este driver expoe. Se
+			// vierem todas false e o clique tambem nao aparecer como ponteiro,
+			// o controle nao entrega esse botao e nao ha o que mapear.
+			val extras = device.hasKeys(*TOUCHPAD_KEYCODES.toIntArray())
+			val presentes = TOUCHPAD_KEYCODES.filterIndexed { i, _ -> extras[i] }
+					.joinToString(",") { KeyEvent.keyCodeToString(it) }
 			trace("Gamepad '${device.name}' id=$id sources=0x${device.sources.toString(16)} " +
 					"L3=${keys[0]} R3=${keys[1]} Cross=${keys[2]} PS=${keys[3]} " +
-					"eixos=${device.motionRanges.size}")
+					"eixos=${device.motionRanges.size} " +
+					"touchpad keys=${if(presentes.isEmpty()) "none" else presentes}")
 		}
 		trace("Input devices: ${ids.size} in total, $gamepads gamepad(s)")
 
@@ -904,6 +1022,29 @@ class VrStreamActivity: ComponentActivity()
 		// ficar sem foco sem que nada mais denuncie. Sem foco, nenhum KeyEvent
 		// chega -- e o sintoma e identico ao de um controle nao pareado.
 		trace("Window focus: $hasFocus")
+	}
+
+	/**
+	 * O clique do touchpad chega por aqui, e nao pelo caminho de gamepad.
+	 *
+	 * Tres portas porque o Android classifica o mesmo clique de tres jeitos
+	 * conforme o driver: botao de mouse vira `dispatchGenericMotionEvent`, toque
+	 * vira `dispatchTouchEvent`, e ha aparelho que manda `ACTION_BUTTON_PRESS`
+	 * pelos dois. Cobrir as tres e barato; adivinhar qual e a certa custou uma
+	 * versao inteira.
+	 */
+	override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean
+	{
+		if(handlePointer(event))
+			return true
+		return super.dispatchGenericMotionEvent(event)
+	}
+
+	override fun dispatchTouchEvent(event: MotionEvent): Boolean
+	{
+		if(handlePointer(event))
+			return true
+		return super.dispatchTouchEvent(event)
 	}
 
 	override fun onGenericMotionEvent(event: MotionEvent): Boolean
@@ -1001,25 +1142,67 @@ class VrStreamActivity: ComponentActivity()
 	private fun handleAdjustChord(event: KeyEvent): Boolean
 	{
 		val down = event.action == KeyEvent.ACTION_DOWN
-		when(event.keyCode)
+		val isL3 = event.keyCode == KeyEvent.KEYCODE_BUTTON_THUMBL
+		val isR3 = event.keyCode == KeyEvent.KEYCODE_BUTTON_THUMBR
+		val isR1 = event.keyCode == KeyEvent.KEYCODE_BUTTON_R1
+		if(!isL3 && !isR3 && !isR1)
+			return false
+
+		if(isL3) thumbLDown = down
+		if(isR3) thumbRDown = down
+		if(isR1) r1Down = down
+
+		val chord = qualityPrefs.tuningChord
+		val sticks = thumbLDown && thumbRDown
+
+		// O acorde de segurar so vale enquanto os dois seguem apertados. Soltar
+		// qualquer um antes da hora e um clique de jogo, nao um pedido de painel.
+		if(chord == StreamQualityPrefs.CHORD_HOLD_L3_R3)
 		{
-			KeyEvent.KEYCODE_BUTTON_THUMBL -> thumbLDown = down
-			KeyEvent.KEYCODE_BUTTON_THUMBR -> thumbRDown = down
-			else -> return false
+			if(sticks && down)
+				handler.postDelayed(holdTick, StreamQualityPrefs.CHORD_HOLD_MS)
+			else if(!sticks)
+				handler.removeCallbacks(holdTick)
+		}
+		else
+		{
+			val complete = when(chord)
+			{
+				StreamQualityPrefs.CHORD_L3_R3_R1 -> sticks && r1Down
+				else -> sticks
+			}
+			if(down && complete)
+			{
+				toggleAdjustMode()
+				return true
+			}
 		}
 
-		if(down && thumbLDown && thumbRDown)
-		{
-			adjustMode = !adjustMode
-			trace(if(adjustMode) "Tuning mode on" else "Tuning mode off")
-			// O pressionar do acorde ja foi para o console antes de o segundo
-			// botao fechar a combinacao. Solta os dois agora, senao o console
-			// segue achando que estao apertados.
-			releaseChordButtons()
-			return true
-		}
-		// Enquanto o modo esta ligado, L3/R3 nao chegam ao console.
-		return adjustMode
+		// Fora do modo, cada botao do acorde continua sendo botao de jogo: R1
+		// atira, L3 corre, R3 e melee. Segurar qualquer um deles seria pior que
+		// nao ter atalho nenhum.
+		if(!adjustMode)
+			return false
+		// Ligado, L3 e R3 nao chegam ao console. R1 segue adiante porque dentro
+		// do painel ele e a altura da tela, tratada logo em seguida.
+		return !isR1
+	}
+
+	/** O acorde de segurar, quando os setecentos milissegundos se completam. */
+	private val holdTick = Runnable {
+		if(thumbLDown && thumbRDown)
+			toggleAdjustMode()
+	}
+
+	private fun toggleAdjustMode()
+	{
+		adjustMode = !adjustMode
+		trace(if(adjustMode) "Tuning mode on" else "Tuning mode off")
+		handler.removeCallbacks(holdTick)
+		// O pressionar do acorde ja foi para o console antes de o ultimo botao
+		// fechar a combinacao. Solta todos agora, senao o console segue achando
+		// que estao apertados.
+		releaseChordButtons()
 	}
 
 	/**
@@ -1032,7 +1215,8 @@ class VrStreamActivity: ComponentActivity()
 	private fun releaseChordButtons()
 	{
 		val streamInput = input ?: return
-		for(keyCode in intArrayOf(KeyEvent.KEYCODE_BUTTON_THUMBL, KeyEvent.KEYCODE_BUTTON_THUMBR))
+		for(keyCode in intArrayOf(KeyEvent.KEYCODE_BUTTON_THUMBL, KeyEvent.KEYCODE_BUTTON_THUMBR,
+				KeyEvent.KEYCODE_BUTTON_R1))
 			streamInput.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
 		session?.setControllerState(streamInput.controllerState)
 	}
@@ -1177,6 +1361,17 @@ class VrStreamActivity: ComponentActivity()
 				Log.i(TAG, "Screen brightness: "
 						+ StreamQualityPrefs.BRIGHTNESS_NAMES[qualityPrefs.brightness])
 			}
+			KeyEvent.KEYCODE_BUTTON_MODE ->
+			{
+				// PS: clique do touchpad, e fecha o painel.
+				//
+				// Existe como saida de emergencia. Se o clique do touchpad nao
+				// chegar sozinho neste controle -- e ha driver em que ele nao
+				// chega -- o mapa do jogo fica inalcancavel, e um comando que so
+				// se abre em dois passos ainda e melhor que um que nao existe.
+				adjustMode = false
+				clickTouchpad()
+			}
 			KeyEvent.KEYCODE_BUTTON_B -> // Circle: sair do modo de ajuste
 				adjustMode = false
 			else -> return true
@@ -1245,22 +1440,23 @@ class VrStreamActivity: ComponentActivity()
 			textSize = 46f
 			typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
 		}
-		canvas.drawText("L3 + R3", band.left + 40f, band.top + 72f, chord)
+		canvas.drawText(StreamQualityPrefs.CHORD_NAMES[qualityPrefs.tuningChord].uppercase(),
+				band.left + 40f, band.top + 72f, chord)
 
 		val what = Paint(Paint.ANTI_ALIAS_FLAG).apply {
 			color = Color.rgb(232, 236, 245)
 			textSize = 40f
 			typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
 		}
-		canvas.drawText("opens the settings panel", band.left + 250f, band.top + 72f, what)
+		canvas.drawText("opens the settings panel", band.left + 380f, band.top + 72f, what)
 
 		val detail = Paint(Paint.ANTI_ALIAS_FLAG).apply {
 			color = Color.argb(190, 200, 210, 230)
 			textSize = 28f
 		}
-		canvas.drawText("Press both stick buttons at the same time to move, resize and",
+		canvas.drawText("Move, resize and sharpen the screen, and click the touchpad.",
 				band.left + 40f, band.top + 118f, detail)
-		canvas.drawText("sharpen the screen. Same chord closes it.",
+		canvas.drawText("Same chord closes it. You can change it in the launcher.",
 				band.left + 40f, band.top + 152f, detail)
 
 		xr?.setHudBitmap(bitmap)
@@ -1304,7 +1500,7 @@ class VrStreamActivity: ComponentActivity()
 			color = Color.argb(180, 200, 210, 230)
 			textSize = 26f
 		}
-		canvas.drawText("L3 + R3 to leave  ·  the console receives nothing right now",
+		canvas.drawText("${StreamQualityPrefs.CHORD_NAMES[qualityPrefs.tuningChord]} to leave  ·  the console receives nothing right now",
 			44f, 116f, hint)
 
 		val label = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -1336,6 +1532,7 @@ class VrStreamActivity: ComponentActivity()
 			"Options" to if(qualityPrefs.syntheticStereo)
 					"3D strength — ${(qualityPrefs.stereoStrength * 100).toInt()}%"
 				else "3D is off (turn it on in the launcher)",
+			"PS" to "click the touchpad (map, inventory) and close this",
 			"Circle" to "leave tuning mode"
 		)
 

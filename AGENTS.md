@@ -538,6 +538,25 @@ aqui antes de procurar longe:
    clipboard. `copySummary` passou a reusar `buildReport`, para os dois não
    divergirem.
 
+23. **O clique do touchpad não chega como tecla de gamepad.** O driver do
+   kernel expõe o touchpad do DualSense como **dispositivo separado**, e o
+   clique físico sai como botão primário de mouse nesse outro dispositivo. Era
+   por isso que `TOUCHPAD_KEYCODES` nunca pegava nada, e era por isso que o
+   diário não mostrava nem sinal: `logInputDevices` só contava quem se declara
+   gamepad, e o touchpad não se declara. Agora `handlePointer` escuta as três
+   portas (`dispatchGenericMotionEvent`, `dispatchTouchEvent`, botões de
+   ponteiro), o diário anota cada fonte nova uma vez, e o painel de ajuste
+   ganhou o clique no botão PS como saída de emergência. **Ainda não foi
+   confirmado em hardware qual das portas é a certa** -- o próximo log do Gab
+   decide.
+
+24. **O acorde do painel virou preferência, e o padrão mudou para L3+R3+R1.**
+   Não existe combinação que jogo nenhum use; L3+R3 sozinho é usado, e o painel
+   abria no meio de uma ação. As três opções são `L3+R3`, `L3+R3+R1` e segurar
+   `L3+R3` por 700 ms. Os botões do acorde continuam chegando ao jogo quando o
+   acorde não fecha -- R1 é botão de tiro, e engolir R1 seria pior que não ter
+   atalho. `releaseChordButtons` passou a soltar R1 também.
+
 ## Onde as coisas estão paradas
 
 Aberto, em ordem de quanto incomoda:
