@@ -1,0 +1,40 @@
+Modo janela: o ponteiro do controle e do controle, nao da interface.
+
+O touchpad do DualSense chega ao Android como dispositivo de ponteiro ao lado
+do gamepad. No modo janela isso tinha duas consequencias, as duas ruins: o
+cursor do sistema aparecia por cima do jogo, e o movimento do dedo entrava nos
+controles de toque do chiaki-ng como se fosse dedo na tela -- que foi o que
+deixou todos os botoes errados depois de uma passada de dedo no touchpad.
+
+Engole tudo que vem do ponteiro do proprio controle e traduz so o clique para o
+botao do touchpad do PlayStation. O ponteiro do headset segue passando: o raio
+da mao tambem chega como mouse, e engoli-lo tiraria o unico jeito de tocar na
+interface deste modo.
+
+--- a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
+@@ -339,5 +339,24 @@
+ 	override fun dispatchKeyEvent(event: KeyEvent) = viewModel.input.dispatchKeyEvent(event) || super.dispatchKeyEvent(event)
+ 	override fun onGenericMotionEvent(event: MotionEvent) = viewModel.input.onGenericMotionEvent(event) || super.onGenericMotionEvent(event)
++
++	private val p5mTouchpadPointer by lazy {
++		io.github.gblandro.p5m.TouchpadPointer { pressed ->
++			val state = viewModel.input.touchControllerState
++			state.buttons = if(pressed)
++				state.buttons or com.metallic.chiaki.lib.ControllerState.BUTTON_TOUCHPAD
++			else
++				state.buttons and com.metallic.chiaki.lib.ControllerState.BUTTON_TOUCHPAD.inv()
++			// Atribuir, e nao so mexer no objeto: o setter deste campo e quem
++			// empurra o estado para a sessao.
++			viewModel.input.touchControllerState = state
++		}
++	}
++
++	override fun dispatchGenericMotionEvent(event: MotionEvent) =
++		p5mTouchpadPointer.handle(event) || super.dispatchGenericMotionEvent(event)
++
++	override fun dispatchTouchEvent(event: MotionEvent) =
++		p5mTouchpadPointer.handle(event) || super.dispatchTouchEvent(event)
+ }
+ 
+ enum class TransformMode

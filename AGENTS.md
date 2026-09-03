@@ -569,6 +569,24 @@ aqui antes de procurar longe:
    `ActivityLifecycleCallbacks` registrado no `P5MApp` -- por fora, porque uma
    das duas telas de stream é do chiaki-ng e assim não precisa de patch.
 
+26. **O ponteiro do controle atrapalhava o modo janela inteiro.** O mesmo
+   dispositivo de ponteiro que entrega o clique do touchpad entrega também o
+   deslizar do dedo. No modo janela isso acordava o cursor do sistema por cima
+   do jogo e chegava aos controles de toque do chiaki-ng como dedo na tela: uma
+   passada no touchpad e todos os botões passavam a responder errado, porque o
+   `touchControllerState` estava sendo escrito por quem não devia.
+   `TouchpadPointer` (nosso, compartilhado pelos dois modos) engole tudo que vem
+   do ponteiro **do próprio controle** e traduz só o clique. O ponteiro do
+   headset continua passando -- o raio da mão também chega como mouse, e
+   engoli-lo tiraria o único jeito de tocar na interface do modo janela. A
+   separação é por dispositivo, não por fonte: só entra quem também se declara
+   gamepad. O modo janela recebe isso pelo patch `0020`.
+
+27. **A imagem no modo janela voltou, mas pelo caminho direto.** O log de
+   03/09 03:18 mostra `Window without shader` -- nitidez em zero e 10 bits
+   desligado. Ou seja, o `glDrawBuffers` explícito do build 128 **ainda não foi
+   testado**: o caminho com shader na janela continua sem confirmação.
+
 ## Onde as coisas estão paradas
 
 Aberto, em ordem de quanto incomoda:
