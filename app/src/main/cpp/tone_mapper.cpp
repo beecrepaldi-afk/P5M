@@ -770,7 +770,7 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 		}
 		// Falhou: cai no redesenho de sempre. Uma vez que falha, falha sempre,
 		// entao desliga em vez de tentar a cada quadro.
-		LOGW("glExtrapolateTex2DQCOM devolveu 0x%x; voltando ao redesenho", err);
+		LOGW("glExtrapolateTex2DQCOM returned 0x%x; falling back to a full redraw", err);
 		extrapolate_fn_ = nullptr;
 	}
 

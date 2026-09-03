@@ -62,7 +62,7 @@ diff --git a/lib/src/takion.c b/lib/src/takion.c
 +		if(qr < 0)
 +			CHIAKI_LOGW(takion->log, "P5M: DSCP AF41 refused by the system");
 +		else
-+			CHIAKI_LOGW(takion->log, "P5M: socket marcado com DSCP AF41 (categoria video)");
++			CHIAKI_LOGW(takion->log, "P5M: socket marked DSCP AF41 (video class)");
 +
 +#ifdef SO_PRIORITY
 +		const int prio = 5;
@@ -70,7 +70,7 @@ diff --git a/lib/src/takion.c b/lib/src/takion.c
 +				(const CHIAKI_SOCKET_BUF_TYPE)&prio, sizeof(prio)) < 0)
 +			CHIAKI_LOGW(takion->log, "P5M: SO_PRIORITY refused by the system");
 +		else
-+			CHIAKI_LOGW(takion->log, "P5M: fila local do socket em prioridade %d", prio);
++			CHIAKI_LOGW(takion->log, "P5M: local socket queue at priority %d", prio);
 +#endif
 +	}
 +

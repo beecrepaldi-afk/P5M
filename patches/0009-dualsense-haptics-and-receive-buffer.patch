@@ -3,7 +3,7 @@ diff --git a/lib/src/takion.c b/lib/src/takion.c
 +++ b/lib/src/takion.c
 @@ -483,6 +483,50 @@
  		else
- 			CHIAKI_LOGW(takion->log, "P5M: fila local do socket em prioridade %d", prio);
+ 			CHIAKI_LOGW(takion->log, "P5M: local socket queue at priority %d", prio);
  #endif
 +
 +		// P5M: buffer de recepcao maior que o do chiaki.

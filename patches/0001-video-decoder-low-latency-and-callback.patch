@@ -133,8 +133,8 @@ index 1146ad8f..8ac08552 100644
 +						name ? name : "?", cstd, transfer, range, fmt);
 +				if(transfer == 6)
 +					__android_log_print(ANDROID_LOG_WARN, "P5MVR",
-+							"color-transfer=6 (PQ): the tone mapping request "
-+							"foi ignorado, os brancos vao sair altos");
++							"color-transfer=6 (PQ): the tone mapping request was "
++							"ignored, whites will come out blown");
 +				if(name)
 +					AMediaCodec_releaseName(decoder->codec, name);
 +				AMediaFormat_delete(out);

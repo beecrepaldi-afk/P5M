@@ -79,9 +79,9 @@ index 53157f1b..10dfa383 100644
 +		__android_log_print(ANDROID_LOG_INFO, "P5MVR",
 +				"Audio: %s, %s, %d channels at %d Hz, burst of %d frames",
 +				ao->stream->getSharingMode() == oboe::SharingMode::Exclusive
-+						? "direct path (exclusive)" : "mixer do sistema (compartilhado)",
++						? "direct path (exclusive)" : "system mixer (shared)",
 +				ao->stream->getPerformanceMode() == oboe::PerformanceMode::LowLatency
-+						? "baixa latencia" : "latencia comum",
++						? "low latency" : "ordinary latency",
 +				ao->stream->getChannelCount(), ao->stream->getSampleRate(),
 +				ao->stream->getFramesPerBurst());
 +	}

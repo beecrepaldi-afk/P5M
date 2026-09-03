@@ -133,7 +133,7 @@
 +		// AMediaCodec_configure aceita janela nula (e o modo de buffer), o
 +		// codec sobe, nada aparece na tela, e o estrago so se manifesta na
 +		// troca seguinte. Recusar aqui mantem o defeito onde ele nasceu.
-+		CHIAKI_LOGE(decoder->log, "ANativeWindow_fromSurface() devolveu NULL; a superficie ja estava morta");
++		CHIAKI_LOGE(decoder->log, "ANativeWindow_fromSurface() returned NULL; the surface was already dead");
 +		goto beach;
 +	}
  

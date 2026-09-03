@@ -1955,7 +1955,7 @@ void XrVideoSession::RenderFrame()
 		{
 			cylinder.next = &layer_settings;
 			if(!logged_layer_config_)
-				LOGI("Camada com XrCompositionLayerSettingsFB, flags=0x%x",
+				LOGI("Layer with XrCompositionLayerSettingsFB, flags=0x%x",
 						(unsigned)layer_settings.layerFlags);
 		}
 

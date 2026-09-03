@@ -1244,7 +1244,7 @@ class VrStreamActivity: ComponentActivity()
 					screenPrefs.curvature < 0.8f -> 1.0f
 					else -> ScreenPrefs.CURVATURE_MIN
 				}
-				trace("Curvatura: %.2f".format(screenPrefs.curvature))
+				trace("Curvature: %.2f".format(screenPrefs.curvature))
 			}
 			KeyEvent.KEYCODE_BUTTON_L2 ->
 			{
