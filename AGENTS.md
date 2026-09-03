@@ -601,6 +601,19 @@ aqui antes de procurar longe:
    seguinte nascia daí. Segurar, e não um botão próprio, porque o painel já
    usa os dez que tem, e porque encerrar por engano custa a sessão inteira.
 
+30. **A janela preta era o shader de duas saídas desenhando na tela.** O
+   fragment shader declara `fragColor` e `historyColor`; o framebuffer padrão
+   tem um alvo só. Pela especificação a segunda saída é descartada em silêncio,
+   e no compositor é o que acontece -- o modo imersivo nunca teve esse
+   problema. Neste Adreno, com a tela como alvo, o desenho vira
+   `GL_INVALID_OPERATION` e não sai nada. O diário da 0.1.0-beta mostrou os
+   dois lados da conta na mesma tela: `58 drawn, 2 refused` e `gl 0x502`.
+   Declarar `glDrawBuffers(GL_BACK)` **não** resolveu. A janela passou a
+   desenhar numa textura nossa e a copiar para a tela com `glBlitFramebuffer`,
+   que é o mesmo caminho do modo imersivo -- o que funciona. A cópia a 1600x900
+   não aparece na conta. E a fila de erro do GL agora é esvaziada antes da
+   passada, senão a linha do diário fala de uma chamada anterior qualquer.
+
 ## Onde as coisas estão paradas
 
 Aberto, em ordem de quanto incomoda:

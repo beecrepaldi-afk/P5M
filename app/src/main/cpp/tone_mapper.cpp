@@ -584,6 +584,40 @@ bool ToneMapper::Attach(ASurfaceTexture *texture)
  * para saber o que ficou parado, e escreve na outra. Ler e escrever a mesma
  * textura na mesma passada e comportamento indefinido em GL.
  */
+/**
+ * A textura em que a janela e desenhada antes de ir para a tela.
+ *
+ * Recriada quando a janela muda de tamanho, e so entao: alocar por quadro
+ * seria pagar uma textura de tela inteira sessenta vezes por segundo.
+ */
+bool ToneMapper::EnsureWindowTarget(int32_t width, int32_t height)
+{
+	if(window_tex_ != 0 && window_w_ == width && window_h_ == height)
+		return true;
+	if(window_tex_ != 0)
+	{
+		glDeleteTextures(1, &window_tex_);
+		window_tex_ = 0;
+	}
+	if(width <= 0 || height <= 0)
+		return false;
+
+	glGenTextures(1, &window_tex_);
+	glBindTexture(GL_TEXTURE_2D, window_tex_);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA,
+			GL_UNSIGNED_BYTE, nullptr);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glBindTexture(GL_TEXTURE_2D, 0);
+
+	window_w_ = width;
+	window_h_ = height;
+	LOGI("Window target texture created: %dx%d", width, height);
+	return true;
+}
+
 bool ToneMapper::EnsureDepthTargets(int32_t width, int32_t height)
 {
 	const int32_t w = width > 4 ? width / 4 : 1;
@@ -786,21 +820,35 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 
 	// Alvo zero e a janela: no modo janela quem recebe o desenho e o
 	// framebuffer padrao da GLSurfaceView, e nao ha textura para anexar.
+	// A janela nao e desenhada direto na tela.
+	//
+	// O fragment shader declara duas saidas: a imagem e o historico da
+	// extrapolacao. O framebuffer padrao tem uma so. Pela especificacao a
+	// segunda deveria ser descartada em silencio, e no compositor e o que
+	// acontece -- o modo imersivo sempre funcionou. Neste Adreno, com a tela
+	// como alvo, o desenho vira GL_INVALID_OPERATION e nao sai nada. O diario
+	// mostrou exatamente isso: 58 passadas desenhadas, `gl 0x502`, tela preta
+	// com som. Declarar o draw buffer como GL_BACK nao resolveu.
+	//
+	// Entao a janela passa a usar o mesmo caminho do modo imersivo, que e o
+	// caminho que funciona: desenha numa textura nossa e copia para a tela. A
+	// copia e um blit de framebuffer, feito pelo proprio GL, e a 1600x900 ela
+	// nao aparece na conta.
 	const bool to_window = target == 0;
-	glBindFramebuffer(GL_FRAMEBUFFER, to_window ? 0 : fbo_);
 	if(to_window)
 	{
-		// Explicito, e nao por omissao.
-		//
-		// O fragment shader declara duas saidas -- a imagem e o historico da
-		// extrapolacao -- e no framebuffer padrao so existe uma. Pela
-		// especificacao a segunda e descartada em silencio, mas ha driver
-		// Adreno que trata a mesma situacao como erro e nao desenha nada, o
-		// que da exatamente uma janela preta com som. Dizer qual e o alvo
-		// custa uma chamada por quadro e tira a duvida.
-		const GLenum back[] = { GL_BACK };
-		glDrawBuffers(1, back);
+		if(!EnsureWindowTarget(width, height))
+		{
+			if(!logged_fbo_failure_)
+			{
+				logged_fbo_failure_ = true;
+				LOGE("Could not create the window target texture (%dx%d)", width, height);
+			}
+			return false;
+		}
+		target = window_tex_;
 	}
+	glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
 
 	// O historico e escrito na mesma passada, por um segundo anexo. Custa uma
 	// gravacao a mais no fragment shader; copiar a tela depois custaria uma
@@ -813,7 +861,7 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D,
 				history_[history_slot], 0);
 	}
-	else if(!to_window)
+	else
 	{
 		// Solta um anexo que possa ter sobrado de um quadro anterior. Anexo
 		// esquecido nao e ignorado por nao estar nos draw buffers: a completude
@@ -821,7 +869,6 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, 0, 0);
 	}
 
-	if(!to_window)
 	{
 		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, target, 0);
 		GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
@@ -895,8 +942,7 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 		// nas duas sempre, sem variante.
 		const GLenum both[] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
 		const GLenum single[] = { GL_COLOR_ATTACHMENT0 };
-		if(!to_window)
-			glDrawBuffers(write_history ? 2 : 1, write_history ? both : single);
+		glDrawBuffers(write_history ? 2 : 1, write_history ? both : single);
 	}
 
 	glViewport(0, 0, width, height);
@@ -948,6 +994,17 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 	glBindVertexArray(0);
 
 	glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+
+	// A copia para a tela, no modo janela.
+	if(to_window)
+	{
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo_);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+		glBlitFramebuffer(0, 0, width, height, 0, 0, width, height,
+				GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		// GL_NEAREST porque origem e destino tem o mesmo tamanho: nao ha o que
+		// filtrar, e pedir filtragem so custaria.
+	}
 
 	// Uma linha, na primeira passada para a janela.
 	//

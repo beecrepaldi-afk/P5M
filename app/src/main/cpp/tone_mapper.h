@@ -101,6 +101,7 @@ public:
 private:
 	bool CompileProgram();
 	bool EnsureHistory(int32_t width, int32_t height);
+	bool EnsureWindowTarget(int32_t width, int32_t height);
 
 	ASurfaceTexture *surface_texture_ = nullptr;
 	bool attached_ = false;
@@ -112,6 +113,16 @@ private:
 	GLuint program_ = 0;
 	GLuint external_tex_ = 0;
 	GLuint fbo_ = 0;
+	/**
+	 * Textura em que a janela e desenhada antes de ir para a tela.
+	 *
+	 * O modo janela nao desenha mais direto no framebuffer padrao. Ver o
+	 * comentario em Render(): o shader tem duas saidas e o driver Adreno recusa
+	 * isso quando o alvo e a tela.
+	 */
+	GLuint window_tex_ = 0;
+	int32_t window_w_ = 0;
+	int32_t window_h_ = 0;
 	GLuint vbo_ = 0;
 	GLuint vao_ = 0;
 
