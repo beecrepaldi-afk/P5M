@@ -1,0 +1,238 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+    <!-- headtracking como OPCIONAL, de proposito.
+         Marcar como required=true declara o app inteiro como VR, e o Horizon OS
+         passa a abri-lo direto em modo imersivo. Mas a entrada e o painel 2D,
+         uma activity Android comum, que nao submete frame OpenXR nenhum. O
+         resultado e uma cena vazia: a "janela em branco" do primeiro teste.
+         O app e hibrido: entra em 2D e so a activity de stream e imersiva, o que
+         ela declara pela categoria com.oculus.intent.category.VR. -->
+    <uses-feature android:name="android.hardware.vr.headtracking" android:version="1" android:required="false" />
+    <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
+    <!-- WifiLock em modo de baixa latencia: impede o radio de dormir entre
+         pacotes durante a sessao. Sem esta permissao createWifiLock lanca. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- Sem isto o loader OpenXR nao enxerga o runtime do Horizon OS no Android 11+. -->
+    <queries>
+        <provider android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker" />
+    </queries>
+
+    <application
+        android:name="io.github.gblandro.p5m.P5MApp"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_p5m"
+        android:label="P5M"
+        android:isGame="true"
+        android:banner="@mipmap/atv_banner"
+        android:supportsRtl="true"
+        android:theme="@style/AppTheme"
+        tools:ignore="GoogleAppIndexingWarning">
+
+        <!-- FrameSync: o algoritmo de temporizacao de quadro que substitui o
+             Phase Sync no Horizon OS.
+
+             Os dois atrasam de proposito o inicio do quadro do app, para que
+             ele termine pouco antes de o compositor precisar dele — assim a
+             pose amostrada e a mais fresca possivel. O FrameSync troca a
+             heuristica dos ultimos quadros por um modelo estatistico e adapta
+             nos dois sentidos, cedo e tarde.
+
+             Somos o candidato ideal: nosso trabalho por quadro e minusculo e
+             quase constante — uma passada de shader, ou nem isso no caminho
+             direto —, e o risco anunciado do metodo (app cuja carga oscila
+             violentamente acabar entregando quadro velho) simplesmente nao se
+             aplica aqui.
+
+             E o ganho, para nos, e maior do que a pose: acordar mais tarde
+             significa chamar o updateTexImage mais tarde, e portanto pegar um
+             quadro de video que pode ter chegado nesse meio tempo. Latencia de
+             video, e nao so de cabeca.
+
+             A partir da v203 vira padrao das apps da loja; aqui, que e
+             carregado por fora, a etiqueta e o que garante. Ignorada por
+             versoes que nao a conhecem. -->
+        <meta-data android:name="com.oculus.enable_frame_sync" android:value="true" />
+
+        <provider
+            android:authorities="com.metallic.chiaki.fileprovider"
+            android:name="androidx.core.content.FileProvider"
+            android:grantUriPermissions="true"
+            android:exported="false">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/filepaths" />
+        </provider>
+
+        <!-- Provider do diagnostico, separado do provider do chiaki-ng.
+             Serve para compartilhar o log como ARQUIVO: copiar texto esbarra no
+             limite de caracteres de uma issue, anexar arquivo nao. -->
+        <provider
+            android:authorities="io.github.gblandro.p5m.diagnostics"
+            android:name="androidx.core.content.FileProvider"
+            android:grantUriPermissions="true"
+            android:exported="false">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/p5m_diagnostic_paths" />
+        </provider>
+
+        <!-- Unica entrada do lancador. O Horizon OS mostra um icone por PACOTE,
+             nao um por activity de lancamento: a tela de diagnostico com entrada
+             propria nunca apareceu na biblioteca. Esta tela e simples de
+             proposito, sem AppCompat nem biblioteca nativa, e leva as outras. -->
+        <activity
+            android:name="io.github.gblandro.p5m.LauncherActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Material"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="com.oculus.intent.category.2D" />
+            </intent-filter>
+        </activity>
+
+        <!-- Painel 2D: descoberta, pareamento e ajustes. Vem inteiro do chiaki-ng.
+             Aberta explicitamente pelo lancador, nao pela biblioteca. -->
+        <activity android:name=".main.MainActivity"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize"
+            android:exported="true">
+            <intent-filter>
+                <category android:name="com.oculus.intent.category.2D" />
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!-- Stream em janela: painel comum do Horizon OS, que o sistema
+             posiciona e mostra ao lado de outros apps. E a StreamActivity do
+             proprio chiaki-ng, que ja estava compilada e so nao era declarada.
+             Proporcao e tamanho ficam livres, a cargo do sistema. O video
+             continua 16:9 dentro da janela: o AspectRatioFrameLayout do
+             chiaki-ng ja o mantem proporcional, entao esticar o painel gera
+             barra preta em vez de imagem distorcida. Travar a proporcao seria
+             possivel com minAspectRatio e maxAspectRatio iguais, mas o Android
+             ignora essas duas em activity redimensionavel, e nao da para ter as
+             duas coisas. -->
+        <activity
+            android:name=".stream.StreamActivity"
+            android:theme="@style/StreamTheme"
+            android:resizeableActivity="true"
+            android:exported="false"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|density|uiMode">
+            <intent-filter>
+                <category android:name="com.oculus.intent.category.2D" />
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!-- Activity imersiva: toma a tela inteira e compoe a propria camada. -->
+        <activity
+            android:name=".stream.VrStreamActivity"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:excludeFromRecents="false"
+            android:exported="true"
+            android:configChanges="screenSize|screenLayout|orientation|keyboardHidden|keyboard|navigation|uiMode|density">
+            <intent-filter>
+                <category android:name="com.oculus.intent.category.VR" />
+                <action android:name="android.intent.action.MAIN" />
+            </intent-filter>
+            <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
+        </activity>
+
+        <!-- Alcancada pelo botao do lancador. Nao usa AppCompat, layout XML nem
+             o tema do chiaki, para nao herdar os modos de falha que investiga. -->
+        <activity
+            android:name="io.github.gblandro.p5m.DiagnosticActivity"
+            android:label="P5M Diagnostics"
+            android:exported="true"
+            android:theme="@android:style/Theme.Material"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize">
+            <intent-filter>
+                <category android:name="com.oculus.intent.category.2D" />
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!-- Banco de ensaio: o caminho de video inteiro com uma fonte gerada
+             aqui dentro, sem console e sem rede. Nao declara MAIN de
+             proposito: e alcancada so pelo botao do lancador, e nao deve
+             concorrer para ser a entrada do app. -->
+        <activity
+            android:name="io.github.gblandro.p5m.BancoDeEnsaioActivity"
+            android:label="P5M — test bench"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:excludeFromRecents="false"
+            android:exported="false"
+            android:configChanges="screenSize|screenLayout|orientation|keyboardHidden|keyboard|navigation|uiMode|density">
+            <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
+        </activity>
+
+        <!-- Calibracao dos analogicos. Painel 2D comum: e uma tela para olhar
+             o controle largado na mesa, e o modo imersivo so atrapalharia.
+             Precisa de configChanges como as outras, para uma troca de foco
+             no Horizon OS nao recriar a activity no meio de uma medicao. -->
+        <activity
+            android:name="io.github.gblandro.p5m.StickCalibrationActivity"
+            android:label="P5M — stick calibration"
+            android:exported="false"
+            android:theme="@android:style/Theme.Material"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize">
+            <intent-filter>
+                <category android:name="com.oculus.intent.category.2D" />
+            </intent-filter>
+        </activity>
+
+        <!-- Conexao remota via PSN: login e lista de consoles da conta.
+             Fora de casa a descoberta por broadcast nao encontra nada, e este
+             e o caminho que enderaca o console pela conta em vez de pelo IP. -->
+        <activity
+            android:name="io.github.gblandro.p5m.PsnRemoteActivity"
+            android:label="P5M — remote connection"
+            android:exported="false"
+            android:theme="@android:style/Theme.Material"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize">
+            <intent-filter>
+                <category android:name="com.oculus.intent.category.2D" />
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <activity android:name=".settings.SettingsActivity" />
+
+        <activity
+            android:name=".regist.RegistActivity"
+            android:theme="@style/MageTheme"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".regist.RegistExecuteActivity"
+            android:theme="@style/MageTheme"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize" />
+
+        <activity
+            android:name=".manualconsole.EditManualConsoleActivity"
+            android:theme="@style/MageTheme"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize" />
+    </application>
+</manifest>

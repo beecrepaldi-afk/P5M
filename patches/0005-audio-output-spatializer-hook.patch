@@ -1,0 +1,107 @@
+diff --git a/android/app/src/main/cpp/audio-output.cpp b/android/app/src/main/cpp/audio-output.cpp
+index 53157f1b..10dfa383 100644
+--- a/android/app/src/main/cpp/audio-output.cpp
++++ b/android/app/src/main/cpp/audio-output.cpp
+@@ -9,6 +9,34 @@
+ 
+ #include <oboe/Oboe.h>
+ 
++#include <android/log.h>
++#include <dlfcn.h>
++
++// P5M: gancho de audio.
++//
++// O espacializador vive na libp5m-vr.so, que nao e ligada a esta -- e nem
++// deveria ser: o chiaki nao conhece o projeto de fora. Entao o simbolo e
++// procurado em tempo de execucao, uma vez por sessao. Se nao estiver la, o
++// ponteiro fica nulo e o audio segue exatamente como sempre seguiu.
++typedef void (*P5MAudioFilter)(int16_t *frames, size_t frame_count, uint32_t channels,
++		uint32_t rate);
++typedef int (*P5MPrefersSystemMixer)(void);
++static P5MAudioFilter p5m_audio_filter_fn = nullptr;
++static P5MPrefersSystemMixer p5m_prefers_system_mixer_fn = nullptr;
++
++static void p5m_resolve_audio_hooks()
++{
++	// dlopen numa biblioteca ja carregada so incrementa a contagem; se ainda
++	// nao estiver, carrega. Nos dois casos o dlsym seguinte encontra o simbolo.
++	void *lib = dlopen("libp5m-vr.so", RTLD_NOW);
++	if(!lib)
++		return;
++	p5m_audio_filter_fn =
++			(P5MAudioFilter)dlsym(lib, "p5m_audio_filter");
++	p5m_prefers_system_mixer_fn =
++			(P5MPrefersSystemMixer)dlsym(lib, "p5m_audio_prefers_system_mixer");
++}
++
+ #define BUFFER_CHUNK_SIZE 1024
+ #define BUFFER_CHUNKS_COUNT 32
+ 
+@@ -58,9 +86,26 @@ extern "C" void android_chiaki_audio_output_settings(uint32_t channels, uint32_t
+ {
+ 	auto ao = reinterpret_cast<AudioOutput *>(audio_output);
+ 
++	p5m_resolve_audio_hooks();
++
++	// P5M: um stream exclusivo fala com o hardware sem passar pelo mixer, e
++	// o que nao passa pelo mixer nao pode ser processado por ele -- o
++	// espacializador do Horizon OS incluido. No modo janela e ele quem tem de
++	// posicionar o som no painel, entao ali o stream vai compartilhado, com
++	// atributos de midia e de filme, que e o que o espacializador procura. No
++	// modo imersivo a espacializacao e nossa e o caminho direto continua.
++	const bool p5m_shared = p5m_prefers_system_mixer_fn
++			&& p5m_prefers_system_mixer_fn() != 0;
++
+ 	oboe::AudioStreamBuilder builder;
+-	builder.setPerformanceMode(oboe::PerformanceMode::LowLatency)
+-		->setSharingMode(oboe::SharingMode::Exclusive)
++	builder.setPerformanceMode(p5m_shared
++				? oboe::PerformanceMode::None
++				: oboe::PerformanceMode::LowLatency)
++		->setSharingMode(p5m_shared
++				? oboe::SharingMode::Shared
++				: oboe::SharingMode::Exclusive)
++		->setUsage(oboe::Usage::Media)
++		->setContentType(oboe::ContentType::Movie)
+ 		->setFormat(oboe::AudioFormat::I16)
+ 		->setChannelCount(channels)
+ 		->setSampleRate(rate)
+@@ -72,6 +117,22 @@ extern "C" void android_chiaki_audio_output_settings(uint32_t channels, uint32_t
+ 	else
+ 		CHIAKI_LOGE(ao->log, "Audio Output failed to open Oboe stream: %s", oboe::convertToText(result));
+ 
++	// P5M: o que foi *concedido*, e nao o que foi pedido. O Oboe cai para o
++	// compartilhado sozinho quando o exclusivo nao esta disponivel, e sem esta
++	// linha nao havia como saber por qual caminho o som estava saindo -- que e
++	// exatamente a duvida que este trecho existe para responder.
++	if(result == oboe::Result::OK && ao->stream)
++	{
++		__android_log_print(ANDROID_LOG_INFO, "P5MVR",
++				"Audio: %s, %s, %d channels at %d Hz, burst of %d frames",
++				ao->stream->getSharingMode() == oboe::SharingMode::Exclusive
++						? "direct path (exclusive)" : "mixer do sistema (compartilhado)",
++				ao->stream->getPerformanceMode() == oboe::PerformanceMode::LowLatency
++						? "baixa latencia" : "latencia comum",
++				ao->stream->getChannelCount(), ao->stream->getSampleRate(),
++				ao->stream->getFramesPerBurst());
++	}
++
+ 	result = ao->stream->start();
+ 	if(result == oboe::Result::OK)
+ 		CHIAKI_LOGI(ao->log, "Audio Output started Oboe stream");
+@@ -110,6 +171,15 @@ oboe::DataCallbackResult AudioOutputCallback::onAudioReady(oboe::AudioStream *st
+ 		memset(buf + buf_size_delivered, 0, buf_size_requested - buf_size_delivered);
+ 	}
+ 
++	// P5M: depois de preencher o silencio, e nao antes -- o filtro tem uma
++	// linha de atraso, e alimenta-la com lixo do buffer anterior deixaria o
++	// estouro audivel por mais tempo do que ele durou.
++	if(p5m_audio_filter_fn)
++		p5m_audio_filter_fn(reinterpret_cast<int16_t *>(audio_data),
++				static_cast<size_t>(num_frames),
++				static_cast<uint32_t>(stream->getChannelCount()),
++				static_cast<uint32_t>(stream->getSampleRate()));
++
+ 	return oboe::DataCallbackResult::Continue;
+ }
+ 

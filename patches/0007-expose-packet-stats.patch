@@ -1,0 +1,111 @@
+diff --git a/android/app/src/main/cpp/chiaki-jni.c b/android/app/src/main/cpp/chiaki-jni.c
+index 9b14b60b..3e7f9fd3 100644
+--- a/android/app/src/main/cpp/chiaki-jni.c
++++ b/android/app/src/main/cpp/chiaki-jni.c
+@@ -231,6 +231,34 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject
+ 	ChiakiConnectInfo connect_info = { 0 };
+ 	connect_info.ps5 = ps5;
+ 
++	// P5M: dois campos que o app Android nunca preenchia.
++	//
++	// packet_loss_max e o teto da perda que o cliente *relata* ao console. Em
++	// zero -- que e o que o { 0 } deixava -- o controle de congestionamento
++	// mede a perda de verdade e a corta para zero antes de mandar. O log
++	// registrava exatamente isso: "Clamping reported packet loss: measured=2.6%
++	// reported_max=0.0%". O console recebia "esta tudo bem" enquanto os pacotes
++	// sumiam, e nunca tinha motivo para baixar o bitrate. 0.05 nao e escolha
++	// minha: e o proprio padrao do chiaki-ng no desktop, que a porta Android
++	// deixou de copiar.
++	connect_info.packet_loss_max = 0.05;
++
++	// enable_idr_on_fec_failure pede um quadro-chave quando a correcao de erros
++	// falha. Sem ele, o decodificador segue decodificando a partir de uma
++	// referencia quebrada -- e o "Missing reference frame 5975 for decoding
++	// frame 5976 -> changed to 5974" que enche o log e justamente isso: o
++	// estrago se arrasta para a frente ate o console mandar um quadro-chave por
++	// conta propria, o que no Remote Play pode demorar segundos.
++	//
++	// Aqui eu difiro do padrao do chiaki-ng, que o deixa desligado, e digo por
++	// que: o quadro-chave e grande e chega logo depois de a rede ter falhado,
++	// entao num link fraco ele pode piorar o que ja estava ruim. Num link forte
++	// -- Wi-Fi 6E com o console no cabo, que e o caso -- a perda e rara e
++	// isolada, e alguns centesimos de segundo de pico valem muito mais do que
++	// segundos de imagem rachada. O proprio libchiaki evita repetir o pedido
++	// enquanto espera o quadro que ja pediu.
++	connect_info.enable_idr_on_fec_failure = true;
++
+ 	const char *str_borrow = E->GetStringUTFChars(env, host_string, NULL);
+ 	connect_info.host = host_str = strdup(str_borrow);
+ 	E->ReleaseStringUTFChars(env, host_string, str_borrow);
+@@ -404,6 +432,37 @@ JNIEXPORT jint JNICALL JNI_FCN(sessionJoin)(JNIEnv *env, jobject obj, jlong ptr)
+ 	return chiaki_session_join(&session->session);
+ }
+ 
++/**
++ * P5M: pacotes recebidos e perdidos desde a ultima leitura.
++ *
++ * O libchiaki ja contava -- o ChiakiPacketStats existe para a correcao de erros
++ * e para o controle de congestionamento -- e o numero nunca saia dali. Do lado
++ * do app so havia o bloco de "FEC failed" no log, que diz que houve perda mas
++ * nao quanta, e so aparece depois que a imagem ja quebrou.
++ *
++ * Devolve os dois valores empacotados num long: recebidos nos 32 bits altos,
++ * perdidos nos baixos. Um par de longs pediria um objeto de retorno e uma
++ * alocacao por leitura, e isto e lido uma vez por segundo com o painel aberto.
++ *
++ * Le sem zerar (reset = false): quem zera e o controle de congestionamento do
++ * proprio chiaki, e roubar a contagem dele estragaria a decisao que ele toma
++ * com ela.
++ */
++JNIEXPORT jlong JNICALL JNI_FCN(sessionPacketStats)(JNIEnv *env, jobject obj, jlong ptr)
++{
++	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
++	if(!session)
++		return 0;
++	uint64_t received = 0, lost = 0;
++	chiaki_packet_stats_get(&session->session.stream_connection.packet_stats, false,
++			&received, &lost);
++	if(received > 0x7fffffffULL)
++		received = 0x7fffffffULL;
++	if(lost > 0x7fffffffULL)
++		lost = 0x7fffffffULL;
++	return (jlong)((received << 32) | lost);
++}
++
+ JNIEXPORT void JNICALL JNI_FCN(sessionSetSurface)(JNIEnv *env, jobject obj, jlong ptr, jobject surface)
+ {
+ 	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
+diff --git a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+index bb0b0a69..b5c6f1a7 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+@@ -91,6 +91,8 @@ private class ChiakiNative
+ 		@JvmStatic external fun sessionStop(ptr: Long): Int
+ 		@JvmStatic external fun sessionJoin(ptr: Long): Int
+ 		@JvmStatic external fun sessionSetSurface(ptr: Long, surface: Surface?)
++		// P5M: recebidos nos 32 bits altos, perdidos nos baixos.
++		@JvmStatic external fun sessionPacketStats(ptr: Long): Long
+ 		@JvmStatic external fun sessionSetControllerState(ptr: Long, controllerState: ControllerState)
+ 		@JvmStatic external fun sessionSetLoginPin(ptr: Long, pin: String)
+ 		@JvmStatic external fun discoveryServiceCreate(result: CreateResult, options: DiscoveryServiceOptions, javaService: DiscoveryService)
+@@ -382,6 +384,20 @@ class Session(connectInfo: ConnectInfo, logFile: String?, logVerbose: Boolean)
+ 		ChiakiNative.sessionSetSurface(nativePtr, surface)
+ 	}
+ 
++	/**
++	 * P5M: pacotes recebidos e perdidos desde o inicio da sessao.
++	 *
++	 * O libchiaki ja contava -- o contador existe para a correcao de erros e o
++	 * controle de congestionamento --, e o numero nunca saia dali. Le sem zerar:
++	 * quem zera e o controle de congestionamento, e roubar a contagem dele
++	 * estragaria a decisao que ele toma com ela.
++	 */
++	fun packetStats(): Pair<Long, Long>
++	{
++		val packed = ChiakiNative.sessionPacketStats(nativePtr)
++		return Pair(packed ushr 32, packed and 0xffffffffL)
++	}
++
+ 	fun setControllerState(controllerState: ControllerState)
+ 	{
+ 		ChiakiNative.sessionSetControllerState(nativePtr, controllerState)

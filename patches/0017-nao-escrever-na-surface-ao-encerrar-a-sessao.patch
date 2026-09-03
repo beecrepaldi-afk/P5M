@@ -1,0 +1,145 @@
+--- a/android/app/src/main/cpp/video-decoder.h
++++ b/android/app/src/main/cpp/video-decoder.h
+@@ -20,6 +20,19 @@
+ 	uint64_t timestamp_cur;
+ 	ChiakiThread output_thread;
+ 	bool shutdown_output;
++	// P5M: portao de escrita na Surface do compositor.
++	//
++	// XR_KHR_android_surface_swapchain exige que nenhuma thread esteja
++	// escrevendo na Surface quando o xrEndSession for chamado, e quem escreve
++	// nela e a thread de saida daqui, pelo releaseOutputBuffer com render=true.
++	// O portao existe para fechar essa escrita sem derrubar o decodificador --
++	// derrubar era o que a documentacao antiga sugeria (setSurface(null)), e
++	// custou o SIGSEGV em ANativeWindow_release.
++	//
++	// Quem fecha o portao segura o render_mutex, e por isso o retorno do
++	// fechamento ja e a garantia de que nenhuma entrega esta em curso.
++	ChiakiMutex render_mutex;
++	bool render_to_surface;
+ 	int32_t target_width;
+ 	int32_t target_height;
+ 	ChiakiCodec target_codec;
+@@ -28,6 +41,7 @@
+ ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *decoder, ChiakiLog *log, int32_t target_width, int32_t target_height, ChiakiCodec codec);
+ void android_chiaki_video_decoder_fini(AndroidChiakiVideoDecoder *decoder);
+ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder, JNIEnv *env, jobject surface);
++void android_chiaki_video_decoder_set_render_to_surface(AndroidChiakiVideoDecoder *decoder, bool render);
+ bool android_chiaki_video_decoder_video_sample(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user);
+ 
+ #endif
+\ No newline at end of file
+--- a/android/app/src/main/cpp/video-decoder.c
++++ b/android/app/src/main/cpp/video-decoder.c
+@@ -32,7 +32,16 @@
+ 	decoder->target_height = target_height;
+ 	decoder->target_codec = codec;
+ 	decoder->shutdown_output = false;
+-	return chiaki_mutex_init(&decoder->codec_mutex, false);
++	// O portao nasce aberto: fora do encerramento da sessao imersiva, a
++	// entrega de quadros e o comportamento normal.
++	decoder->render_to_surface = true;
++	ChiakiErrorCode err = chiaki_mutex_init(&decoder->render_mutex, false);
++	if(err != CHIAKI_ERR_SUCCESS)
++		return err;
++	err = chiaki_mutex_init(&decoder->codec_mutex, false);
++	if(err != CHIAKI_ERR_SUCCESS)
++		chiaki_mutex_fini(&decoder->render_mutex);
++	return err;
+ }
+ 
+ static void kill_decoder(AndroidChiakiVideoDecoder *decoder)
+@@ -95,6 +104,7 @@
+ 	if(decoder->codec)
+ 		kill_decoder(decoder);
+ 	chiaki_mutex_fini(&decoder->codec_mutex);
++	chiaki_mutex_fini(&decoder->render_mutex);
+ }
+ 
+ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder, JNIEnv *env, jobject surface)
+@@ -265,6 +275,18 @@
+ // Os dois parametros sao ignorados de proposito: quem decide pedir keyframe
+ // depois de perda e a propria libchiaki, e o MediaCodec nao tem o que fazer
+ // com essa informacao. Aceita-los apenas restaura a compatibilidade.
++void android_chiaki_video_decoder_set_render_to_surface(AndroidChiakiVideoDecoder *decoder, bool render)
++{
++	chiaki_mutex_lock(&decoder->render_mutex);
++	decoder->render_to_surface = render;
++	chiaki_mutex_unlock(&decoder->render_mutex);
++	// O quadro decodificado continua sendo consumido quando o portao esta
++	// fechado; so nao vai para a Surface. Fila do codec segue drenando, e a
++	// sessao do console nao percebe diferenca nenhuma.
++	CHIAKI_LOGI(decoder->log, "P5M: escrita na Surface %s",
++			render ? "liberada" : "fechada");
++}
++
+ bool android_chiaki_video_decoder_video_sample(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user)
+ {
+ 	(void)frames_lost;
+@@ -377,7 +399,17 @@
+ 			continue;
+ 		if(status >= 0)
+ 		{
+-			AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, info.size != 0);
++			// P5M: a entrega acontece debaixo do render_mutex.
++			//
++			// Nao e sincronizacao com o codec -- esse ja tem o seu mutex. E o
++			// que permite a alguem de fora afirmar, ao voltar de
++			// set_render_to_surface, que nenhuma escrita na Surface esta em
++			// curso. Sem isso a afirmacao seria sobre o futuro e nao sobre o
++			// presente, e o encerramento da sessao OpenXR precisa do presente.
++			chiaki_mutex_lock(&decoder->render_mutex);
++			bool render = info.size != 0 && decoder->render_to_surface;
++			AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, render);
++			chiaki_mutex_unlock(&decoder->render_mutex);
+ 			if(info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)
+ 			{
+ 				CHIAKI_LOGI(decoder->log, "AMediaCodec reported EOS");
+--- a/android/app/src/main/cpp/chiaki-jni.c
++++ b/android/app/src/main/cpp/chiaki-jni.c
+@@ -705,6 +705,12 @@
+ 	android_chiaki_video_decoder_set_surface(&session->video_decoder, env, surface);
+ }
+ 
++JNIEXPORT void JNICALL JNI_FCN(sessionSetVideoRenderToSurface)(JNIEnv *env, jobject obj, jlong ptr, jboolean render)
++{
++	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
++	android_chiaki_video_decoder_set_render_to_surface(&session->video_decoder, render != JNI_FALSE);
++}
++
+ JNIEXPORT void JNICALL JNI_FCN(sessionSetControllerState)(JNIEnv *env, jobject obj, jlong ptr, jobject controller_state_java)
+ {
+ 	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
+--- a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+@@ -105,6 +105,7 @@
+ 		@JvmStatic external fun sessionSetSurface(ptr: Long, surface: Surface?)
+ 		// P5M: recebidos nos 32 bits altos, perdidos nos baixos.
+ 		@JvmStatic external fun sessionPacketStats(ptr: Long): Long
++		@JvmStatic external fun sessionSetVideoRenderToSurface(ptr: Long, render: Boolean)
+ 		@JvmStatic external fun sessionSetControllerState(ptr: Long, controllerState: ControllerState)
+ 		@JvmStatic external fun sessionSetLoginPin(ptr: Long, pin: String)
+ 		@JvmStatic external fun discoveryServiceCreate(result: CreateResult, options: DiscoveryServiceOptions, javaService: DiscoveryService)
+@@ -497,6 +498,22 @@
+ 		return Pair(packed ushr 32, packed and 0xffffffffL)
+ 	}
+ 
++	/**
++	 * Abre ou fecha a escrita do decodificador na Surface.
++	 *
++	 * Existe para o encerramento da sessao imersiva: XR_KHR_android_surface_swapchain
++	 * exige que ninguem esteja escrevendo na Surface do swapchain quando o
++	 * xrEndSession for chamado. Fechar o portao e barato e reversivel; derrubar
++	 * o decodificador, que era a outra saida, ja custou um SIGSEGV.
++	 *
++	 * Quando esta chamada retorna, nenhuma entrega esta em curso.
++	 */
++	fun setVideoRenderToSurface(render: Boolean)
++	{
++		if(nativePtr != 0L)
++			ChiakiNative.sessionSetVideoRenderToSurface(nativePtr, render)
++	}
++
+ 	fun setControllerState(controllerState: ControllerState)
+ 	{
+ 		ChiakiNative.sessionSetControllerState(nativePtr, controllerState)

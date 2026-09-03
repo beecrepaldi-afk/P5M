@@ -1,0 +1,223 @@
+diff --git a/lib/src/takion.c b/lib/src/takion.c
+--- a/lib/src/takion.c
++++ b/lib/src/takion.c
+@@ -483,6 +483,50 @@
+ 		else
+ 			CHIAKI_LOGW(takion->log, "P5M: fila local do socket em prioridade %d", prio);
+ #endif
++
++		// P5M: buffer de recepcao maior que o do chiaki.
++		//
++		// O chiaki pede SO_RCVBUF igual ao a_rwnd que anuncia no protocolo:
++		// 0x19000, ou 100 KB. Sao dois numeros com donos diferentes que a
++		// biblioteca trata como um so. O a_rwnd e uma promessa feita ao
++		// console e nao se mexe nele; o SO_RCVBUF e o balde do kernel aqui
++		// dentro, e 100 KB e pequeno demais para o que chega em rajada.
++		//
++		// A conta: 100 KB a 25 Mbps sao 32 ms. Um quadro-chave de 1080p a
++		// esse bitrate passa facil de 200 KB e chega todo de uma vez. Se a
++		// thread que le o socket estiver fora do processador por um instante
++		// -- e num headset ela disputa com composicao, decodificador e o
++		// nosso proprio shader -- o kernel descarta o excedente sem avisar
++		// ninguem. Do lado de fora a rede esta impecavel: o pacote chegou na
++		// antena, foi perdido dentro do aparelho.
++		//
++		// Isso fecha um circulo que o diario mostrava e eu tinha lido ao
++		// contrario: falha de FEC -> pedido de IDR -> quadro-chave grande em
++		// rajada -> estouro do balde -> falha de FEC. As 132 falhas
++		// concentradas justamente na janela de jogo, com 21 pedidos de IDR no
++		// meio, sao a assinatura disso, e nao de uma rede ruim.
++		//
++		// 1 MB da folga de ~320 ms na mesma conta. O kernel pode conceder
++		// menos (o teto e net.core.rmem_max e nao ha como forca-lo sem
++		// capacidade de rede), por isso o valor concedido e lido de volta e
++		// registrado: se vier abaixo do pedido, esta escrito no diario.
++		{
++			const int wanted = 1024 * 1024;
++			if(setsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF,
++					(const CHIAKI_SOCKET_BUF_TYPE)&wanted, sizeof(wanted)) < 0)
++				CHIAKI_LOGW(takion->log, "P5M: 1 MB SO_RCVBUF refused; carrying on with chiaki's");
++			else
++			{
++				int granted = 0;
++				socklen_t granted_size = sizeof(granted);
++				if(getsockopt(takion->sock, SOL_SOCKET, SO_RCVBUF,
++						(CHIAKI_SOCKET_BUF_TYPE)&granted, &granted_size) == 0)
++					CHIAKI_LOGW(takion->log, "P5M: receive buffer asked %d B, granted %d B "
++							"(the kernel usually doubles what was asked)", wanted, granted);
++				else
++					CHIAKI_LOGW(takion->log, "P5M: receive buffer asked %d B, grant unreadable", wanted);
++			}
++		}
+ 	}
+ 
+ 	err = chiaki_thread_create(&takion->thread, takion_thread_func, takion);
+diff --git a/android/app/src/main/cpp/chiaki-jni.c b/android/app/src/main/cpp/chiaki-jni.c
+--- a/android/app/src/main/cpp/chiaki-jni.c
++++ b/android/app/src/main/cpp/chiaki-jni.c
+@@ -156,6 +156,14 @@
+ 	jfieldID java_controller_touch_y;
+ 	jfieldID java_controller_touch_id;
+ 
++	// P5M: estado da conversao de haptica em vibracao (ver o callback abaixo).
++	uint32_t haptics_accum_l;
++	uint32_t haptics_accum_r;
++	unsigned int haptics_accum_count;
++	int haptics_last_l;
++	int haptics_last_r;
++	bool haptics_logged;
++
+ 	AndroidChiakiVideoDecoder video_decoder;
+ 	AndroidChiakiAudioDecoder audio_decoder;
+ 	void *audio_output;
+@@ -206,6 +214,118 @@
+ 	(*global_vm)->DetachCurrentThread(global_vm);
+ }
+ 
++// P5M: a vibracao do PS5 nao chega como vibracao.
++//
++// O diario de dev.76 nao mostrava nenhum pacote de tipo 7 (rumble) em tres
++// sessoes, e eu conclui que o console nao mandava nada. Estava errado, e o
++// proprio codigo do chiaki-ng diz por que.
++//
++// O DualSense nao tem motor de rotacao: tem dois atuadores de bobina, que sao
++// alto-falantes. O console nao manda "esquerdo 200, direito 40" -- ele manda
++// *audio*, um segundo fluxo PCM estereo de 16 bits marcado com is_haptics, na
++// mesma via do som do jogo. Por isso o grep por tipos de dado nunca acharia:
++// haptica nao e um tipo de dado, e uma trilha de audio.
++//
++// E o console so manda esse fluxo se o cliente se apresentar como DualSense.
++// A porta Android do chiaki nunca preencheu enable_dualsense: o ConnectInfo
++// saia zerado, o cliente se anunciava como DualShock 4, e um DualShock 4 nao
++// recebe haptica. O que veio depois disso e coerente com o pedido: nada.
++//
++// Aqui fechamos os dois lados. enable_dualsense faz o console mandar, e este
++// callback transforma o audio em intensidade. E a mesma conversao que o
++// chiaki-ng usa no desktop para controle por Bluetooth ("rumble emulado"),
++// porque Bluetooth nao carrega audio ate o controle -- so o comando antigo de
++// vibrar. Media do valor absoluto das amostras, piso para nao vibrar por
++// ruido, media de tres pacotes para nao trepidar a cada 10 ms.
++#define P5M_HAPTICS_MIN_STRENGTH 100
++#define P5M_HAPTICS_PACKETS_PER_RUMBLE 3
++#define P5M_HAPTICS_GAIN 2
++#define P5M_HAPTICS_FLOOR 40
++
++static void android_chiaki_haptics_frame(uint8_t *buf, size_t buf_size, void *user)
++{
++	AndroidChiakiSession *session = user;
++	const size_t sample_size = 2 * sizeof(int16_t); // estereo
++	size_t samples = buf_size / sample_size;
++	if(!samples)
++		return;
++
++	if(!session->haptics_logged)
++	{
++		session->haptics_logged = true;
++		CHIAKI_LOGW(session->log, "P5M: first haptics frame from the console (%zu bytes, %zu samples)",
++				buf_size, samples);
++	}
++
++	uint32_t sum_l = 0, sum_r = 0;
++	for(size_t i = 0; i < samples; i++)
++	{
++		int16_t l = 0, r = 0;
++		memcpy(&l, buf + i * sample_size, sizeof(int16_t));
++		memcpy(&r, buf + i * sample_size + sizeof(int16_t), sizeof(int16_t));
++		sum_l += (uint32_t)(l < 0 ? -(int32_t)l : (int32_t)l) * 2;
++		sum_r += (uint32_t)(r < 0 ? -(int32_t)r : (int32_t)r) * 2;
++	}
++
++	uint32_t left = sum_l / samples;
++	uint32_t right = sum_r / samples;
++	if(left < P5M_HAPTICS_MIN_STRENGTH)
++		left = 0;
++	if(right < P5M_HAPTICS_MIN_STRENGTH)
++		right = 0;
++
++	session->haptics_accum_l += left;
++	session->haptics_accum_r += right;
++	if(++session->haptics_accum_count < P5M_HAPTICS_PACKETS_PER_RUMBLE)
++		return;
++
++	left = session->haptics_accum_l / P5M_HAPTICS_PACKETS_PER_RUMBLE;
++	right = session->haptics_accum_r / P5M_HAPTICS_PACKETS_PER_RUMBLE;
++	session->haptics_accum_l = 0;
++	session->haptics_accum_r = 0;
++	session->haptics_accum_count = 0;
++
++	// Do audio de 16 bits para a intensidade de 8 bits do vibrador.
++	//
++	// O >> 8 sozinho seria a conversao fiel -- e o equivalente ao "Normal" do
++	// chiaki-ng, que entrega 16 bits ao SDL. Aqui ele nao serve: o destino nao
++	// e a bobina do DualSense, e o motor comum acionado por relatorio HID do
++	// Bluetooth, que so comeca a ser sentido bem acima do zero. Um efeito leve
++	// (media de umas poucas milhares de amostras) viraria 3 em 255 e nao seria
++	// sentido -- indistinguivel de nao ter chegado nada, que e exatamente a
++	// duvida que este caminho existe para responder.
++	//
++	// Entao: ganho de 2 (o "Strong" do chiaki-ng) e piso de 40 para o que
++	// passou do limiar. O piso nao inventa vibracao onde nao ha; ele so
++	// garante que o que o jogo mandou seja perceptivel. Se em jogo tudo sair
++	// forte demais, sao estes dois numeros.
++	uint32_t scaled_l = left * P5M_HAPTICS_GAIN;
++	uint32_t scaled_r = right * P5M_HAPTICS_GAIN;
++	int rumble_l = (int)((scaled_l > 0xffff ? 0xffff : scaled_l) >> 8);
++	int rumble_r = (int)((scaled_r > 0xffff ? 0xffff : scaled_r) >> 8);
++	if(left > 0 && rumble_l < P5M_HAPTICS_FLOOR)
++		rumble_l = P5M_HAPTICS_FLOOR;
++	if(right > 0 && rumble_r < P5M_HAPTICS_FLOOR)
++		rumble_r = P5M_HAPTICS_FLOOR;
++
++	// Deduplicacao antes do JNI, e nao depois. Do outro lado Rumble.set() ja
++	// descarta valor repetido, mas para descobrir isso ele precisaria ter
++	// atravessado a fronteira -- e atravessar significa anexar e desanexar a
++	// thread do takion, a mesma que entrega video, cem vezes por segundo.
++	if(rumble_l == session->haptics_last_l && rumble_r == session->haptics_last_r)
++		return;
++	session->haptics_last_l = rumble_l;
++	session->haptics_last_r = rumble_r;
++
++	JNIEnv *env = attach_thread_jni();
++	if(!env)
++		return;
++	E->CallVoidMethod(env, session->java_session,
++					  session->java_session_event_rumble_meth,
++					  (jint)rumble_l, (jint)rumble_r);
++	(*global_vm)->DetachCurrentThread(global_vm);
++}
++
+ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject result, jobject connect_info_obj, jstring log_file_str, jboolean log_verbose, jobject java_session)
+ {
+ 	AndroidChiakiSession *session = NULL;
+@@ -259,6 +379,13 @@
+ 	// enquanto espera o quadro que ja pediu.
+ 	connect_info.enable_idr_on_fec_failure = true;
+ 
++	// P5M: apresentar-se como DualSense. Sem isto o console manda o
++	// CONTROLLERCONNECTION com tipo DUALSHOCK4 e nunca abre a trilha de
++	// haptica -- era essa a razao de o diario nao mostrar vibracao nenhuma.
++	// Ligar tambem faz o ctrl mandar ENABLE_DUALSENSE_FEATURES, que e o que
++	// habilita gatilhos adaptativos do lado do console.
++	connect_info.enable_dualsense = true;
++
+ 	const char *str_borrow = E->GetStringUTFChars(env, host_string, NULL);
+ 	connect_info.host = host_str = strdup(str_borrow);
+ 	E->ReleaseStringUTFChars(env, host_string, str_borrow);
+@@ -349,6 +476,17 @@
+ 	session->java_session_event_quit_meth = E->GetMethodID(env, session->java_session_class, "eventQuit", "(ILjava/lang/String;)V");
+ 	session->java_session_event_rumble_meth = E->GetMethodID(env, session->java_session_class, "eventRumble", "(II)V");
+ 
++	// O sink de haptica so pode ser ligado depois dos method ids: o callback
++	// usa java_session_event_rumble_meth, e a trilha pode comecar a chegar
++	// assim que a sessao subir.
++	{
++		ChiakiAudioSink haptics_sink;
++		haptics_sink.user = session;
++		haptics_sink.header_cb = NULL;
++		haptics_sink.frame_cb = android_chiaki_haptics_frame;
++		chiaki_session_set_haptics_sink(&session->session, &haptics_sink);
++	}
++
+ 	jclass controller_state_class = E->FindClass(env, BASE_PACKAGE"/ControllerState");
+ 	session->java_controller_state_buttons = E->GetFieldID(env, controller_state_class, "buttons", "I");
+ 	session->java_controller_state_l2_state = E->GetFieldID(env, controller_state_class, "l2State", "B");

@@ -1,0 +1,537 @@
+diff --git a/android/app/src/main/cpp/chiaki-jni.c b/android/app/src/main/cpp/chiaki-jni.c
+--- a/android/app/src/main/cpp/chiaki-jni.c
++++ b/android/app/src/main/cpp/chiaki-jni.c
+@@ -9,6 +9,7 @@
+ #include <chiaki/session.h>
+ #include <chiaki/discoveryservice.h>
+ #include <chiaki/regist.h>
++#include <chiaki/remote/holepunch.h>
+ 
+ #include <string.h>
+ #include <linux/in.h>
+@@ -156,6 +157,11 @@
+ 	jfieldID java_controller_touch_y;
+ 	jfieldID java_controller_touch_id;
+ 
++	// P5M: sessao de holepunch da conexao remota via PSN. Depois de
++	// entregue ao chiaki_session_init, quem a libera e o chiaki_session_fini;
++	// guardamos o ponteiro so para poder conduzir a furacao de NAT.
++	ChiakiHolepunchSession holepunch;
++
+ 	// P5M: estado da conversao de haptica em vibracao (ver o callback abaixo).
+ 	uint32_t haptics_accum_l;
+ 	uint32_t haptics_accum_r;
+@@ -348,6 +354,14 @@
+ 	jobject connect_video_profile_obj = E->GetObjectField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "videoProfile", "L"BASE_PACKAGE"/ConnectVideoProfile;"));
+ 	jclass connect_video_profile_class = E->GetObjectClass(env, connect_video_profile_obj);
+ 
++	// P5M: os tres campos da conexao remota via PSN. Vazios na conexao
++	// local, que e o caminho que este arquivo sempre teve.
++	jstring duid_string = E->GetObjectField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "duid", "Ljava/lang/String;"));
++	jstring psn_token_string = E->GetObjectField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "psnToken", "Ljava/lang/String;"));
++	jbyteArray psn_account_id_array = E->GetObjectField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "psnAccountId", "[B"));
++	const char *duid_borrow = duid_string ? E->GetStringUTFChars(env, duid_string, NULL) : NULL;
++	const bool psn_mode = duid_borrow && duid_borrow[0];
++
+ 	ChiakiConnectInfo connect_info = { 0 };
+ 	connect_info.ps5 = ps5;
+ 
+@@ -395,25 +409,34 @@
+ 		goto beach;
+ 	}
+ 
+-	if(E->GetArrayLength(env, regist_key_array) != sizeof(connect_info.regist_key))
++	// Na conexao remota nao ha chave de registro para passar: a propria
++	// libchiaki registra de novo por dentro do tunel, usando so o id da conta
++	// PSN, e escreve regist_key e morning no connect_info quando termina
++	// (lib/src/session.c, regist_cb). Por isso os dois arrays chegam vazios do
++	// Kotlin nesse modo, e conferir o tamanho deles seria recusar uma conexao
++	// que nao precisa deles.
++	if(!psn_mode)
+ 	{
+-		CHIAKI_LOGE(log, "Regist Key passed from Java has invalid length");
+-		err = CHIAKI_ERR_INVALID_DATA;
+-		goto beach;
+-	}
+-	jbyte *bytes = E->GetByteArrayElements(env, regist_key_array, NULL);
+-	memcpy(connect_info.regist_key, bytes, sizeof(connect_info.regist_key));
+-	E->ReleaseByteArrayElements(env, regist_key_array, bytes, JNI_ABORT);
++		if(E->GetArrayLength(env, regist_key_array) != sizeof(connect_info.regist_key))
++		{
++			CHIAKI_LOGE(log, "Regist Key passed from Java has invalid length");
++			err = CHIAKI_ERR_INVALID_DATA;
++			goto beach;
++		}
++		jbyte *bytes = E->GetByteArrayElements(env, regist_key_array, NULL);
++		memcpy(connect_info.regist_key, bytes, sizeof(connect_info.regist_key));
++		E->ReleaseByteArrayElements(env, regist_key_array, bytes, JNI_ABORT);
+ 
+-	if(E->GetArrayLength(env, morning_array) != sizeof(connect_info.morning))
+-	{
+-		CHIAKI_LOGE(log, "Morning passed from Java has invalid length");
+-		err = CHIAKI_ERR_INVALID_DATA;
+-		goto beach;
++		if(E->GetArrayLength(env, morning_array) != sizeof(connect_info.morning))
++		{
++			CHIAKI_LOGE(log, "Morning passed from Java has invalid length");
++			err = CHIAKI_ERR_INVALID_DATA;
++			goto beach;
++		}
++		bytes = E->GetByteArrayElements(env, morning_array, NULL);
++		memcpy(connect_info.morning, bytes, sizeof(connect_info.morning));
++		E->ReleaseByteArrayElements(env, morning_array, bytes, JNI_ABORT);
+ 	}
+-	bytes = E->GetByteArrayElements(env, morning_array, NULL);
+-	memcpy(connect_info.morning, bytes, sizeof(connect_info.morning));
+-	E->ReleaseByteArrayElements(env, morning_array, bytes, JNI_ABORT);
+ 
+ 	connect_info.video_profile.width = (unsigned int)E->GetIntField(env, connect_video_profile_obj, E->GetFieldID(env, connect_video_profile_class, "width", "I"));
+ 	connect_info.video_profile.height = (unsigned int)E->GetIntField(env, connect_video_profile_obj, E->GetFieldID(env, connect_video_profile_class, "height", "I"));
+@@ -457,6 +480,67 @@
+ 
+ 	android_chiaki_audio_decoder_set_cb(&session->audio_decoder, android_chiaki_audio_output_settings, android_chiaki_audio_output_frame, session->audio_output);
+ 
++	// P5M: conexao remota via PSN.
++	//
++	// Fora de casa a descoberta nao encontra nada: ela e broadcast UDP na rede
++	// local, e broadcast nao atravessa a internet. O caminho que resta e o que
++	// a Sony usa no proprio app -- furar o NAT dos dois lados com a ajuda dos
++	// servidores dela. Todo o protocolo ja estava compilado dentro deste APK
++	// (lib/src/remote/holepunch.c); faltava so alguem chamar.
++	//
++	// Aqui a sessao e criada e entregue ao connect_info. A furacao em si e
++	// demorada e bloqueia, entao mora em sessionConnectPsn, chamada de uma
++	// thread do Kotlin entre este create e o start.
++	if(psn_mode)
++	{
++		const char *token = psn_token_string ? E->GetStringUTFChars(env, psn_token_string, NULL) : NULL;
++		if(!token || !token[0])
++		{
++			CHIAKI_LOGE(log, "P5M: conexao remota pedida sem token PSN");
++			err = CHIAKI_ERR_INVALID_DATA;
++		}
++		else
++		{
++			session->holepunch = chiaki_holepunch_session_init(token, log);
++			if(!session->holepunch)
++			{
++				CHIAKI_LOGE(log, "P5M: failed to start the holepunch session");
++				err = CHIAKI_ERR_MEMORY;
++			}
++		}
++		if(token)
++			E->ReleaseStringUTFChars(env, psn_token_string, token);
++
++		if(err == CHIAKI_ERR_SUCCESS)
++		{
++			if(!psn_account_id_array
++					|| E->GetArrayLength(env, psn_account_id_array) != CHIAKI_PSN_ACCOUNT_ID_SIZE)
++			{
++				CHIAKI_LOGE(log, "P5M: id de conta PSN ausente ou com tamanho errado");
++				err = CHIAKI_ERR_INVALID_DATA;
++			}
++			else
++			{
++				jbyte *id_bytes = E->GetByteArrayElements(env, psn_account_id_array, NULL);
++				memcpy(connect_info.psn_account_id, id_bytes, CHIAKI_PSN_ACCOUNT_ID_SIZE);
++				E->ReleaseByteArrayElements(env, psn_account_id_array, id_bytes, JNI_ABORT);
++				connect_info.holepunch_session = session->holepunch;
++			}
++		}
++
++		if(err != CHIAKI_ERR_SUCCESS)
++		{
++			if(session->holepunch)
++				chiaki_holepunch_session_fini(session->holepunch);
++			android_chiaki_video_decoder_fini(&session->video_decoder);
++			android_chiaki_audio_decoder_fini(&session->audio_decoder);
++			android_chiaki_audio_output_free(session->audio_output);
++			free(session);
++			session = NULL;
++			goto beach;
++		}
++	}
++
+ 	err = chiaki_session_init(&session->session, &connect_info, log);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 	{
+@@ -520,6 +604,8 @@
+ 	chiaki_session_set_audio_sink(&session->session, &audio_sink);
+ 
+ beach:
++	if(duid_borrow)
++		E->ReleaseStringUTFChars(env, duid_string, duid_borrow);
+ 	if(!session && log)
+ 	{
+ 		android_chiaki_file_log_fini(log);
+@@ -658,6 +744,256 @@
+ 	E->ReleaseStringUTFChars(env, pin_java, pin);
+ }
+ 
++// Recolhe as linhas que a libchiaki registra durante uma chamada.
++//
++// Sem isto o motivo de uma falha existe, mas em lugar nenhum util: o log da
++// libchiaki no Android vai para o logcat, e o diario do P5M e outro arquivo.
++// Quem esta longe de casa, sem PC, nao le logcat -- entao a mensagem que
++// explica a falha morre a dois metros de quem precisa dela.
++//
++// Com um log proprio passado so para a chamada, a linha ("... failed with HTTP
++// code 401", por exemplo) volta como texto e sobe ate a tela.
++#define P5M_CAPTURA_MAX 512
++
++// Definida em log.c e nao declarada em log.h. E o callback que escreve no
++// logcat; queremos capturar *e* continuar escrevendo lá.
++void log_cb_android(ChiakiLogLevel level, const char *msg, void *user);
++
++typedef struct p5m_captura_t
++{
++	char texto[P5M_CAPTURA_MAX];
++	size_t usado;
++} P5mCaptura;
++
++static void p5m_captura_cb(ChiakiLogLevel level, const char *msg, void *user)
++{
++	P5mCaptura *c = user;
++	// Repassa para o logcat tambem: quem tiver PC continua vendo tudo.
++	log_cb_android(level, msg, NULL);
++	if(level != CHIAKI_LOG_ERROR && level != CHIAKI_LOG_WARNING)
++		return;
++	if(c->usado + 2 >= sizeof(c->texto))
++		return;
++	// A ultima linha de erro e a que interessa; as anteriores ficam se couberem.
++	int escrito = snprintf(c->texto + c->usado, sizeof(c->texto) - c->usado,
++			"%s%s", c->usado ? " | " : "", msg);
++	if(escrito > 0)
++		c->usado += (size_t)escrito;
++	if(c->usado >= sizeof(c->texto))
++		c->usado = sizeof(c->texto) - 1;
++}
++
++// Dois caracteres hexadecimais viram um byte, ou a funcao devolve falso.
++// Existe aqui em vez de usar o parse_hex da libchiaki porque aquele mora em
++// lib/src/utils.h, que e cabecalho privado e nao esta no caminho de include
++// deste arquivo.
++static bool p5m_hex_byte(const char *duo, uint8_t *out)
++{
++	uint8_t valor = 0;
++	for(int i = 0; i < 2; i++)
++	{
++		char c = duo[i];
++		uint8_t digito;
++		if(c >= '0' && c <= '9')
++			digito = (uint8_t)(c - '0');
++		else if(c >= 'a' && c <= 'f')
++			digito = (uint8_t)(c - 'a' + 10);
++		else if(c >= 'A' && c <= 'F')
++			digito = (uint8_t)(c - 'A' + 10);
++		else
++			return false;
++		valor = (uint8_t)((valor << 4) | digito);
++	}
++	*out = valor;
++	return true;
++}
++
++// P5M: as tres funcoes da conexao remota via PSN.
++//
++// Nenhuma delas inventa protocolo: a libchiaki ja traz tudo pronto e este e o
++// mesmo roteiro que o chiaki-ng roda no desktop (gui/src/streamsession.cpp,
++// ConnectPsnConnection). O que faltava era a ponte -- a porta Android nunca
++// expos nada disso ao Kotlin.
++
++JNIEXPORT jstring JNICALL JNI_FCN(psnDuid)(JNIEnv *env, jobject obj)
++{
++	char duid[CHIAKI_DUID_STR_SIZE];
++	size_t duid_size = sizeof(duid);
++	ChiakiErrorCode err = chiaki_holepunch_generate_client_device_uid(duid, &duid_size);
++	if(err != CHIAKI_ERR_SUCCESS)
++	{
++		CHIAKI_LOGE(&global_log, "P5M: failed to generate the client duid");
++		return NULL;
++	}
++	return E->NewStringUTF(env, duid);
++}
++
++JNIEXPORT jobjectArray JNICALL JNI_FCN(psnListDevices)(JNIEnv *env, jobject obj, jstring token_string, jboolean ps5)
++{
++	// O primeiro elemento e sempre o estado: "ok" ou "erro\t<motivo>". Os
++	// consoles vem depois.
++	//
++	// Antes esta funcao devolvia NULL em qualquer falha, e do lado de la NULL e
++	// lista vazia viravam a mesma frase na tela -- "no console showed up".
++	// Sao tres coisas diferentes: token recusado, servidor fora, e conta que
++	// realmente nao tem console visivel. So a terceira e sobre o console; as
++	// outras duas sao sobre nos. Juntar as tres numa mensagem so foi o que fez
++	// a primeira falha de verdade nao dizer nada.
++	jclass string_class = E->FindClass(env, "java/lang/String");
++
++	const char *token = token_string ? E->GetStringUTFChars(env, token_string, NULL) : NULL;
++	if(!token || !token[0])
++	{
++		if(token)
++			E->ReleaseStringUTFChars(env, token_string, token);
++		jobjectArray so_erro = E->NewObjectArray(env, 1, string_class, NULL);
++		jstring linha = E->NewStringUTF(env, "error\tno access token");
++		E->SetObjectArrayElement(env, so_erro, 0, linha);
++		E->DeleteLocalRef(env, linha);
++		return so_erro;
++	}
++
++	// Log proprio so para esta chamada, para o motivo da falha voltar como
++	// texto em vez de sumir no logcat.
++	P5mCaptura captura = { .texto = { 0 }, .usado = 0 };
++	ChiakiLog log_capturado;
++	chiaki_log_init(&log_capturado, CHIAKI_LOG_ALL & ~CHIAKI_LOG_VERBOSE,
++			p5m_captura_cb, &captura);
++
++	ChiakiHolepunchDeviceInfo *devices = NULL;
++	size_t count = 0;
++	ChiakiErrorCode err = chiaki_holepunch_list_devices(token,
++			ps5 ? CHIAKI_HOLEPUNCH_CONSOLE_TYPE_PS5 : CHIAKI_HOLEPUNCH_CONSOLE_TYPE_PS4,
++			&devices, &count, &log_capturado);
++	E->ReleaseStringUTFChars(env, token_string, token);
++	if(err != CHIAKI_ERR_SUCCESS)
++	{
++		CHIAKI_LOGE(&global_log, "P5M: PSN refused the console list (%s)", chiaki_error_string(err));
++		char linha_erro[P5M_CAPTURA_MAX + 128];
++		snprintf(linha_erro, sizeof(linha_erro), "error\t%s%s%s",
++				chiaki_error_string(err),
++				captura.usado ? " — " : "",
++				captura.usado ? captura.texto : "");
++		jobjectArray so_erro = E->NewObjectArray(env, 1, string_class, NULL);
++		jstring linha = E->NewStringUTF(env, linha_erro);
++		E->SetObjectArrayElement(env, so_erro, 0, linha);
++		E->DeleteLocalRef(env, linha);
++		return so_erro;
++	}
++
++	// Registrado em WARNING, e nao em INFO, pelo mesmo motivo das marcacoes de
++	// socket: o log_cb do Android mapeia WARNING para ANDROID_LOG_ERROR, e e
++	// isso que o diario do P5M captura. Em INFO estas linhas existiriam so
++	// no buffer circular do logcat -- e sem PC, longe de casa, uma linha que
++	// nao chega ao diario nao chega a lugar nenhum.
++	CHIAKI_LOGW(&global_log, "P5M: a PSN respondeu com %zu console(s) na conta", count);
++
++	jobjectArray out = E->NewObjectArray(env, (jsize)count + 1, string_class, NULL);
++	jstring estado = E->NewStringUTF(env, "ok");
++	E->SetObjectArrayElement(env, out, 0, estado);
++	E->DeleteLocalRef(env, estado);
++
++	for(size_t i = 0; i < count; i++)
++	{
++		char linha[32 * 2 + 1 + sizeof(devices[i].device_name) + 8];
++		char hex[sizeof(devices[i].device_uid) * 2 + 1];
++		for(size_t b = 0; b < sizeof(devices[i].device_uid); b++)
++			snprintf(hex + b * 2, 3, "%02x", devices[i].device_uid[b]);
++		// device_name pode vir sem terminador se ocupar os 32 bytes.
++		char nome[sizeof(devices[i].device_name) + 1];
++		memcpy(nome, devices[i].device_name, sizeof(devices[i].device_name));
++		nome[sizeof(devices[i].device_name)] = '\0';
++		snprintf(linha, sizeof(linha), "%s\t%s\t%d", hex, nome, devices[i].remoteplay_enabled ? 1 : 0);
++		CHIAKI_LOGW(&global_log, "P5M: console %zu on the PSN account (remote play %s)",
++				i + 1, devices[i].remoteplay_enabled ? "on" : "off");
++		jstring linha_java = E->NewStringUTF(env, linha);
++		E->SetObjectArrayElement(env, out, (jsize)i + 1, linha_java);
++		E->DeleteLocalRef(env, linha_java);
++	}
++	chiaki_holepunch_free_device_list(&devices);
++	return out;
++}
++
++JNIEXPORT jint JNICALL JNI_FCN(sessionConnectPsn)(JNIEnv *env, jobject obj, jlong ptr, jstring duid_string, jboolean ps5)
++{
++	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
++	if(!session || !session->holepunch)
++		return (jint)CHIAKI_ERR_INVALID_DATA;
++
++	const char *duid = E->GetStringUTFChars(env, duid_string, NULL);
++	size_t duid_len = strlen(duid);
++	// device_uid tem 32 bytes, entao 64 caracteres em hexadecimal. O buffer
++	// segue esse tamanho e nada maior e aceito.
++	uint8_t duid_bytes[32];
++	const size_t duid_bytes_len = duid_len / 2;
++	bool duid_ok = duid_len == sizeof(duid_bytes) * 2;
++	memset(duid_bytes, 0, sizeof(duid_bytes));
++	for(size_t i = 0; duid_ok && i < duid_bytes_len; i++)
++		duid_ok = p5m_hex_byte(duid + i * 2, duid_bytes + i);
++	E->ReleaseStringUTFChars(env, duid_string, duid);
++	if(!duid_ok)
++	{
++		CHIAKI_LOGE(session->log, "P5M: the console duid is not %zu hex characters",
++				sizeof(duid_bytes) * 2);
++		return (jint)CHIAKI_ERR_INVALID_DATA;
++	}
++
++	ChiakiErrorCode err;
++
++	ChiakiHolepunchConsoleType tipo = ps5
++			? CHIAKI_HOLEPUNCH_CONSOLE_TYPE_PS5
++			: CHIAKI_HOLEPUNCH_CONSOLE_TYPE_PS4;
++
++	// A ordem destes cinco passos e obrigatoria e esta documentada no topo de
++	// lib/include/chiaki/remote/holepunch.h. Cada um registra o proprio sucesso
++	// porque, quando a coisa falha longe de casa, saber ate onde chegou e a
++	// diferenca entre "PSN did not answer" e "the console did not accept".
++	err = chiaki_holepunch_upnp_discover(session->holepunch);
++	if(err != CHIAKI_ERR_SUCCESS)
++	{
++		// Nao e fatal: UPnP so ajuda quando o roteador daqui coopera.
++		CHIAKI_LOGW(session->log, "P5M: UPnP unavailable on this network; carrying on without it");
++	}
++	err = chiaki_holepunch_session_create(session->holepunch);
++	if(err != CHIAKI_ERR_SUCCESS)
++	{
++		CHIAKI_LOGE(session->log, "P5M: PSN refused to create the remote session (%s)", chiaki_error_string(err));
++		return (jint)err;
++	}
++	CHIAKI_LOGW(session->log, "P5M: remote session created on PSN");
++
++	err = holepunch_session_create_offer(session->holepunch);
++	if(err != CHIAKI_ERR_SUCCESS)
++	{
++		CHIAKI_LOGE(session->log, "P5M: failed to build the control offer (%s)", chiaki_error_string(err));
++		return (jint)err;
++	}
++	err = chiaki_holepunch_session_start(session->holepunch, duid_bytes, tipo);
++	if(err != CHIAKI_ERR_SUCCESS)
++	{
++		CHIAKI_LOGE(session->log, "P5M: the console did not answer PSN's call (%s)", chiaki_error_string(err));
++		return (jint)err;
++	}
++	CHIAKI_LOGW(session->log, "P5M: console acordado pela PSN, furando o NAT");
++
++	err = chiaki_holepunch_session_punch_hole(session->holepunch, CHIAKI_HOLEPUNCH_PORT_TYPE_CTRL);
++	if(err != CHIAKI_ERR_SUCCESS)
++	{
++		CHIAKI_LOGE(session->log, "P5M: could not punch through NAT for the control path (%s)", chiaki_error_string(err));
++		return (jint)err;
++	}
++	CHIAKI_LOGW(session->log, "P5M: control path open; the rest is a normal session");
++	return (jint)CHIAKI_ERR_SUCCESS;
++}
++
++JNIEXPORT void JNICALL JNI_FCN(sessionCancelPsn)(JNIEnv *env, jobject obj, jlong ptr)
++{
++	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
++	if(!session || !session->holepunch)
++		return;
++	chiaki_holepunch_main_thread_cancel(session->holepunch, true);
++}
++
+ typedef struct android_discovery_service_t
+ {
+ 	ChiakiDiscoveryService service;
+diff --git a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+--- a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+@@ -69,7 +69,14 @@
+ 	val host: String,
+ 	val registKey: ByteArray,
+ 	val morning: ByteArray,
+-	val videoProfile: ConnectVideoProfile
++	val videoProfile: ConnectVideoProfile,
++	// P5M: conexao remota via PSN. Os tres vem vazios numa conexao local, e
++	// e o duid vazio que diz ao lado nativo qual dos dois caminhos seguir.
++	// Como sao os ultimos campos e tem valor padrao, nenhuma chamada existente
++	// precisou mudar.
++	val duid: String = "",
++	val psnToken: String = "",
++	val psnAccountId: ByteArray = ByteArray(0)
+ ): Parcelable
+ 
+ private class ChiakiNative
+@@ -101,6 +108,70 @@
+ 		@JvmStatic external fun registStart(result: CreateResult, registInfo: RegistInfo, javaLog: ChiakiLog, javaRegist: Regist)
+ 		@JvmStatic external fun registStop(ptr: Long)
+ 		@JvmStatic external fun registFree(ptr: Long)
++		// P5M: conexao remota via PSN.
++		@JvmStatic external fun psnDuid(): String?
++		@JvmStatic external fun psnListDevices(token: String, ps5: Boolean): Array<String>?
++		@JvmStatic external fun sessionConnectPsn(ptr: Long, duid: String, ps5: Boolean): Int
++		@JvmStatic external fun sessionCancelPsn(ptr: Long)
++	}
++}
++
++/**
++ * P5M: um console visto pela conta PSN, e nao pela rede local.
++ *
++ * O [duid] e o identificador que a Sony da ao aparelho -- 64 caracteres em
++ * hexadecimal. E ele, e nao um endereco IP, que enderaca o console na conexao
++ * remota: e justamente por isso que ela funciona de qualquer lugar.
++ */
++data class PsnDevice(val duid: String, val name: String, val remotePlayEnabled: Boolean, val ps5: Boolean)
++
++/**
++ * P5M: resultado de uma consulta a lista de consoles.
++ *
++ * Lista vazia e falha nao sao a mesma coisa, e tratar as duas como "nao achei
++ * nada" foi o que fez a primeira falha de verdade nao dizer nada. [error] nulo
++ * com [devices] vazia significa que a conta respondeu e nao tem console
++ * visivel -- que e uma informacao, nao um defeito.
++ */
++data class PsnDeviceList(val error: String?, val devices: List<PsnDevice>)
++
++/**
++ * P5M: a porta de entrada da conexao remota, publica porque ChiakiNative
++ * nao e.
++ */
++object ChiakiPsn
++{
++	/**
++	 * Identificador deste cliente, exigido como parametro do login PSN.
++	 *
++	 * O token so serve para furar NAT se tiver sido criado com um duid, entao
++	 * este valor precisa entrar na URL de login e nao pode ser inventado do
++	 * lado Kotlin.
++	 */
++	fun clientDuid(): String? = ChiakiNative.psnDuid()
++
++	/**
++	 * Consoles da conta. Faz rede: nunca chame da thread principal.
++	 *
++	 * So PS5: a libchiaki recusa PS4 na primeira linha de
++	 * chiaki_holepunch_list_devices, entao pedir a lista de PS4 e gastar uma
++	 * chamada para receber um erro previsivel.
++	 */
++	fun listDevices(token: String): PsnDeviceList
++	{
++		val linhas = ChiakiNative.psnListDevices(token, true)
++			?: return PsnDeviceList("the native side did not answer", emptyList())
++		if(linhas.isEmpty())
++			return PsnDeviceList("the native side answered empty", emptyList())
++		val estado = linhas[0].split("\t")
++		if(estado[0] != "ok")
++			return PsnDeviceList(estado.getOrNull(1) ?: "error with no reason", emptyList())
++		val devices = linhas.drop(1).mapNotNull {
++			val partes = it.split("\t")
++			if(partes.size < 3) null
++			else PsnDevice(partes[0], partes[1], partes[2] == "1", true)
++		}
++		return PsnDeviceList(null, devices)
+ 	}
+ }
+ 
+@@ -345,6 +416,23 @@
+ 	fun start() = ErrorCode(ChiakiNative.sessionStart(nativePtr))
+ 	fun stop() = ErrorCode(ChiakiNative.sessionStop(nativePtr))
+ 
++	/**
++	 * P5M: fura o NAT antes de [start], na conexao remota via PSN.
++	 *
++	 * Bloqueia por dezenas de segundos -- fala com os servidores da Sony, espera
++	 * o console atender e troca candidatos de rede -- entao nunca chame da
++	 * thread principal. Numa conexao local nao existe: o duid vazio faz o lado
++	 * nativo devolver erro sem tentar nada.
++	 */
++	fun connectPsn(duid: String, ps5: Boolean) = ErrorCode(ChiakiNative.sessionConnectPsn(nativePtr, duid, ps5))
++
++	/** Interrompe uma furacao em andamento. */
++	fun cancelPsn()
++	{
++		if(nativePtr != 0L)
++			ChiakiNative.sessionCancelPsn(nativePtr)
++	}
++
+ 	fun dispose()
+ 	{
+ 		if(nativePtr == 0L)

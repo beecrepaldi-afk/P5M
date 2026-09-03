@@ -1,0 +1,18 @@
+diff --git a/android/app/src/main/java/com/metallic/chiaki/main/MainActivity.kt b/android/app/src/main/java/com/metallic/chiaki/main/MainActivity.kt
+index 5bf1f49e..66d9b8e1 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/main/MainActivity.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/main/MainActivity.kt
+@@ -173,10 +173,9 @@ class MainActivity : AppCompatActivity()
+ 		{
+ 			fun connect() {
+ 				val connectInfo = ConnectInfo(host.isPS5, host.host, registeredHost.rpRegistKey, registeredHost.rpKey, Preferences(this).videoProfile)
+-				Intent(this, StreamActivity::class.java).let {
+-					it.putExtra(StreamActivity.EXTRA_CONNECT_INFO, connectInfo)
+-					startActivity(it)
+-				}
++				// P5M: janela ou imersivo, conforme a preferencia. A escolha
++				// mora em codigo nosso para este patch continuar de uma linha.
++				io.github.gblandro.p5m.DisplayMode.startStream(this, connectInfo)
+ 			}
+ 
+ 			if(host is DiscoveredDisplayHost && host.discoveredHost.state == DiscoveryHost.State.STANDBY)

@@ -1,0 +1,112 @@
+diff --git a/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt b/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt
+--- a/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt
+@@ -18,6 +18,11 @@
+ data class StreamStateQuit(val reason: QuitReason, val reasonString: String?): StreamState()
+ data class StreamStateLoginPinRequest(val pinIncorrect: Boolean): StreamState()
+ 
++// P5M: quanto esperar a furação de NAT desistir antes de liberar a sessão.
++// Generoso o bastante para o cancelamento chegar, curto o bastante para não
++// virar ANR na thread principal, de onde o ciclo de vida chama.
++private const val PSN_JOIN_TIMEOUT_MS = 3000L
++
+ class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, val logVerbose: Boolean, val input: StreamInput)
+ {
+ 	var session: Session? = null
+@@ -38,8 +43,42 @@
+ 		}
+ 	}
+ 
++	// P5M: a thread que fura o NAT, enquanto ela existir.
++	private var psnThread: Thread? = null
++
+ 	fun shutdown()
+ 	{
++		// P5M: a furação de NAT corre numa thread e usa a sessão nativa por
++		// dentro dela. Liberar a sessão embaixo dessa thread é uso de memória
++		// liberada, e não é hipótese: derrubou o processo com "pthread_mutex_lock
++		// called on a destroyed mutex", em pthread_cond_timedwait dentro de
++		// chiaki_holepunch_session_start.
++		//
++		// Cancelar acorda a espera do holepunch; o join é o que garante que
++		// ninguém está mais lá dentro quando o dispose acontecer.
++		val aindaDentro = psnThread?.let { t ->
++			if(!t.isAlive)
++				false
++			else
++			{
++				session?.cancelPsn()
++				t.join(PSN_JOIN_TIMEOUT_MS)
++				t.isAlive
++			}
++		} ?: false
++		psnThread = null
++
++		if(aindaDentro)
++		{
++			// Último recurso. Vazar a sessão é ruim; liberar memória que outra
++			// thread ainda está usando é pior, e é o que matava o processo.
++			Log.w("StreamSession", "NAT traversal did not finish in time; " +
++					"leaving the native session behind rather than freeing it")
++			session = null
++			_state.value = StreamStateIdle
++			return
++		}
++
+ 		session?.stop()
+ 		session?.dispose()
+ 		session = null
+@@ -49,6 +88,19 @@
+ 
+ 	fun pause()
+ 	{
++		// P5M: num headset, um painel 2D perde o foco por qualquer coisa --
++		// olhar para outro painel já basta -- e o onPause dispara. Derrubar a
++		// sessão aí é barato numa conexão local, que reconecta em segundos; na
++		// remota custa a furação inteira, que leva quase um minuto e teria de
++		// recomeçar do zero na PSN.
++		//
++		// Foi isso que matou a primeira furação que estava dando certo: ela
++		// trocava pacotes com o console quando o painel perdeu o foco.
++		//
++		// Enquanto a furação corre, o pause não desliga nada. O onDestroy
++		// continua desligando.
++		if(psnThread?.isAlive == true)
++			return
+ 		shutdown()
+ 	}
+ 
+@@ -61,11 +113,32 @@
+ 			val session = Session(connectInfo, logManager.createNewFile().file.absolutePath, logVerbose)
+ 			_state.value = StreamStateConnecting
+ 			session.eventCallback = this::eventCallback
+-			session.start()
+ 			val surface = surface
+ 			if(surface != null)
+ 				session.setSurface(surface)
+ 			this.session = session
++			// P5M: numa conexao remota via PSN e preciso furar o NAT antes de
++			// iniciar a sessao, e isso bloqueia por dezenas de segundos falando
++			// com os servidores da Sony. Numa conexao local o duid vem vazio e
++			// nada disso acontece -- o start e imediato, como sempre foi.
++			//
++			// A superficie e entregue antes do start agora. Ela so fica
++			// guardada ate o primeiro quadro, entao a ordem nao muda nada no
++			// caminho local, e no remoto evita que o decodificador comece sem
++			// destino enquanto a thread ainda esta furando.
++			if(connectInfo.duid.isEmpty())
++				session.start()
++			else
++			{
++				psnThread = Thread {
++					val err = session.connectPsn(connectInfo.duid, connectInfo.ps5)
++					if(err.isSuccess)
++						session.start()
++					else
++						_state.postValue(StreamStateCreateError(CreateError(err)))
++				}
++				psnThread?.start()
++			}
+ 		}
+ 		catch(e: CreateError)
+ 		{

@@ -1,0 +1,17 @@
+// Build de topo. As versoes seguem as que o chiaki-ng usa no projeto Android dele,
+// porque compilamos as fontes Kotlin do submodulo direto neste modulo.
+buildscript {
+    ext.kotlin_version = '1.8.0'
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:7.4.1'
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+    }
+}
+
+tasks.register('clean', Delete) {
+    delete rootProject.buildDir
+}

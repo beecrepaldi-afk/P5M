@@ -1,0 +1,360 @@
+--- a/android/app/src/main/cpp/video-decoder.h
++++ b/android/app/src/main/cpp/video-decoder.h
+@@ -8,6 +8,8 @@
+ #include <chiaki/thread.h>
+ #include <chiaki/log.h>
+ 
++#define P5M_STAMP_RING 256
++
+ typedef struct AMediaCodec AMediaCodec;
+ typedef struct ANativeWindow ANativeWindow;
+ 
+@@ -33,6 +35,38 @@
+ 	// fechamento ja e a garantia de que nenhuma entrega esta em curso.
+ 	ChiakiMutex render_mutex;
+ 	bool render_to_surface;
++	// P5M: medicao do caminho do video.
++	//
++	// Das duas pontas do caminho -- estatisticas de rede de um lado, latencia
++	// do compositor do outro -- ja havia numero. Do meio, nao: quanto tempo o
++	// quadro passa dentro do decodificador, e com que regularidade ele sai. E
++	// esse meio que decide se a imagem treme.
++	//
++	// A medicao vive aqui porque e aqui que as duas pontas do trecho existem:
++	// a entrada sabe quando o quadro foi entregue ao codec, a saida sabe
++	// quando ele voltou. Ninguem mais ve as duas.
++	ChiakiMutex stats_mutex;
++	// Carimbo de entrada por PTS. O PTS anda de um em um, entao o resto da
++	// divisao pelo tamanho do anel endereca direto. Guarda-se o PTS junto para
++	// que uma volta completa do anel apareca como desconhecido em vez de virar
++	// um numero errado.
++	uint64_t stamp_pts[P5M_STAMP_RING];
++	uint64_t stamp_ns[P5M_STAMP_RING];
++	// Janela de dez segundos. Tudo abaixo zera a cada resumo.
++	uint64_t window_start_ns;
++	uint64_t last_delivery_ns;
++	uint64_t decode_sum_us;
++	uint64_t gap_sum_us;
++	uint32_t decode_n, decode_min_us, decode_max_us;
++	uint32_t gap_n, gap_min_us, gap_max_us;
++	// Intervalo entre entregas, em quatro faixas em torno dos 16,7 ms de uma
++	// fonte de 60 fps: adiantado, no ritmo, um quadro de atraso, dois ou mais.
++	uint32_t gap_bucket[4];
++	uint32_t frames_rendered;
++	uint32_t frames_gated;
++	uint32_t decode_unknown;
++	// Intervalos grandes demais para serem jitter: a fonte parou.
++	uint32_t source_pauses;
+ 	int32_t target_width;
+ 	int32_t target_height;
+ 	ChiakiCodec target_codec;
+--- a/android/app/src/main/cpp/video-decoder.c
++++ b/android/app/src/main/cpp/video-decoder.c
+@@ -12,8 +12,61 @@
+ #include <stdint.h>
+ #include <android/log.h>
+ 
++#include <time.h>
++#include <stdio.h>
++
+ #define INPUT_BUFFER_TIMEOUT_MS 10
+ 
++// P5M: janela do resumo de desempenho.
++//
++// Dez segundos e um meio-termo deliberado: curto o bastante para que uma
++// travada de rede apareca isolada numa janela em vez de diluida na media da
++// sessao inteira, e longo o bastante para o diario nao virar uma linha por
++// segundo -- que era o defeito do log antigo, e o que fez o teto de tamanho
++// existir.
++#define P5M_WINDOW_NS (10ULL * 1000000000ULL)
++// Faixas do intervalo entre entregas, em microssegundos, em torno dos 16667 us
++// de uma fonte de 60 fps. Nao dependem da taxa do painel de proposito: o que
++// se quer saber e se o console entregou no ritmo dele, e essa pergunta e a
++// mesma a 72, 90 ou 120 Hz.
++#define P5M_GAP_EARLY_US 12500
++#define P5M_GAP_ONTIME_US 20800
++#define P5M_GAP_LATE_US 29200
++// Meio segundo sem quadro nao e uma entrega atrasada: e a fonte parada -- uma
++// reconexao, uma pausa, o console dormindo. Contar isso como intervalo faz a
++// media mentir e o maximo virar anedota, e foi o que aconteceu na primeira
++// medicao pela rede do projeto irmao: uma janela saiu com 38 segundos de
++// maximo, que era o remetente desligado. Trinta quadros de folga; nenhuma rede
++// plausivel segura tanto e volta.
++#define P5M_GAP_ABSENT_US 500000
++
++static uint64_t p5m_now_ns(void)
++{
++	struct timespec ts;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
++}
++
++// Zera a janela. Chamado com o stats_mutex na mao.
++static void p5m_stats_reset(AndroidChiakiVideoDecoder *decoder, uint64_t now)
++{
++	decoder->window_start_ns = now;
++	decoder->decode_sum_us = 0;
++	decoder->gap_sum_us = 0;
++	decoder->decode_n = 0;
++	decoder->decode_min_us = UINT32_MAX;
++	decoder->decode_max_us = 0;
++	decoder->gap_n = 0;
++	decoder->gap_min_us = UINT32_MAX;
++	decoder->gap_max_us = 0;
++	for(int i = 0; i < 4; i++)
++		decoder->gap_bucket[i] = 0;
++	decoder->frames_rendered = 0;
++	decoder->frames_gated = 0;
++	decoder->decode_unknown = 0;
++	decoder->source_pauses = 0;
++}
++
+ static void *android_chiaki_video_decoder_output_thread_func(void *user);
+ 
+ ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *decoder, ChiakiLog *log, int32_t target_width, int32_t target_height, ChiakiCodec codec)
+@@ -35,12 +88,28 @@
+ 	// O portao nasce aberto: fora do encerramento da sessao imersiva, a
+ 	// entrega de quadros e o comportamento normal.
+ 	decoder->render_to_surface = true;
++	for(size_t i = 0; i < P5M_STAMP_RING; i++)
++	{
++		decoder->stamp_pts[i] = UINT64_MAX;
++		decoder->stamp_ns[i] = 0;
++	}
++	decoder->last_delivery_ns = 0;
++	p5m_stats_reset(decoder, p5m_now_ns());
+ 	ChiakiErrorCode err = chiaki_mutex_init(&decoder->render_mutex, false);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 		return err;
++	err = chiaki_mutex_init(&decoder->stats_mutex, false);
++	if(err != CHIAKI_ERR_SUCCESS)
++	{
++		chiaki_mutex_fini(&decoder->render_mutex);
++		return err;
++	}
+ 	err = chiaki_mutex_init(&decoder->codec_mutex, false);
+ 	if(err != CHIAKI_ERR_SUCCESS)
++	{
++		chiaki_mutex_fini(&decoder->stats_mutex);
+ 		chiaki_mutex_fini(&decoder->render_mutex);
++	}
+ 	return err;
+ }
+ 
+@@ -104,6 +173,7 @@
+ 	if(decoder->codec)
+ 		kill_decoder(decoder);
+ 	chiaki_mutex_fini(&decoder->codec_mutex);
++	chiaki_mutex_fini(&decoder->stats_mutex);
+ 	chiaki_mutex_fini(&decoder->render_mutex);
+ }
+ 
+@@ -275,6 +345,121 @@
+ // Os dois parametros sao ignorados de proposito: quem decide pedir keyframe
+ // depois de perda e a propria libchiaki, e o MediaCodec nao tem o que fazer
+ // com essa informacao. Aceita-los apenas restaura a compatibilidade.
++/**
++ * Fecha a conta de um quadro que acabou de sair do codec.
++ *
++ * Duas medidas por quadro, e elas respondem perguntas diferentes:
++ *
++ * - **Decodificacao**: da entrega ao codec ate a saida. E o pedaco do caminho
++ *   que ninguem media, entre as estatisticas de rede e a latencia do
++ *   compositor.
++ * - **Entrega**: o intervalo entre um quadro e o anterior. A media disso e
++ *   quase sempre 16,7 ms e nao diz nada; o que se sente e a distribuicao. Um
++ *   quadro que chega a 33 ms depois do anterior e uma repeticao visivel, e mil
++ *   deles com media perfeita continuam tremendo.
++ *
++ * O resumo sai uma vez a cada dez segundos, do lado da thread de saida, ja
++ * fora do mutex -- escrever no log com um mutex de caminho critico na mao seria
++ * trocar uma medicao por um engasgo.
++ */
++static void p5m_stats_sample(AndroidChiakiVideoDecoder *decoder, uint64_t pts, bool rendered)
++{
++	const uint64_t now = p5m_now_ns();
++	char linha[320];
++	bool tem_resumo = false;
++
++	chiaki_mutex_lock(&decoder->stats_mutex);
++
++	if(rendered)
++	{
++		decoder->frames_rendered++;
++		if(decoder->last_delivery_ns)
++		{
++			const uint64_t gap_full_us = (now - decoder->last_delivery_ns) / 1000;
++			if(gap_full_us > P5M_GAP_ABSENT_US)
++			{
++				// O quadro continua contando; so o intervalo e que nao entra na
++				// distribuicao.
++				decoder->source_pauses++;
++				decoder->last_delivery_ns = now;
++				goto fim_da_entrega;
++			}
++			const uint32_t gap_us = (uint32_t)gap_full_us;
++			decoder->gap_sum_us += gap_us;
++			decoder->gap_n++;
++			if(gap_us < decoder->gap_min_us)
++				decoder->gap_min_us = gap_us;
++			if(gap_us > decoder->gap_max_us)
++				decoder->gap_max_us = gap_us;
++			if(gap_us < P5M_GAP_EARLY_US)
++				decoder->gap_bucket[0]++;
++			else if(gap_us <= P5M_GAP_ONTIME_US)
++				decoder->gap_bucket[1]++;
++			else if(gap_us <= P5M_GAP_LATE_US)
++				decoder->gap_bucket[2]++;
++			else
++				decoder->gap_bucket[3]++;
++		}
++		decoder->last_delivery_ns = now;
++	}
++	else
++		decoder->frames_gated++;
++
++fim_da_entrega:;
++
++	// O PTS anda de um em um, entao o resto da divisao endereca o carimbo. Um
++	// slot que ja nao guarda este PTS significa que o anel deu a volta inteira
++	// enquanto o quadro estava dentro do codec -- e isso e informacao, nao
++	// ruido: aparece no resumo como "sem par".
++	const size_t slot = (size_t)(pts % P5M_STAMP_RING);
++	if(decoder->stamp_pts[slot] == pts)
++	{
++		const uint32_t dec_us = (uint32_t)((now - decoder->stamp_ns[slot]) / 1000);
++		decoder->stamp_pts[slot] = UINT64_MAX;
++		decoder->decode_sum_us += dec_us;
++		decoder->decode_n++;
++		if(dec_us < decoder->decode_min_us)
++			decoder->decode_min_us = dec_us;
++		if(dec_us > decoder->decode_max_us)
++			decoder->decode_max_us = dec_us;
++	}
++	else
++		decoder->decode_unknown++;
++
++	if(now - decoder->window_start_ns >= P5M_WINDOW_NS && decoder->frames_rendered > 0)
++	{
++		const double gap_med = decoder->gap_n
++				? (double)decoder->gap_sum_us / decoder->gap_n / 1000.0 : 0.0;
++		const double dec_med = decoder->decode_n
++				? (double)decoder->decode_sum_us / decoder->decode_n / 1000.0 : 0.0;
++		snprintf(linha, sizeof(linha),
++				"Video 10s: %u frames | delivery %.1f/%.1f/%.1f ms (min/avg/max) | "
++				"pacing %u early, %u on time, %u one late, %u two or more | "
++				"decode %.1f/%.1f/%.1f ms | %u unpaired, %u with the gate shut"
++				"%s",
++				decoder->frames_rendered,
++				decoder->gap_n ? decoder->gap_min_us / 1000.0 : 0.0,
++				gap_med,
++				decoder->gap_max_us / 1000.0,
++				decoder->gap_bucket[0], decoder->gap_bucket[1],
++				decoder->gap_bucket[2], decoder->gap_bucket[3],
++				decoder->decode_n ? decoder->decode_min_us / 1000.0 : 0.0,
++				dec_med,
++				decoder->decode_max_us / 1000.0,
++				decoder->decode_unknown, decoder->frames_gated,
++				decoder->source_pauses ? ", houve pausa da fonte" : "");
++		tem_resumo = true;
++		p5m_stats_reset(decoder, now);
++	}
++
++	chiaki_mutex_unlock(&decoder->stats_mutex);
++
++	// Tag P5MVR, e nao a do chiaki: o diario em arquivo captura P5MVR:I e
++	// Chiaki:E, e uma linha informativa com a tag do submodulo nao chegaria la.
++	if(tem_resumo)
++		__android_log_print(ANDROID_LOG_INFO, "P5MVR", "%s", linha);
++}
++
+ void android_chiaki_video_decoder_set_render_to_surface(AndroidChiakiVideoDecoder *decoder, bool render)
+ {
+ 	chiaki_mutex_lock(&decoder->render_mutex);
+@@ -321,6 +506,17 @@
+ 			codec_sample_size = codec_buf_size;
+ 		}
+ 		memcpy(codec_buf, buf, codec_sample_size);
++		// P5M: carimbar a entrada antes de entregar ao codec.
++		//
++		// Depois nao da: o codec pode devolver o quadro antes de a linha
++		// seguinte rodar, e o carimbo chegaria atrasado do proprio tempo que
++		// se quer medir.
++		const uint64_t pts = decoder->timestamp_cur;
++		chiaki_mutex_lock(&decoder->stats_mutex);
++		decoder->stamp_pts[pts % P5M_STAMP_RING] = pts;
++		decoder->stamp_ns[pts % P5M_STAMP_RING] = p5m_now_ns();
++		chiaki_mutex_unlock(&decoder->stats_mutex);
++
+ 		media_status_t r = AMediaCodec_queueInputBuffer(decoder->codec, (size_t)codec_buf_index, 0, codec_sample_size, decoder->timestamp_cur++, 0); // timestamp just raised by 1 for maximum realtime
+ 		if(r != AMEDIA_OK)
+ 		{
+@@ -410,6 +606,7 @@
+ 			bool render = info.size != 0 && decoder->render_to_surface;
+ 			AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, render);
+ 			chiaki_mutex_unlock(&decoder->render_mutex);
++			p5m_stats_sample(decoder, (uint64_t)info.presentationTimeUs, render);
+ 			if(info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)
+ 			{
+ 				CHIAKI_LOGI(decoder->log, "AMediaCodec reported EOS");
+--- a/android/app/src/main/cpp/audio-output.cpp
++++ b/android/app/src/main/cpp/audio-output.cpp
+@@ -11,6 +11,15 @@
+ 
+ #include <android/log.h>
+ #include <dlfcn.h>
++#include <time.h>
++
++// P5M: relogio monotonico, o mesmo do resumo de video.
++static uint64_t p5m_now_ns()
++{
++	struct timespec ts;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
++}
+ 
+ // P5M: gancho de audio.
+ //
+@@ -63,6 +72,17 @@
+ 	AudioOutputCallback stream_callback;
+ 	AudioBuffer buf;
+ 
++	// P5M: contagem de estouros por janela de dez segundos.
++	//
++	// A mensagem original e um CHIAKI_LOGW, e o diario do app captura do
++	// submodulo so os erros -- entao o sintoma mais citado do projeto era
++	// justamente o que nao chegava ao arquivo. Contar e resumir resolve duas
++	// coisas de uma vez: a linha aparece, e aparece na mesma cadencia do resumo
++	// de video, que e o unico jeito de responder se o audio transborda porque o
++	// video atrasou.
++	uint32_t p5m_overflows = 0;
++	uint64_t p5m_window_ns = 0;
++
+ 	AudioOutput() : stream_callback(this) {}
+ };
+ 
+@@ -147,7 +167,24 @@
+ 	size_t buf_size = samples_count * sizeof(int16_t);
+ 	size_t pushed = ao->buf.Push(reinterpret_cast<uint8_t *>(buf), buf_size);
+ 	if(pushed < buf_size)
++	{
+ 		CHIAKI_LOGW(ao->log, "Audio Output Buffer Overflow!");
++		ao->p5m_overflows++;
++	}
++
++	const uint64_t agora = p5m_now_ns();
++	if(ao->p5m_window_ns == 0)
++		ao->p5m_window_ns = agora;
++	else if(agora - ao->p5m_window_ns >= 10000000000ULL)
++	{
++		// Sempre, inclusive com zero. Uma janela silenciosa e o que da sentido
++		// as outras: sem ela nao da para saber se o audio ficou bom ou se o
++		// resumo parou de sair.
++		__android_log_print(ANDROID_LOG_INFO, "P5MVR",
++				"Audio 10s: %u buffer overruns", ao->p5m_overflows);
++		ao->p5m_overflows = 0;
++		ao->p5m_window_ns = agora;
++	}
+ }
+ 
+ oboe::DataCallbackResult AudioOutputCallback::onAudioReady(oboe::AudioStream *stream, void *audio_data, int32_t num_frames)

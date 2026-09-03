@@ -1,0 +1,166 @@
+--- a/android/app/src/main/cpp/video-decoder.c
++++ b/android/app/src/main/cpp/video-decoder.c
+@@ -20,6 +20,13 @@
+ {
+ 	decoder->log = log;
+ 	decoder->codec = NULL;
++	// P5M: o window tambem nasce nulo.
++	//
++	// Ninguem zerava este campo aqui, e o resto do arquivo o le sem conferir.
++	// Enquanto o malloc da sessao calhou de devolver pagina zerada isso nao
++	// apareceu; num bloco reaproveitado apareceria como ANativeWindow_release
++	// sobre lixo.
++	decoder->window = NULL;
+ 	decoder->timestamp_cur = 0;
+ 	decoder->target_width = target_width;
+ 	decoder->target_height = target_height;
+@@ -30,6 +37,25 @@
+ 
+ static void kill_decoder(AndroidChiakiVideoDecoder *decoder)
+ {
++	// P5M: deletar o codec DEBAIXO do mutex, e depois de esperar a thread de
++	// saida.
++	//
++	// O original soltava o mutex e so entao chamava AMediaCodec_delete. Nessa
++	// fresta a thread de video entrava em video_sample, pegava o mutex, via
++	// decoder->codec ainda diferente de NULL -- porque quem o zera vem depois
++	// do delete -- e chamava AMediaCodec_dequeueInputBuffer sobre um codec ja
++	// destruido. O processo morria com
++	//
++	//     incStrong() called on 0x... too many times, strong refs = 0
++	//
++	// vindo de MediaCodec::dequeueInputBuffer, com a pilha inteira dentro do
++	// chiaki_video_receiver_av_packet. Foi assim que a sessao imersiva remota
++	// caiu ao ser encerrada, depois de sete minutos rodando.
++	//
++	// E o ramo de erro nem esperava a thread de saida: ela continuava girando
++	// sobre decoder->codec enquanto o delete acontecia. Agora os dois ramos
++	// esperam, o que e seguro porque o AMediaCodec_stop faz o dequeue devolver
++	// erro e a thread sai pelo shutdown_output.
+ 	chiaki_mutex_lock(&decoder->codec_mutex);
+ 	decoder->shutdown_output = true;
+ 	ssize_t codec_buf_index = AMediaCodec_dequeueInputBuffer(decoder->codec, 1000);
+@@ -37,19 +63,31 @@
+ 	{
+ 		CHIAKI_LOGI(decoder->log, "Video Decoder sending EOS buffer");
+ 		AMediaCodec_queueInputBuffer(decoder->codec, (size_t)codec_buf_index, 0, 0, decoder->timestamp_cur++, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
+-		AMediaCodec_stop(decoder->codec);
+-		chiaki_mutex_unlock(&decoder->codec_mutex);
+-		chiaki_thread_join(&decoder->output_thread, NULL);
+ 	}
+ 	else
+-	{
+ 		CHIAKI_LOGE(decoder->log, "Failed to get input buffer for shutting down Video Decoder!");
+-		AMediaCodec_stop(decoder->codec);
+-		chiaki_mutex_unlock(&decoder->codec_mutex);
+-	}
++	AMediaCodec_stop(decoder->codec);
++	chiaki_mutex_unlock(&decoder->codec_mutex);
++
++	// Sem o mutex, porque a thread de saida precisa dele para ler o
++	// shutdown_output e perceber que e hora de sair.
++	chiaki_thread_join(&decoder->output_thread, NULL);
++
++	chiaki_mutex_lock(&decoder->codec_mutex);
+ 	AMediaCodec_delete(decoder->codec);
+ 	decoder->codec = NULL;
++	// A janela morre junto com o codec.
++	//
++	// Sem isto o ponteiro sobrevivia ao codec que o usava, e a proxima troca
++	// de superficie soltava uma referencia de uma sessao ja encerrada -- alem
++	// de vazar a referencia a cada sessao.
++	if(decoder->window)
++	{
++		ANativeWindow_release(decoder->window);
++		decoder->window = NULL;
++	}
+ 	decoder->shutdown_output = false;
++	chiaki_mutex_unlock(&decoder->codec_mutex);
+ }
+ 
+ void android_chiaki_video_decoder_fini(AndroidChiakiVideoDecoder *decoder)
+@@ -65,7 +103,16 @@
+ 
+ 	if(!surface)
+ 	{
+-		if(decoder->codec)
++		// P5M: soltar o mutex ANTES do kill_decoder, e sempre.
++		//
++		// Duas coisas erradas moravam aqui. O kill_decoder tranca o mesmo
++		// mutex que ja esta trancado nesta linha, e o mutex nao e recursivo:
++		// era travamento certo no `surfaceDestroyed` do modo janela. E o
++		// `return` saia sem destrancar, de modo que a proxima chamada ficaria
++		// esperando para sempre por um mutex que ninguem mais ia soltar.
++		bool tinha_codec = decoder->codec != NULL;
++		chiaki_mutex_unlock(&decoder->codec_mutex);
++		if(tinha_codec)
+ 		{
+ 			kill_decoder(decoder);
+ 			CHIAKI_LOGI(decoder->log, "Decoder shut down after surface was removed");
+@@ -77,9 +124,23 @@
+ 	{
+ #if __ANDROID_API__ >= 23
+ 		CHIAKI_LOGI(decoder->log, "Video decoder already initialized, swapping surface");
+-		ANativeWindow *new_window = surface ? ANativeWindow_fromSurface(env, surface) : NULL;
++		// P5M: uma Surface abandonada devolve NULL aqui.
++		//
++		// Foi assim que o processo caiu com SIGSEGV em ANativeWindow_release:
++		// a superficie anterior tinha sido criada quando a janela ja estava
++		// morta, o decodificador acabou configurado sem janela nenhuma, e a
++		// troca seguinte soltou esse NULL. Trocar por nada e pior do que nao
++		// trocar -- sem janela o codec decodifica para lugar nenhum e a tela
++		// fica preta sem uma linha de log dizendo porque.
++		ANativeWindow *new_window = ANativeWindow_fromSurface(env, surface);
++		if(!new_window)
++		{
++			CHIAKI_LOGE(decoder->log, "ANativeWindow_fromSurface() returned NULL on swap; keeping the current window");
++			goto beach;
++		}
+ 		AMediaCodec_setOutputSurface(decoder->codec, new_window);
+-		ANativeWindow_release(decoder->window);
++		if(decoder->window)
++			ANativeWindow_release(decoder->window);
+ 		decoder->window = new_window;
+ #else
+ 		CHIAKI_LOGE(decoder->log, "Video Decoder already initialized");
+@@ -88,6 +149,15 @@
+ 	}
+ 
+ 	decoder->window = ANativeWindow_fromSurface(env, surface);
++	if(!decoder->window)
++	{
++		// Mesma historia do ramo acima, so que na primeira vez: o
++		// AMediaCodec_configure aceita janela nula (e o modo de buffer), o
++		// codec sobe, nada aparece na tela, e o estrago so se manifesta na
++		// troca seguinte. Recusar aqui mantem o defeito onde ele nasceu.
++		CHIAKI_LOGE(decoder->log, "ANativeWindow_fromSurface() devolveu NULL; a superficie ja estava morta");
++		goto beach;
++	}
+ 
+ 	const char *mime = chiaki_codec_is_h265(decoder->target_codec) ? "video/hevc" : "video/avc";
+ 	CHIAKI_LOGI(decoder->log, "Initializing decoder with mime %s", mime);
+@@ -180,7 +250,8 @@
+ 	decoder->codec = NULL;
+ 
+ error_surface:
+-	ANativeWindow_release(decoder->window);
++	if(decoder->window)
++		ANativeWindow_release(decoder->window);
+ 	decoder->window = NULL;
+ 
+ beach:
+--- a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+@@ -469,6 +469,12 @@
+ 
+ 	fun setSurface(surface: Surface?)
+ 	{
++		// P5M: depois do dispose o ponteiro e zero, e o lado nativo o
++		// desreferencia sem conferir. A view que produz a superficie tem ciclo
++		// de vida proprio e pode chamar aqui depois da sessao ter ido embora --
++		// foi o que aconteceu quando uma sessao caiu e outra abriu em seguida.
++		if(nativePtr == 0L)
++			return
+ 		ChiakiNative.sessionSetSurface(nativePtr, surface)
+ 	}
+ 

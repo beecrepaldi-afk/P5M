@@ -1,0 +1,163 @@
+diff --git a/android/app/src/main/cpp/video-decoder.c b/android/app/src/main/cpp/video-decoder.c
+index 1146ad8f..8ac08552 100644
+--- a/android/app/src/main/cpp/video-decoder.c
++++ b/android/app/src/main/cpp/video-decoder.c
+@@ -9,6 +9,8 @@
+ #include <android/native_window_jni.h>
+ 
+ #include <string.h>
++#include <stdint.h>
++#include <android/log.h>
+ 
+ #define INPUT_BUFFER_TIMEOUT_MS 10
+ 
+@@ -102,6 +104,52 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
+ 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, decoder->target_width);
+ 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, decoder->target_height);
+ 
++	// P5M: o formato original so informava mime/largura/altura, o que deixa o
++	// decodificador livre para bufferizar frames em nome do throughput. Em jogo
++	// isso e latencia pura. Estas tres chaves pedem o oposto.
++#if __ANDROID_API__ >= 30
++	// Desliga o buffer de reordenacao do decodificador. O Remote Play nunca envia
++	// B-frames, entao nao ha nada para reordenar e a espera e desperdicio puro.
++	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_LOW_LATENCY, 1);
++#endif
++#if __ANDROID_API__ >= 28
++	// Prioridade 0 = realtime: o codec nao cede tempo para trabalho em lote.
++	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_PRIORITY, 0);
++	// Taxa de operacao alvo. Negativo (INT32_MAX efetivo) pede o maximo que o
++	// hardware entregar, em vez de ritmar a decodificacao pelo framerate nominal.
++	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_OPERATING_RATE, INT32_MAX);
++#endif
++
++	// P5M: pede ao decodificador que entregue SDR mesmo quando a fonte e HDR.
++	//
++	// No Remote Play, 10 bits por canal nao existem separados do HDR: o unico
++	// jeito de pedir Main10 ao PS5 e o perfil HDR, que vem com curva PQ e gamut
++	// BT.2020 juntos. Entregar isso cru a um painel SDR da imagem lavada e
++	// escura -- pior que os 8 bits que se queria melhorar.
++	//
++	// Esta chave move o mapeamento de tons para dentro do decodificador, em
++	// hardware: o video chega em 10 bits, a conversao acontece antes de virar
++	// frame, e o que sobra e o ganho que interessa -- gradiente sem faixas, por
++	// haver 1024 niveis por canal na origem em vez de 256.
++	//
++	// A chave vai como literal porque o #define so existe em NDK recente. O
++	// valor 3 e COLOR_TRANSFER_SDR_VIDEO. Decodificador que nao a reconheca
++	// simplesmente ignora.
++	AMediaFormat_setInt32(format, "color-transfer-request", 3);
++
++	// P5M: chave privada do decodificador da Qualcomm.
++	//
++	// O Quest 3 usa um Snapdragon XR2 Gen 2, e o decodificador que atende o
++	// video/hevc e o c2.qti.hevc.decoder -- confirmado no log do proprio
++	// aparelho. Antes do KEY_LOW_LATENCY padrao existir, a Qualcomm ja expunha
++	// este controle proprio, e ele continua sendo lido: em varios drivers e ele,
++	// e nao a chave padrao, que efetivamente desliga o buffer de reordenacao.
++	//
++	// As duas convivem de proposito. Chave desconhecida e ignorada pelo
++	// AMediaFormat, entao num aparelho sem decodificador Qualcomm isto nao custa
++	// nada, e aqui pode ser a que vale.
++	AMediaFormat_setInt32(format, "vendor.qti-ext-dec-low-latency.enable", 1);
++
+ 	media_status_t r = AMediaCodec_configure(decoder->codec, format, decoder->window, NULL, 0);
+ 	if(r != AMEDIA_OK)
+ 	{
+@@ -139,8 +187,18 @@ beach:
+ 	chiaki_mutex_unlock(&decoder->codec_mutex);
+ }
+ 
+-bool android_chiaki_video_decoder_video_sample(uint8_t *buf, size_t buf_size, void *user)
++// P5M: ChiakiVideoSampleCallback ganhou frames_lost e frame_recovered na
++// libchiaki, e a camada JNI do Android nunca acompanhou -- por isso o app
++// Android do chiaki-ng nao compila contra a propria lib atual.
++//
++// Os dois parametros sao ignorados de proposito: quem decide pedir keyframe
++// depois de perda e a propria libchiaki, e o MediaCodec nao tem o que fazer
++// com essa informacao. Aceita-los apenas restaura a compatibilidade.
++bool android_chiaki_video_decoder_video_sample(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user)
+ {
++	(void)frames_lost;
++	(void)frame_recovered;
++
+ 	bool r = true;
+ 	AndroidChiakiVideoDecoder *decoder = user;
+ 	chiaki_mutex_lock(&decoder->codec_mutex);
+@@ -189,10 +247,63 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
+ {
+ 	AndroidChiakiVideoDecoder *decoder = user;
+ 
++	// P5M: uma vez por sessao. Com saida em Surface nem todo codec emite
++	// OUTPUT_FORMAT_CHANGED, entao o primeiro buffer entregue serve de segunda
++	// chance -- consultar o formato so no evento deixaria o log mudo justamente
++	// nos codecs que o omitem.
++	bool p5m_logged_format = false;
++
+ 	while(1)
+ 	{
+ 		AMediaCodecBufferInfo info;
+ 		ssize_t status = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, -1);
++		// P5M: o formato real so e conhecido depois que o codec decide, e sem
++		// ele nao da para saber se o Main10 pedido foi aceito ou se o codec caiu
++		// para 8 bits em silencio -- nem se o mapeamento de tons aconteceu. Uma
++		// linha por sessao, na primeira negociacao.
++		if(!p5m_logged_format
++				&& (status >= 0 || status == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED))
++		{
++			p5m_logged_format = true;
++			AMediaFormat *out = AMediaCodec_getOutputFormat(decoder->codec);
++			if(out)
++			{
++				int32_t cstd = -1, transfer = -1, range = -1, fmt = -1;
++				AMediaFormat_getInt32(out, "color-standard", &cstd);
++				AMediaFormat_getInt32(out, "color-transfer", &transfer);
++				AMediaFormat_getInt32(out, "color-range", &range);
++				AMediaFormat_getInt32(out, AMEDIAFORMAT_KEY_COLOR_FORMAT, &fmt);
++				// Tag P5MVR, e nao o log do chiaki: o diario em arquivo
++				// filtra por tag, e uma linha nossa com a tag do submodulo nao
++				// chega la. Foi exatamente o que aconteceu na primeira tentativa
++				// deste log -- a linha existia e ninguem a via.
++				//
++				// color-transfer 3 = SDR_VIDEO, 6 = ST2084 (PQ), 7 = HLG.
++				// Receber 6 significa que o pedido de mapeamento de tons foi
++				// ignorado, e ai a imagem sai lavada.
++				// O nome importa: o mapeamento de tons depende do decodificador
++				// especifico, e saber qual esta em uso e o que permite comparar
++				// com o que o fabricante documenta.
++				char *name = NULL;
++				AMediaCodec_getName(decoder->codec, &name);
++				__android_log_print(ANDROID_LOG_INFO, "P5MVR",
++						"Decoder output format '%s': color-standard=%d "
++						"color-transfer=%d color-range=%d color-format=0x%x",
++						name ? name : "?", cstd, transfer, range, fmt);
++				if(transfer == 6)
++					__android_log_print(ANDROID_LOG_WARN, "P5MVR",
++							"color-transfer=6 (PQ): the tone mapping request "
++							"foi ignorado, os brancos vao sair altos");
++				if(name)
++					AMediaCodec_releaseName(decoder->codec, name);
++				AMediaFormat_delete(out);
++			}
++			else
++				__android_log_print(ANDROID_LOG_WARN, "P5MVR",
++						"AMediaCodec_getOutputFormat devolveu nulo");
++		}
++		if(status == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED)
++			continue;
+ 		if(status >= 0)
+ 		{
+ 			AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, info.size != 0);
+diff --git a/android/app/src/main/cpp/video-decoder.h b/android/app/src/main/cpp/video-decoder.h
+index b12ba853..f2ea0e5e 100644
+--- a/android/app/src/main/cpp/video-decoder.h
++++ b/android/app/src/main/cpp/video-decoder.h
+@@ -28,6 +28,6 @@ typedef struct android_chiaki_video_decoder_t
+ ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *decoder, ChiakiLog *log, int32_t target_width, int32_t target_height, ChiakiCodec codec);
+ void android_chiaki_video_decoder_fini(AndroidChiakiVideoDecoder *decoder);
+ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder, JNIEnv *env, jobject surface);
+-bool android_chiaki_video_decoder_video_sample(uint8_t *buf, size_t buf_size, void *user);
++bool android_chiaki_video_decoder_video_sample(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user);
+ 
+ #endif
+\ No newline at end of file

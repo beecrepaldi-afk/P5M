@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Caminhos do provider do diagnostico. Separado do filepaths.xml do
+     chiaki-ng de proposito: nome de arquivo distinto nao colide na fusao de
+     recursos, entao nao precisa de patch no submodulo. -->
+<paths>
+    <cache-path
+        name="p5m_diagnostics"
+        path="diagnostics/" />
+</paths>

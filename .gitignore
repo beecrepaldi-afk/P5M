@@ -1,0 +1,10 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+.cxx/
+*.keystore
+*.jks
+.env
+.cache-cabecalhos/

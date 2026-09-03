@@ -1,0 +1,3 @@
+[submodule "external/chiaki-ng"]
+	path = external/chiaki-ng
+	url = https://github.com/streetpea/chiaki-ng.git

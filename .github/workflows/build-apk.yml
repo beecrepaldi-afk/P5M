@@ -1,0 +1,271 @@
+name: Build APK
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+
+# Varios pushes seguidos geram builds concorrentes que publicam todos na mesma
+# tag 'dev'. Sem isto, um build antigo pode terminar depois de um novo e deixar
+# o APK desatualizado no release. Cancela o anterior e so o mais recente publica.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Necessario para o passo de release publicar a tag e o APK.
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Conferencias que custam milissegundos e substituem uma volta inteira de
+      # CI -- ou, pior, uma sessao de teste gasta com um APK que nao podia
+      # funcionar. Cobrem as tres fronteiras que nenhum compilador atravessa
+      # sozinho: JNI, tabelas indexadas por ciclo, e os patches do submodulo.
+      # Cada uma delas ja quebrou um build nesta arvore.
+      - name: Conferencias rapidas
+        run: python3 tools/conferir.py
+
+      # Antes do NDK, de proposito: um erro de C++ aparece aqui em segundos e
+      # com arquivo e linha, enquanto no externalNativeBuild ele aparece quinze
+      # minutos depois -- e o log de la e inalcancavel de onde este projeto e
+      # desenvolvido. E o mesmo teste que roda localmente antes do push.
+      - name: Compilacao nativa
+        run: python3 tools/compilar_nativo.py
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: NDK e CMake
+        run: |
+          sdkmanager --install "ndk;26.3.11579264" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0"
+
+      # A libchiaki gera os stubs nanopb em tempo de build, o que exige protoc e
+      # o gerador Python do nanopb rodando no HOST -- nao no alvo Android.
+      - name: protoc e gerador nanopb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          python3 -m pip install --upgrade "protobuf<6"
+          protoc --version
+
+      # Tag v1.2.3 vira a versao 1.2.3 e um release definitivo. Push em branch
+      # vira 0.1.0-dev.<build> e atualiza o release rolante 'dev'.
+      #
+      # O versionCode e o numero do build em ambos os casos: monotonico, entao
+      # dá para alternar entre uma versao marcada e um build de desenvolvimento
+      # sem o Android recusar a instalacao por downgrade.
+      - name: Determinar versao
+        id: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+            echo "tagged=true" >> "$GITHUB_OUTPUT"
+          else
+            BASE=$(grep '^p5mVersionName=' gradle.properties | cut -d= -f2)
+            VERSION="${BASE}-dev.${GITHUB_RUN_NUMBER}"
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "P5M_VERSION_NAME=$VERSION" >> "$GITHUB_ENV"
+          echo "P5M_VERSION_CODE=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+          echo "Versao: $VERSION (code $GITHUB_RUN_NUMBER)"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # Intermediarios de CA que os servidores da Sony nao mandam.
+      #
+      # O host de notificacoes manda so a folha, sem a autoridade que a
+      # assinou. O OpenSSL nao busca o que falta (a extensao AIA nunca foi
+      # implementada no curl -- curl#2793), entao a conexao remota morre no
+      # aperto de mao. O mesmo defeito esta aberto no chiaki-ng upstream
+      # (#798), atingindo Linux de mesa: e a Sony que mudou o servidor.
+      #
+      # Baixar aqui e nao no aparelho tira a dependencia de a rede onde o
+      # headset esta alcancar o CDN da autoridade -- e justamente longe de casa
+      # que isso e menos garantido. Baixado a cada build, entao nao envelhece
+      # como envelheceria um arquivo versionado.
+      #
+      # O que sai daqui e um CANDIDATO, nao um certificado confiado: o
+      # CaBundle refaz a prova no aparelho, contra as raizes daquele aparelho,
+      # antes de usar. A conferencia abaixo e so para nao embarcar lixo.
+      #
+      # Nunca derruba o build: se a CI nao baixar, o app ainda tenta pela AIA
+      # em tempo de execucao.
+      - name: Intermediarios de CA
+        continue-on-error: true
+        run: |
+          set -u
+          destino=app/src/main/assets/ca-intermediarios.pem
+          mkdir -p "$(dirname "$destino")"
+          : > "$destino"
+          for url in \
+            http://crt.comodoca.com/COMODORSADomainValidationSecureServerCA.crt \
+            http://crt.sectigo.com/COMODORSADomainValidationSecureServerCA.crt
+          do
+            echo "Tentando $url"
+            curl -fsS --max-time 30 -o bruto.crt "$url" || continue
+            # O CDN entrega DER; PEM tambem e aceito, por seguranca.
+            openssl x509 -inform DER -in bruto.crt -out cand.pem 2>/dev/null \
+              || openssl x509 -in bruto.crt -out cand.pem 2>/dev/null \
+              || { echo "nao e um certificado X.509"; continue; }
+            if openssl verify -CAfile /etc/ssl/certs/ca-certificates.crt cand.pem; then
+              openssl x509 -in cand.pem -noout -subject -issuer -enddate
+              cat cand.pem >> "$destino"
+              break
+            else
+              echo "::warning::o certificado de $url nao valida contra as raizes do runner"
+            fi
+          done
+          if [ -s "$destino" ]; then
+            echo "Intermediario embarcado ($(wc -c < "$destino") bytes)."
+          else
+            echo "::warning::Nenhum intermediario embarcado. O app vai depender de"
+            echo "::warning::buscar pela AIA em tempo de execucao."
+          fi
+
+      # A chave que assina o APK, guardada entre builds.
+      #
+      # Sem isto o Gradle gera um ~/.android/debug.keystore novo em cada runner,
+      # porque o runner e descartavel. Assinaturas diferentes fazem o Android
+      # recusar instalar por cima: para trocar de versao e preciso desinstalar,
+      # e desinstalar leva junto TODO o estado do app -- login da PSN, registro
+      # do console, modo de exibicao, nitidez. Cada APK novo chegava como um
+      # aplicativo diferente que por acaso tem o mesmo nome.
+      #
+      # A chave fica no cache do Actions e nao no repositorio: e material de
+      # assinatura, e material de assinatura nao se versiona. O cache e por
+      # repositorio e cada acerto renova os 7 dias de validade, entao enquanto
+      # houver um build por semana ela sobrevive indefinidamente. Se um dia
+      # expirar, o proximo APK volta a exigir uma desinstalacao -- uma vez, e
+      # com aviso aqui em vez de surpresa no aparelho.
+      - name: Chave de assinatura estavel
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: debug-keystore-v1
+
+      - name: Conferir a chave
+        run: |
+          if [ -f ~/.android/debug.keystore ]; then
+            echo "Chave restaurada do cache; este APK instala por cima do anterior."
+          else
+            echo "::warning::Sem chave no cache. O Gradle vai criar uma nova, e este"
+            echo "::warning::APK NAO instala por cima: sera preciso desinstalar uma vez."
+          fi
+
+      - name: Build debug APK
+        run: ./gradlew --no-daemon assembleDebug
+
+      - name: Upload APK (artefato)
+        uses: actions/upload-artifact@v4
+        with:
+          name: p5m-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      # Release rolante: uma unica tag 'dev' que sempre aponta para o build mais
+      # recente. Assim o APK tem URL fixa e baixa direto, sem zip e sem precisar
+      # achar o run certo no Actions.
+      - name: Preparar APK
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk p5m.apk
+          cp app/build/outputs/apk/debug/app-debug.apk "p5m-${{ steps.version.outputs.version }}.apk"
+          ls -lh p5m*.apk
+
+      # Release definitivo, so em tag. Fica na lista de releases para sempre,
+      # com o APK daquela versao exata anexado.
+      - name: Publicar release versionado
+        if: steps.version.outputs.tagged == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: P5M ${{ steps.version.outputs.version }}
+          files: p5m-${{ steps.version.outputs.version }}.apk
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+      # O release rolante acumularia um APK versionado por push. Limpa os
+      # antigos antes de anexar o novo, para a pagina ficar com exatamente dois
+      # arquivos: o de nome fixo e o da versao atual.
+      - name: Limpar APKs versionados antigos do release rolante
+        if: steps.version.outputs.tagged == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          auth=(-H "Authorization: Bearer $GH_TOKEN")
+          ids=$(curl -sS "${auth[@]}" "$api/releases/tags/dev" \
+            | jq -r '.assets[]? | select(.name | test("^p5m-.*[.]apk$")) | .id' \
+            2>/dev/null || true)
+          for id in $ids; do
+            echo "Removendo asset antigo $id"
+            curl -sS -X DELETE "${auth[@]}" "$api/releases/assets/$id" || true
+          done
+
+      # Release rolante, so em branch. Sempre o build mais recente, URL fixa.
+      - name: Publicar release rolante
+        if: steps.version.outputs.tagged == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev
+          name: P5M - build mais recente
+          prerelease: true
+          files: |
+            p5m.apk
+            p5m-${{ steps.version.outputs.version }}.apk
+          fail_on_unmatched_files: true
+          body: |
+            Build de desenvolvimento **${{ steps.version.outputs.version }}**,
+            gerado automaticamente a cada push. Para versoes estaveis, veja a
+            lista de releases.
+
+            **Commit:** ${{ github.sha }}
+
+            ### Instalar
+
+            Baixe pelo navegador do proprio Quest e instale direto no
+            headset -- nao precisa de PC. Dois arquivos, mesmo conteudo:
+
+            - `p5m-${{ steps.version.outputs.version }}.apk` -- nome com a
+              versao, para saber depois qual e qual na pasta de downloads.
+            - `p5m.apk` -- nome fixo, para quem quiser sempre a mesma URL.
+
+            Pelo PC, se preferir:
+
+            ```
+            adb install -r p5m.apk
+            ```
+
+            Aparece na biblioteca do Quest em **Fontes desconhecidas**, como
+            "P5M".
+
+            ### Antes de abrir
+
+            Pareie o controle: chave de modo em "D", Home para ligar, segure
+            Star por 3 s, e pareie pelo Bluetooth do Quest.
+
+            ### Se algo falhar
+
+            ```
+            adb logcat -v time P5MVR:V Chiaki:V AndroidRuntime:E DEBUG:E *:S
+            ```

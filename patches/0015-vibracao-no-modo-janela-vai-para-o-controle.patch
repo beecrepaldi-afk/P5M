@@ -1,0 +1,65 @@
+--- a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
+@@ -100,22 +100,33 @@
+ 		viewModel.session.state.observe(this, Observer { this.stateChanged(it) })
+ 		adjustStreamViewAspect()
+ 
+-		if(Preferences(this).rumbleEnabled)
+-		{
+-			val vibrator = getSystemService(VIBRATOR_SERVICE) as Vibrator
+-			viewModel.session.rumbleState.observe(this, Observer {
+-				val amplitude = min(255, (it.left.toInt() + it.right.toInt()) / 2)
+-				vibrator.cancel()
+-				if(amplitude == 0)
+-					return@Observer
+-				if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+-					vibrator.vibrate(VibrationEffect.createOneShot(1000, amplitude))
+-				else
+-					vibrator.vibrate(1000)
+-			})
+-		}
++		// P5M: a vibracao vai para o controle, e nao para o aparelho.
++		//
++		// O codigo original pedia o VIBRATOR_SERVICE -- o vibrador do proprio
++		// aparelho. Num celular as duas coisas coincidem; aqui o aparelho e um
++		// headset, que nao tem vibrador nenhum, entao o comando saia e nao
++		// chegava a lugar algum. Foi assim que a vibracao funcionou no modo
++		// imersivo (que ja usava o Rumble) e nao no modo janela, com o mesmo
++		// console mandando os mesmos eventos.
++		//
++		// De quebra, o Rumble faz tres coisas que faltavam aqui: manda pelo
++		// CombinedVibration quando o controle tem dois motores (o DualSense
++		// tem, e o caminho antigo aciona so o primeiro), declara o uso como
++		// midia para o sistema nao filtrar o comando em silencio, e nao repete
++		// pedido identico -- durante vibracao continua os eventos chegam sem
++		// parar, e cada um deles e uma chamada de binder na thread que tambem
++		// entrega video.
++		val rumble = io.github.gblandro.p5m.Rumble(Preferences(this).rumbleEnabled)
++		rumble.attach(io.github.gblandro.p5m.Rumble.gamepadDeviceId())
++		this.rumble = rumble
++		viewModel.session.rumbleState.observe(this, Observer {
++			rumble.set(it.left.toInt(), it.right.toInt())
++		})
+ 	}
+ 
++	// Um motor girando nao pode sobreviver a tela que o ligou.
++	private var rumble: io.github.gblandro.p5m.Rumble? = null
++
+ 	private val controlsDisposable = CompositeDisposable()
+ 
+ 	override fun onAttachFragment(fragment: Fragment)
+@@ -142,12 +153,14 @@
+ 	override fun onPause()
+ 	{
+ 		super.onPause()
++		rumble?.stop()
+ 		viewModel.session.pause()
+ 	}
+ 
+ 	override fun onDestroy()
+ 	{
+ 		super.onDestroy()
++		rumble?.stop()
+ 		controlsDisposable.dispose()
+ 	}
+ 

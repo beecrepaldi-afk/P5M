@@ -1,0 +1,207 @@
+apply plugin: 'com.android.application'
+apply plugin: 'kotlin-android'
+apply plugin: 'kotlin-parcelize'
+apply plugin: 'kotlin-kapt'
+
+def chiakiNg = file("$rootDir/external/chiaki-ng")
+if (!file("$chiakiNg/CMakeLists.txt").exists()) {
+    throw new GradleException("Submodulo chiaki-ng ausente. Rode: git submodule update --init --recursive")
+}
+def chiakiAndroidJava = file("$chiakiNg/android/app/src/main/java")
+def chiakiAndroidRes = file("$chiakiNg/android/app/src/main/res")
+
+def p5mVersionCode = (System.getenv("P5M_VERSION_CODE") ?: "1").toInteger()
+def p5mVersionName = System.getenv("P5M_VERSION_NAME")
+        ?: "${project.findProperty('p5mVersionName') ?: '0.1.0'}-local"
+
+// O submodulo fica intocado no git. Algumas mudancas, porem, so podem ser feitas
+// por dentro dele: as chaves de baixa latencia moram no C do decodificador, e o
+// redirecionamento da MainActivity para a activity imersiva e uma linha do
+// Kotlin dele. Aplicamos como patch idempotente antes de qualquer compilacao --
+// se ja estiver aplicado, a task nao faz nada.
+def applyChiakiPatches = tasks.register('applyChiakiPatches') {
+    doLast {
+        def patchDir = file("$rootDir/patches")
+        if (!patchDir.exists()) return
+        patchDir.listFiles().findAll { it.name.endsWith('.patch') }.sort().each { patch ->
+            def alreadyApplied = providers.exec {
+                commandLine 'git', '-C', chiakiNg.absolutePath, 'apply', '--check', '--reverse', patch.absolutePath
+                ignoreExitValue = true
+            }.result.get().exitValue == 0
+            if (alreadyApplied) {
+                logger.lifecycle("Patch ja aplicado, pulando: ${patch.name}")
+                return
+            }
+            def result = providers.exec {
+                commandLine 'git', '-C', chiakiNg.absolutePath, 'apply', patch.absolutePath
+                ignoreExitValue = true
+            }.result.get()
+            if (result.exitValue != 0) {
+                throw new GradleException("Falha ao aplicar ${patch.name} no submodulo chiaki-ng")
+            }
+            logger.lifecycle("Patch aplicado: ${patch.name}")
+        }
+    }
+}
+
+android {
+    namespace 'com.metallic.chiaki'
+    compileSdkVersion 34
+    ndkVersion '26.3.11579264'
+
+    defaultConfig {
+        applicationId "io.github.gblandro.p5m"
+        // Quest 3 roda Android 12L (API 32). minSdk 30 libera
+        // MediaCodec KEY_LOW_LATENCY, que e central para este projeto.
+        minSdkVersion 30
+        targetSdkVersion 34
+        // versionCode e sempre o numero do build do CI: monotonico entre
+        // builds de branch e de tag, entao dá para ir e voltar entre uma
+        // versao marcada e um build de desenvolvimento sem o Android recusar
+        // a instalacao. O nome semantico vive no versionName.
+        versionCode p5mVersionCode
+        versionName p5mVersionName
+
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments "-DCHIAKI_ENABLE_TESTS=OFF",
+                        "-DCHIAKI_ENABLE_CLI=OFF",
+                        "-DCHIAKI_ENABLE_GUI=OFF",
+                        "-DCHIAKI_ENABLE_SETSU=OFF",
+                        "-DCHIAKI_ENABLE_ANDROID=ON",
+                        "-DCHIAKI_ENABLE_FFMPEG_DECODER=OFF",
+                        "-DCHIAKI_ENABLE_PI_DECODER=OFF",
+                        "-DCHIAKI_LIB_ENABLE_OPUS=OFF",
+                        "-DCHIAKI_LIB_OPENSSL_EXTERNAL_PROJECT=ON",
+                        "-DCHIAKI_LIB_JSONC_EXTERNAL_PROJECT=ON",
+                        "-DCHIAKI_LIB_MINIUPNPC_EXTERNAL_PROJECT=ON",
+                        // O curl embarcado nasce sem nenhuma raiz em que
+                        // confiar: o CMakeLists dele so procura um pacote de
+                        // certificados quando NAO esta compilando cruzado, e
+                        // compilar para Android e exatamente isso. O resultado
+                        // era toda conexao HTTPS da libchiaki recusada no aperto
+                        // de mao -- que foi como a primeira listagem de consoles
+                        // da PSN morreu.
+                        //
+                        // Este e um macro de compilacao, nao variavel de
+                        // ambiente, entao o caminho tem de ser decidido aqui. O
+                        // arquivo em si e escrito em tempo de execucao a partir
+                        // da loja de confianca do proprio Android; ver
+                        // CaBundle.kt, que confere que os dois caminhos batem.
+                        "-DCURL_CA_BUNDLE=/data/user/0/io.github.gblandro.p5m/files/p5m-ca.pem",
+                        "-DCHIAKI_ENABLE_STEAM_SHORTCUT=OFF",
+                        "-DCHIAKI_ENABLE_STEAMDECK_NATIVE=OFF",
+                        "-DANDROID_STL=c++_shared"
+                cppFlags "-std=c++17"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            version "3.22.1"
+            path "src/main/cpp/CMakeLists.txt"
+        }
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs = ['src/main/java', chiakiAndroidJava]
+            // O nosso res so tem arquivos de nome exclusivo; recurso duplicado
+            // entre as duas pastas seria erro de fusao.
+            res.srcDirs = ['src/main/res', chiakiAndroidRes]
+        }
+    }
+
+    buildFeatures {
+        viewBinding true
+        prefab true
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+    kotlinOptions {
+        jvmTarget = "1.8"
+    }
+
+    buildTypes {
+        debug {
+            // APK de uso pessoal: sem minify, para o stacktrace vir legivel.
+            minifyEnabled false
+        }
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging false
+        }
+    }
+    lint {
+        abortOnError false
+    }
+}
+
+// Compilamos as fontes Kotlin do submodulo direto do diretorio dele, ja
+// patcheadas -- por isso toda task que le codigo precisa esperar o patch.
+tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
+    dependsOn applyChiakiPatches
+    kotlinOptions {
+        freeCompilerArgs += "-opt-in=kotlin.ExperimentalUnsignedTypes"
+    }
+}
+tasks.matching { it.name.startsWith('kapt') }.configureEach {
+    dependsOn applyChiakiPatches
+}
+preBuild.dependsOn applyChiakiPatches
+// O CMake do submodulo compila o C que o patch altera, entao as tasks nativas
+// tambem precisam esperar por ele -- preBuild sozinho nao garante a ordem em
+// todas as versoes do AGP.
+tasks.matching {
+    it.name.startsWith('configureCMake') ||
+    it.name.startsWith('buildCMake') ||
+    it.name.startsWith('externalNativeBuild')
+}.configureEach {
+    dependsOn applyChiakiPatches
+}
+
+dependencies {
+    implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
+    implementation 'androidx.appcompat:appcompat:1.6.0'
+    // VrStreamActivity, LauncherActivity e DiagnosticActivity nao usam AppCompat:
+    // o AppCompat exige tema Theme.AppCompat para setContentView, e elas usam
+    // temas do sistema. ComponentActivity da o LifecycleOwner sem essa amarra.
+    implementation 'androidx.activity:activity-ktx:1.6.1'
+    implementation 'androidx.core:core-ktx:1.9.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation 'androidx.recyclerview:recyclerview:1.2.1'
+    implementation 'androidx.preference:preference:1.2.0'
+    implementation 'com.google.android.material:material:1.8.0'
+    implementation 'androidx.lifecycle:lifecycle-extensions:2.2.0'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-ktx:2.5.1'
+    implementation 'androidx.lifecycle:lifecycle-reactivestreams:2.5.1'
+    implementation "io.reactivex.rxjava2:rxjava:2.2.20"
+    implementation "io.reactivex.rxjava2:rxkotlin:2.4.0"
+    implementation 'io.reactivex.rxjava2:rxandroid:2.1.1'
+    def room_version = "2.5.0"
+    implementation "androidx.room:room-runtime:$room_version"
+    kapt "androidx.room:room-compiler:$room_version"
+    implementation "androidx.room:room-ktx:$room_version"
+    implementation "androidx.room:room-rxjava2:$room_version"
+    implementation "com.squareup.moshi:moshi:1.14.0"
+    kapt "com.squareup.moshi:moshi-kotlin-codegen:1.14.0"
+
+    // Audio do chiaki-jni.
+    implementation "com.google.oboe:oboe:1.9.3"
+    // Loader OpenXR oficial do Khronos, com headers via prefab.
+    implementation "org.khronos.openxr:openxr_loader_for_android:1.1.41"
+}

@@ -1,0 +1,40 @@
+--- a/android/app/src/main/java/com/metallic/chiaki/session/StreamInput.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/session/StreamInput.kt
+@@ -40,9 +40,36 @@
+ 		if(motionControllerState.r2State > 0U)
+ 			controllerState.r2State = motionControllerState.r2State
+ 
+-		return controllerState or touchControllerState
++		val p5mSaida = controllerState or touchControllerState
++
++		// P5M: a calibracao dos analogicos entra aqui, no unico ponto por
++		// onde os dois modos passam.
++		//
++		// Antes a zona morta vivia dentro da activity imersiva, o que deixava o
++		// modo janela sem nenhuma -- o mesmo controle gasto andava sozinho num
++		// modo e nao no outro, e nada na tela explicava por que. Aqui vale para
++		// os dois de uma vez, e some a chance de os dois divergirem.
++		//
++		// Le do StickPrefs uma vez por sessao, e nao a cada leitura: isto e
++		// chamado a cada evento de controle, e ler SharedPreferences sessenta
++		// vezes por segundo seria disco no caminho critico da entrada. A
++		// calibragem so muda na tela do lancador, que nao existe durante o
++		// stream.
++		val (px, py) = io.github.gblandro.p5m.StickPrefs.aplicar(
++				p5mSaida.leftX, p5mSaida.leftY, p5mCalibragemEsq)
++		p5mSaida.leftX = px
++		p5mSaida.leftY = py
++		val (qx, qy) = io.github.gblandro.p5m.StickPrefs.aplicar(
++				p5mSaida.rightX, p5mSaida.rightY, p5mCalibragemDir)
++		p5mSaida.rightX = qx
++		p5mSaida.rightY = qy
++
++		return p5mSaida
+ 	}
+ 
++	private val p5mCalibragemEsq by lazy { io.github.gblandro.p5m.StickPrefs(context).left }
++	private val p5mCalibragemDir by lazy { io.github.gblandro.p5m.StickPrefs(context).right }
++
+ 	private val sensorControllerState = ControllerState() // from Motion Sensors
+ 	private val keyControllerState = ControllerState() // from KeyEvents
+ 	private val motionControllerState = ControllerState() // from MotionEvents

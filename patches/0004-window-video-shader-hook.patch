@@ -1,0 +1,39 @@
+diff --git a/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt b/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt
+index dd32a408..19575f0f 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt
+@@ -93,6 +93,21 @@ class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, va
+ 		}
+ 	}
+ 
++	/**
++	 * Entrega uma Surface pronta, vinda de fora.
++	 *
++	 * O P5M usa isto no modo janela quando a imagem passa por um shader
++	 * antes de chegar ao painel: ali quem produz a Surface e uma SurfaceTexture
++	 * nossa, e nao o holder de um SurfaceView. Guardar em `surface` importa --
++	 * e dela que o `resume()` se serve para religar a sessao depois de uma
++	 * pausa.
++	 */
++	fun attachToSurface(surface: Surface?)
++	{
++		this.surface = surface
++		session?.setSurface(surface)
++	}
++
+ 	fun attachToSurfaceView(surfaceView: SurfaceView)
+ 	{
+ 		surfaceView.holder.addCallback(object: SurfaceHolder.Callback {
+diff --git a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
+index ad06185f..34d0dc20 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
+@@ -96,7 +96,7 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
+ 		}
+ 
+ 		//viewModel.session.attachToTextureView(textureView)
+-		viewModel.session.attachToSurfaceView(binding.surfaceView)
++		io.github.gblandro.p5m.WindowVideo.attach(this, binding.surfaceView, viewModel.session)
+ 		viewModel.session.state.observe(this, Observer { this.stateChanged(it) })
+ 		adjustStreamViewAspect()
+ 

@@ -1,0 +1,79 @@
+diff --git a/lib/src/takion.c b/lib/src/takion.c
+--- a/lib/src/takion.c
++++ b/lib/src/takion.c
+@@ -437,6 +437,75 @@
+ 		}
+ 	}
+ 
++	// P5M: marcacao de prioridade no socket.
++	//
++	// O fluxo do Remote Play saia sem marca nenhuma, na mesma fila que todo o
++	// resto da rede. Um ponto de acesso com WMM classifica por DSCP, e AF41
++	// (34) cai na categoria de video -- a que existe justamente para trafego
++	// continuo e sensivel a atraso. Escolhido em vez de EF/voz de proposito:
++	// voz tem prioridade maior mas rajada menor, e 25 Mbps de video em rajadas
++	// curtas seria trocar atraso por perda.
++	//
++	// SO_PRIORITY vai junto porque as duas coisas agem em lugares diferentes:
++	// o DSCP viaja no pacote e serve ao ponto de acesso, e a prioridade do
++	// socket fica no aparelho e ordena a fila local antes de o pacote sair. O
++	// valor 5 cai na mesma categoria de video pelo mapeamento 802.1d, e acima
++	// de 6 o Android exige capacidade de rede que um app nao tem.
++	//
++	// As duas sao pedidos, nao garantias: driver e ponto de acesso podem
++	// ignorar. Por isso nenhuma falha aqui interrompe a conexao -- so registra.
++	//
++	// Registrado em WARNING mesmo quando da certo, e nao em INFO. Nao e
++	// descuido: o log_cb do Android mapeia WARNING para ANDROID_LOG_ERROR, e o
++	// diario do P5M captura Chiaki:E. Em INFO estas linhas existiriam so no
++	// buffer circular do logcat, que se perde em minutos -- e sem PC para ler
++	// o logcat ao vivo, uma linha que nao chega ao diario nao chega a lugar
++	// nenhum.
++	{
++		// A familia do endereco vem do SOCKET, e nao de info->sa.
++		//
++		// Isto ja custou um SIGSEGV. Em senkusha.c o ChiakiTakionConnectInfo e
++		// uma struct de pilha nao inicializada, e quando ja existe um socket --
++		// que e o caso da conexao remota, onde ele chega furado pelo holepunch
++		// -- os campos sa e sa_len nunca sao preenchidos. O codigo original so
++		// lia info->sa dentro do ramo que os preenche; este bloco roda fora
++		// dele, entao ler info->sa->sa_family aqui era desreferenciar lixo de
++		// pilha. Localmente passava despercebido, porque ali o campo existe.
++		//
++		// O socket ja existe nos dois caminhos a esta altura, e ele sabe a
++		// propria familia. Se getsockname falhar, IPv4 e o palpite certo: e o
++		// unico que o console aceita ("IPV6 NOT supported by your PlayStation
++		// console" aparece no proprio log da furacao).
++		struct sockaddr_storage endereco_local;
++		socklen_t endereco_local_len = sizeof(endereco_local);
++		int familia = AF_INET;
++		if(getsockname(takion->sock, (struct sockaddr *)&endereco_local,
++				&endereco_local_len) == 0)
++			familia = endereco_local.ss_family;
++
++		const int dscp_af41 = 34 << 2;
++		int qr;
++		if(familia == AF_INET6)
++			qr = setsockopt(takion->sock, IPPROTO_IPV6, IPV6_TCLASS,
++					(const CHIAKI_SOCKET_BUF_TYPE)&dscp_af41, sizeof(dscp_af41));
++		else
++			qr = setsockopt(takion->sock, IPPROTO_IP, IP_TOS,
++					(const CHIAKI_SOCKET_BUF_TYPE)&dscp_af41, sizeof(dscp_af41));
++		if(qr < 0)
++			CHIAKI_LOGW(takion->log, "P5M: DSCP AF41 refused by the system");
++		else
++			CHIAKI_LOGW(takion->log, "P5M: socket marcado com DSCP AF41 (categoria video)");
++
++#ifdef SO_PRIORITY
++		const int prio = 5;
++		if(setsockopt(takion->sock, SOL_SOCKET, SO_PRIORITY,
++				(const CHIAKI_SOCKET_BUF_TYPE)&prio, sizeof(prio)) < 0)
++			CHIAKI_LOGW(takion->log, "P5M: SO_PRIORITY refused by the system");
++		else
++			CHIAKI_LOGW(takion->log, "P5M: fila local do socket em prioridade %d", prio);
++#endif
++	}
++
+ 	err = chiaki_thread_create(&takion->thread, takion_thread_func, takion);
+ 
+ 	chiaki_thread_set_name(&takion->thread, "Chiaki Takion");

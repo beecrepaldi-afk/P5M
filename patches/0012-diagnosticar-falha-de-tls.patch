@@ -1,0 +1,120 @@
+diff --git a/lib/src/remote/holepunch.c b/lib/src/remote/holepunch.c
+--- a/lib/src/remote/holepunch.c
++++ b/lib/src/remote/holepunch.c
+@@ -442,6 +442,98 @@
+ static ChiakiErrorCode send_responseto_ps(Session *session, uint8_t *req, chiaki_socket_t *sock,
+     Candidate *candidate, struct sockaddr *addr, socklen_t len);
+ 
++// P5M: por que a verificacao de TLS falhou, e nao so que falhou.
++//
++// "SSL peer certificate ... was not OK" e uma frase para tres defeitos
++// diferentes, e cada um pede um conserto diferente:
++//
++//   - raiz desconhecida: o servidor manda a cadeia inteira e nao confiamos em
++//     quem a assinou;
++//   - cadeia incompleta: o servidor manda so a folha e falta o intermediario;
++//   - nome que nao bate: a cadeia e boa e o certificado nao cobre este host.
++//
++// Do lado de fora, com o aparelho a milhares de quilometros e sem PC, os tres
++// sao a mesma tela preta. Por isso a falha responde por si:
++//
++//   1. o codigo X509 da verificacao (CURLINFO_SSL_VERIFYRESULT), que ja
++//      separa "name does not match" (0) de "could not find the signer" (20);
++//   2. a cadeia que o servidor mandou de fato -- quantos certificados, e o
++//      titular e emissor de cada um --, que separa cadeia incompleta de raiz
++//      desconhecida.
++//
++// O passo 2 abre uma segunda conexao com a verificacao desligada. Isso pede
++// cuidado, entao: ela nao manda nem le byte nenhum de protocolo (CONNECT_ONLY),
++// nao devolve socket para lugar nenhum, e o handle morre no fim da funcao. A
++// unica coisa que sai dela e texto para o diario. Nenhum caminho de conexao de
++// verdade passa por aqui -- este codigo so roda depois de a conexao real ja
++// ter sido recusada.
++static void p5m_diagnosticar_tls(ChiakiLog *log, CURL *curl, const char *url)
++{
++    long verificacao = -1;
++    curl_easy_getinfo(curl, CURLINFO_SSL_VERIFYRESULT, &verificacao);
++
++    const char *motivo;
++    switch(verificacao)
++    {
++        case 0:  motivo = "the chain passed; it was the host name that failed"; break;
++        case 2:  motivo = "could not find the issuer certificate"; break;
++        case 10: motivo = "certificado expirado"; break;
++        case 18: motivo = "certificado autoassinado"; break;
++        case 19: motivo = "raiz autoassinada dentro da cadeia"; break;
++        case 20: motivo = "could not find the signer locally (unknown root or incomplete chain)"; break;
++        case 21: motivo = "could not verify the first certificate"; break;
++        default: motivo = "ver a lista de erros de verificacao do OpenSSL"; break;
++    }
++    CHIAKI_LOGE(log, "P5M: TLS verification of %s failed with X509 code %ld (%s)",
++            url, verificacao, motivo);
++
++    // wss:// nao serve para so espiar a cadeia; https:// no mesmo host, sim.
++    char sonda_url[192];
++    const char *resto = url;
++    if(strncmp(url, "wss://", 6) == 0)
++        resto = url + 6;
++    else if(strncmp(url, "https://", 8) == 0)
++        resto = url + 8;
++    else if(strncmp(url, "ws://", 5) == 0)
++        resto = url + 5;
++    snprintf(sonda_url, sizeof(sonda_url), "https://%s", resto);
++
++    CURL *sonda = curl_easy_init();
++    if(!sonda)
++        return;
++    curl_easy_setopt(sonda, CURLOPT_URL, sonda_url);
++    curl_easy_setopt(sonda, CURLOPT_CONNECT_ONLY, 1L);
++    curl_easy_setopt(sonda, CURLOPT_CERTINFO, 1L);
++    curl_easy_setopt(sonda, CURLOPT_SSL_VERIFYPEER, 0L);
++    curl_easy_setopt(sonda, CURLOPT_SSL_VERIFYHOST, 0L);
++    curl_easy_setopt(sonda, CURLOPT_TIMEOUT, 10L);
++    CURLcode res = curl_easy_perform(sonda);
++    if(res != CURLE_OK)
++    {
++        CHIAKI_LOGE(log, "P5M: a sonda da cadeia nem conectou (%s)", curl_easy_strerror(res));
++        curl_easy_cleanup(sonda);
++        return;
++    }
++
++    struct curl_certinfo *cadeia = NULL;
++    if(curl_easy_getinfo(sonda, CURLINFO_CERTINFO, &cadeia) == CURLE_OK && cadeia)
++    {
++        CHIAKI_LOGE(log, "P5M: o servidor mandou %d certificado(s)", cadeia->num_of_certs);
++        for(int i = 0; i < cadeia->num_of_certs; i++)
++        {
++            for(struct curl_slist *linha = cadeia->certinfo[i]; linha; linha = linha->next)
++            {
++                if(strncmp(linha->data, "Subject:", 8) == 0
++                        || strncmp(linha->data, "Issuer:", 7) == 0)
++                    CHIAKI_LOGE(log, "P5M:   [%d] %s", i, linha->data);
++            }
++        }
++    }
++    else
++        CHIAKI_LOGE(log, "P5M: the probe connected but returned no chain");
++    curl_easy_cleanup(sonda);
++}
++
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_holepunch_list_devices(
+     const char* psn_oauth2_token, ChiakiHolepunchConsoleType console_type,
+     ChiakiHolepunchDeviceInfo **devices, size_t *device_count,
+@@ -512,6 +604,8 @@
+             err = CHIAKI_ERR_HTTP_NONOK;
+         } else {
+             CHIAKI_LOGE(log, "chiaki_holepunch_list_devices: Fetching device list from %s failed with CURL error %s", url, curl_easy_strerror(res));
++            if(res == CURLE_PEER_FAILED_VERIFICATION)
++                p5m_diagnosticar_tls(log, curl, url);
+             err = CHIAKI_ERR_NETWORK;
+         }
+         goto cleanup;
+@@ -2116,6 +2210,8 @@
+             CHIAKI_LOGE(session->log, "websocket_thread_func: Connecting to push notification WebSocket %s failed with HTTP code %ld", ws_url, http_code);
+         } else {
+             CHIAKI_LOGE(session->log, "websocket_thread_func: Connecting to push notification WebSocket %s failed with CURL error %s", ws_url, curl_easy_strerror(res));
++            if(res == CURLE_PEER_FAILED_VERIFICATION)
++                p5m_diagnosticar_tls(session->log, curl, ws_url);
+         }
+         goto cleanup;
+     }

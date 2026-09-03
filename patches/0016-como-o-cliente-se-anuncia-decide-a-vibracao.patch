@@ -1,0 +1,49 @@
+--- a/android/app/src/main/cpp/chiaki-jni.c
++++ b/android/app/src/main/cpp/chiaki-jni.c
+@@ -393,12 +393,24 @@
+ 	// enquanto espera o quadro que ja pediu.
+ 	connect_info.enable_idr_on_fec_failure = true;
+ 
+-	// P5M: apresentar-se como DualSense. Sem isto o console manda o
+-	// CONTROLLERCONNECTION com tipo DUALSHOCK4 e nunca abre a trilha de
+-	// haptica -- era essa a razao de o diario nao mostrar vibracao nenhuma.
+-	// Ligar tambem faz o ctrl mandar ENABLE_DUALSENSE_FEATURES, que e o que
+-	// habilita gatilhos adaptativos do lado do console.
+-	connect_info.enable_dualsense = true;
++	// P5M: como o cliente se apresenta ao console decide o que o console
++	// manda de volta.
++	//
++	// Anunciado como DualSense, o console abre a trilha de haptica crua e os
++	// gatilhos adaptativos. Anunciado como DualShock 4, ele nao abre nenhuma
++	// das duas -- e em troca faz ELE MESMO a reducao da haptica do jogo para
++	// dois motores, e manda o resultado como pacote de tipo 7.
++	//
++	// Nenhuma das duas e melhor em abstrato. No Quest a haptica crua nao tem
++	// como chegar ao controle (o Android nao abre relatorio HID de saida a
++	// aplicativo nenhum), entao o que sobra e adivinhar a intensidade pela
++	// envoltoria; a reducao do console e feita por quem escreveu o jogo. Quem
++	// escolhe e a preferencia, e o padrao esta em DualShock 4 por isso.
++	connect_info.enable_dualsense = E->GetBooleanField(env, connect_info_obj,
++			E->GetFieldID(env, connect_info_class, "dualsense", "Z")) == JNI_TRUE;
++	CHIAKI_LOGI(log, "P5M: anunciando o controle como %s",
++			connect_info.enable_dualsense ? "DualSense (raw haptics)"
++					: "DualShock 4 (rumble reduced by the console)");
+ 
+ 	const char *str_borrow = E->GetStringUTFChars(env, host_string, NULL);
+ 	connect_info.host = host_str = strdup(str_borrow);
+--- a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+@@ -76,7 +76,12 @@
+ 	// precisou mudar.
+ 	val duid: String = "",
+ 	val psnToken: String = "",
+-	val psnAccountId: ByteArray = ByteArray(0)
++	val psnAccountId: ByteArray = ByteArray(0),
++	// P5M: como este cliente se anuncia ao console. Ver a explicacao no
++	// chiaki-jni.c, onde o campo e lido: em resumo, DualSense traz haptica crua
++	// que nao temos como entregar, e DualShock 4 traz a vibracao ja reduzida
++	// pelo proprio console.
++	val dualsense: Boolean = false
+ ): Parcelable
+ 
+ private class ChiakiNative

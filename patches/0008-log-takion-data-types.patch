@@ -1,0 +1,72 @@
+diff --git a/lib/src/streamconnection.c b/lib/src/streamconnection.c
+index afa1a60a..6295c639 100644
+--- a/lib/src/streamconnection.c
++++ b/lib/src/streamconnection.c
+@@ -423,6 +423,40 @@ static void stream_connection_takion_cb(ChiakiTakionEvent *event, void *user)
+ 
+ static void stream_connection_takion_data(ChiakiStreamConnection *stream_connection, ChiakiTakionMessageDataType data_type, uint8_t *buf, size_t buf_size)
+ {
++	// P5M: cada tipo de mensagem, uma vez.
++	//
++	// A rota de vibracao do P5M funciona -- a buzina de teste e sentida no
++	// controle --, e mesmo assim nenhum evento de rumble chega durante o jogo.
++	// So ha dois lugares onde isso pode morrer: o console nao mandar, ou o
++	// libchiaki nao entregar. Estas linhas separam os dois casos, e sao uma por
++	// tipo: dentro de um fluxo de 60 pacotes por segundo, log repetido nao
++	// informa mais, so afoga o resto.
++	//
++	// Em WARNING porque e o nivel que o log_cb do Android mapeia para
++	// ANDROID_LOG_ERROR, que e o que o diario do P5M captura. Em INFO a linha
++	// so existiria no buffer circular do logcat, e sem PC para le-lo ao vivo,
++	// linha que nao chega ao diario nao chega a lugar nenhum.
++	{
++		static bool p5m_seen[16] = { false };
++		unsigned idx = (unsigned)data_type;
++		if(idx < 16 && !p5m_seen[idx])
++		{
++			p5m_seen[idx] = true;
++			const char *name = "desconhecido";
++			switch(data_type)
++			{
++				case CHIAKI_TAKION_MESSAGE_DATA_TYPE_PROTOBUF: name = "protobuf"; break;
++				case CHIAKI_TAKION_MESSAGE_DATA_TYPE_RUMBLE: name = "RUMBLE"; break;
++				case CHIAKI_TAKION_MESSAGE_DATA_TYPE_PAD_INFO: name = "pad_info"; break;
++				case CHIAKI_TAKION_MESSAGE_DATA_TYPE_TRIGGER_EFFECTS: name = "trigger_effects"; break;
++				default: break;
++			}
++			CHIAKI_LOGW(stream_connection->log,
++					"P5M: first packet of type %u (%s), %llu bytes",
++					idx, name, (unsigned long long)buf_size);
++		}
++	}
++
+ 	switch(data_type)
+ 	{
+ 		case CHIAKI_TAKION_MESSAGE_DATA_TYPE_PROTOBUF:
+@@ -1237,7 +1271,25 @@ static void stream_connection_takion_av(ChiakiStreamConnection *stream_connectio
+ 	if(packet->is_video)
+ 		chiaki_video_receiver_av_packet(stream_connection->video_receiver, packet);
+ 	else if(packet->is_haptics)
+-	    chiaki_audio_receiver_av_packet(stream_connection->haptics_receiver, packet);
++	{
++		// P5M: o PS5 manda os hapticos do DualSense como fluxo de audio, e
++		// nao como rumble classico. Se esta linha aparecer e a de RUMBLE nao,
++		// a resposta esta aqui: o console esta mandando, e por um caminho que
++		// o app Android decodifica e joga fora -- nenhum haptics_sink e ligado.
++		//
++		// As chaves sao obrigatorias e a versao anterior nao as tinha: o ramo
++		// era de um comando so, sem chaves, e o bloco entrou entre o `else if`
++		// e o comando dele. O `else` seguinte ficou orfao e o arquivo parou de
++		// compilar.
++		static bool p5m_seen_haptics = false;
++		if(!p5m_seen_haptics)
++		{
++			p5m_seen_haptics = true;
++			CHIAKI_LOGW(stream_connection->log,
++					"P5M: first haptics packet (the DualSense audio stream)");
++		}
++		chiaki_audio_receiver_av_packet(stream_connection->haptics_receiver, packet);
++	}
+ 	else
+ 		chiaki_audio_receiver_av_packet(stream_connection->audio_receiver, packet);
+ }
