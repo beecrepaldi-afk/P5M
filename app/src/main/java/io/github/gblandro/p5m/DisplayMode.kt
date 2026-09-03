@@ -68,8 +68,56 @@ object DisplayMode
 	 * MainActivity continua sendo uma linha, e a decisão mora em código nosso,
 	 * onde dá para mudar sem mexer no upstream.
 	 */
+	private var streamsAlive = 0
+
+	/**
+	 * Conta quantas telas de stream estao vivas.
+	 *
+	 * Feito por fora, no ciclo de vida do processo, porque uma das duas telas
+	 * e do chiaki-ng: contar aqui vale para as duas sem tocar no submodulo, e
+	 * nao ha caminho em que uma delas esqueca de avisar.
+	 */
+	fun watchStreamActivities(app: android.app.Application)
+	{
+		app.registerActivityLifecycleCallbacks(object:
+				android.app.Application.ActivityLifecycleCallbacks
+		{
+			private fun isStream(a: android.app.Activity) =
+				a is com.metallic.chiaki.stream.StreamActivity ||
+						a is com.metallic.chiaki.stream.VrStreamActivity
+
+			override fun onActivityCreated(a: android.app.Activity, b: android.os.Bundle?)
+			{
+				if(isStream(a)) streamsAlive++
+			}
+			override fun onActivityDestroyed(a: android.app.Activity)
+			{
+				if(isStream(a)) streamsAlive = (streamsAlive - 1).coerceAtLeast(0)
+			}
+			override fun onActivityStarted(a: android.app.Activity) {}
+			override fun onActivityResumed(a: android.app.Activity) {}
+			override fun onActivityPaused(a: android.app.Activity) {}
+			override fun onActivityStopped(a: android.app.Activity) {}
+			override fun onActivitySaveInstanceState(a: android.app.Activity, b: android.os.Bundle) {}
+		})
+	}
+
 	fun startStream(context: Context, connectInfo: com.metallic.chiaki.lib.ConnectInfo)
 	{
+		// Um stream de cada vez.
+		//
+		// O diario de 03/09 mostrou duas sessoes abrindo com cinco segundos de
+		// diferenca, sem a primeira ter sido fechada. O console respondeu
+		// "Remote is already in use" -- e o dono da sessao que ele recusava era
+		// o proprio app. Logo depois a Surface da primeira morria embaixo da
+		// segunda, e a tela ficava preta ate matar o processo. Dois toques na
+		// lista de consoles bastam para chegar ai.
+		if(streamsAlive > 0)
+		{
+			Log.i(TAG, "A stream is already open; ignoring this second request")
+			return
+		}
+
 		val mode = current(context)
 		val target = if(mode == IMMERSIVE)
 			com.metallic.chiaki.stream.VrStreamActivity::class.java

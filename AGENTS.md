@@ -546,9 +546,11 @@ aqui antes de procurar longe:
    gamepad, e o touchpad não se declara. Agora `handlePointer` escuta as três
    portas (`dispatchGenericMotionEvent`, `dispatchTouchEvent`, botões de
    ponteiro), o diário anota cada fonte nova uma vez, e o painel de ajuste
-   ganhou o clique no botão PS como saída de emergência. **Ainda não foi
-   confirmado em hardware qual das portas é a certa** -- o próximo log do Gab
-   decide.
+   ganhou o clique no botão PS como saída de emergência. **Confirmado em hardware
+   no log de 03/09**: o DualSense manda o clique como `source=0x2002`
+   (`SOURCE_MOUSE`), pelo mesmo `deviceId` do gamepad, e o `Touchpad click:
+   down/up` aparece no diário. Outro controle pode mandar por outra porta;
+   por isso as três continuam escutando.
 
 24. **O acorde do painel virou preferência, e o padrão mudou para L3+R3+R1.**
    Não existe combinação que jogo nenhum use; L3+R3 sozinho é usado, e o painel
@@ -556,6 +558,16 @@ aqui antes de procurar longe:
    `L3+R3` por 700 ms. Os botões do acorde continuam chegando ao jogo quando o
    acorde não fecha -- R1 é botão de tiro, e engolir R1 seria pior que não ter
    atalho. `releaseChordButtons` passou a soltar R1 também.
+
+25. **Dois streams podiam abrir ao mesmo tempo, e era isso o "Remote is already
+   in use".** No log de 03/09 duas sessões abriram com cinco segundos de
+   diferença sem a primeira ter sido fechada; o console recusou a segunda, e
+   quem estava usando a sessão recusada era o próprio app. Logo depois a
+   Surface da primeira morria embaixo da segunda (`ANativeWindow_fromSurface()
+   devolveu NULL`) e a tela ficava preta. `DisplayMode.startStream` agora
+   recusa a segunda abertura, e a contagem vive num
+   `ActivityLifecycleCallbacks` registrado no `P5MApp` -- por fora, porque uma
+   das duas telas de stream é do chiaki-ng e assim não precisa de patch.
 
 ## Onde as coisas estão paradas
 

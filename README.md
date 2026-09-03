@@ -112,11 +112,11 @@ Writing this out because a beta that hides it wastes your time:
 - **You can't type the PIN in immersive mode.** If your console asks for a
   login PIN, register it once from the 2D panel first.
 - **Quest Touch controllers do nothing.** You need a real gamepad.
-- **The DualSense touchpad click may not reach the console.** The driver hands
-  the touchpad over as a separate device and not as a gamepad button, so the
-  app now listens for it there too. If your game still won't open its map,
-  the settings panel has it on the PS button, and the log will tell me which
-  way your controller sends it. Send it.
+- **The touchpad click is only tested on the DualSense.** The driver hands the
+  touchpad over as a separate mouse device rather than a gamepad button, and
+  that is where the app now listens. Other pads may route it somewhere else. If
+  your game won't open its map, the settings panel has the click on the PS
+  button, and the log will say how your controller sends it.
 - **Bitrate is stuck at 25 Mbps.** No setting for it yet.
 - **Haptic rumble mode buzzes** at moments the game never asked for. Classic
   mode is the default and it's the better one right now.

@@ -33,6 +33,7 @@ class P5MApp: Application()
 		// A captura de pilha vem primeiro de todas: ela e a unica coisa aqui que
 		// serve se o proximo passo cair.
 		PilhaNativa.instalar(this)
+		DisplayMode.watchStreamActivities(this)
 		Trace.rotateOnNewVersion(this)
 		registrarMortesAnteriores(this)
 		startTraceCapture()
