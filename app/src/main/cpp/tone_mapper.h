@@ -186,6 +186,7 @@ private:
 	// repetido: o updateTexImage devolve sucesso nos dois casos.
 	int64_t last_timestamp_ = 0;
 	bool logged_cadence_ = false;
+	bool logged_window_ = false;
 	int frames_seen_ = 0;
 	int frames_fresh_ = 0;
 

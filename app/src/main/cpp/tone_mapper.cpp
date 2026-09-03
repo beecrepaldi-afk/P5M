@@ -788,6 +788,19 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 	// framebuffer padrao da GLSurfaceView, e nao ha textura para anexar.
 	const bool to_window = target == 0;
 	glBindFramebuffer(GL_FRAMEBUFFER, to_window ? 0 : fbo_);
+	if(to_window)
+	{
+		// Explicito, e nao por omissao.
+		//
+		// O fragment shader declara duas saidas -- a imagem e o historico da
+		// extrapolacao -- e no framebuffer padrao so existe uma. Pela
+		// especificacao a segunda e descartada em silencio, mas ha driver
+		// Adreno que trata a mesma situacao como erro e nao desenha nada, o
+		// que da exatamente uma janela preta com som. Dizer qual e o alvo
+		// custa uma chamada por quadro e tira a duvida.
+		const GLenum back[] = { GL_BACK };
+		glDrawBuffers(1, back);
+	}
 
 	// O historico e escrito na mesma passada, por um segundo anexo. Custa uma
 	// gravacao a mais no fragment shader; copiar a tela depois custaria uma
@@ -935,6 +948,21 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 	glBindVertexArray(0);
 
 	glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+
+	// Uma linha, na primeira passada para a janela.
+	//
+	// Ate aqui o modo janela ficava mudo depois de "Tone mapper ready": nao
+	// havia como distinguir "desenhou preto" de "nao desenhou". O erro do GL
+	// vai junto porque uma janela preta com som e, quase sempre, uma chamada
+	// recusada que ninguem leu.
+	if(to_window && !logged_window_)
+	{
+		logged_window_ = true;
+		const GLenum err = glGetError();
+		LOGI("First window frame drawn: %dx%d, sharpen %.2f, pq %d, gl 0x%x",
+				width, height, sharpen, pq ? 1 : 0, err);
+	}
+
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	return true;
 }

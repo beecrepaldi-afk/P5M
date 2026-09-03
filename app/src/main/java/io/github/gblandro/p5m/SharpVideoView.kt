@@ -36,6 +36,9 @@ class SharpVideoView(
 	private var surface: Surface? = null
 	private var viewportWidth = 0
 	private var viewportHeight = 0
+	private var quadrosDesenhados = 0
+	private var quadrosRecusados = 0
+	private var quadrosPedidos = 0
 
 	private inner class VideoRenderer: Renderer
 	{
@@ -74,13 +77,29 @@ class SharpVideoView(
 		{
 			viewportWidth = width
 			viewportHeight = height
+			Log.i(TAG, "Window video surface: ${width}x${height}")
 		}
 
 		override fun onDrawFrame(gl: GL10?)
 		{
 			if(surface == null || viewportWidth == 0)
+			{
+				// Um caso silencioso que ja existia: sem superficie ou com
+				// largura zero a view desenha nada, para sempre, e o log nao
+				// diferenciava isso de uma imagem preta.
+				if(quadrosPedidos++ == 30)
+					Log.w(TAG, "30 draws with nothing to draw on: " +
+							"surface=${surface != null} viewport=${viewportWidth}x$viewportHeight")
 				return
-			filter.draw(viewportWidth, viewportHeight, pq, sharpen)
+			}
+			val ok = filter.draw(viewportWidth, viewportHeight, pq, sharpen)
+			// A contagem separa "o filtro recusou" de "o filtro desenhou e a
+			// janela ficou preta assim mesmo". Sao problemas diferentes e
+			// levam a lugares diferentes.
+			if(ok) quadrosDesenhados++ else quadrosRecusados++
+			if(quadrosDesenhados + quadrosRecusados == 60)
+				Log.i(TAG, "Window video after 60 passes: $quadrosDesenhados drawn, " +
+						"$quadrosRecusados refused (refused means no frame had arrived yet)")
 		}
 	}
 
