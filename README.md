@@ -78,8 +78,17 @@ Remote Play enabled.
    the release page in the Quest browser and install the download.
 3. It shows up under **Unknown Sources** in your library.
 
-**Pair your controller with the headset, not with the console.** This is the
-thing that trips up almost everyone. A DualSense paired to the PS5 is invisible
+### Press L3 + R3 while you play
+
+That's the settings panel: both stick buttons at the same time, in the middle
+of a game. Screen size, distance, height, curvature, sharpness, passthrough,
+3D strength, all of it, and the same chord closes it again. There's no other
+way in, so if you skip this line you'll be stuck with whatever the defaults
+gave you. The app shows the reminder once at the start of every session too.
+
+### Pair your controller with the headset, not with the console
+
+This is the thing that trips up almost everyone. A DualSense paired to the PS5 is invisible
 to the Quest, so the app gets no input at all and looks broken. The diagnostics
 screen will tell you that's what happened.
 
@@ -104,9 +113,15 @@ Writing this out because a beta that hides it wastes your time:
 
 ## When something goes wrong
 
-Open **Diagnostics** in the app and hit **Copy summary**. It's a few dozen
-lines instead of the whole log. Paste that into an issue with a note about what
-you were doing.
+Open the app and hit **Report a problem**. It packs up what happened, puts it
+on the clipboard, and opens a pre-filled issue in the Quest browser. Write a
+line about what you were doing and send it. Nothing leaves the headset until
+you press that button.
+
+If the browser is being difficult, the same screen can serve the whole diary
+over your local network: hit **Serve on network** and open the address it
+prints on your phone. **Copy summary** and **Send as file** are still there for
+anyone who prefers them.
 
 The log strips credentials, account IDs, console names, emails and public IP
 addresses before it writes them, so pasting it in public is safe. Local network
@@ -151,5 +166,10 @@ Meta Platforms, Inc.
 
 ## Supporting it
 
-The app is free and stays free, the license makes sure of that. If you get some
-use out of it and want to chip in: <https://patreon.com/gblandro>
+The app is free and stays free, the license makes sure of that. This is nights
+and weekends work, though, and there's a long list of things still to fix. If
+you get some use out of it and want to keep it moving:
+
+**<https://patreon.com/gblandro>**
+
+There's a link inside the app too, under Support.

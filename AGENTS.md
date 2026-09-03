@@ -520,6 +520,24 @@ aqui antes de procurar longe:
    `docs/COMO-FUNCIONA.md`; o novo é para quem vai instalar, em inglês, e
    credita o chiaki-ng na primeira tela de texto.
 
+21. **O acorde L3+R3 agora se anuncia sozinho.** Ele era invisível: nada na
+   tela imersiva sugeria que existisse, e quem instalasse o app não tinha onde
+   descobrir. Agora aparece um lembrete de sete segundos logo depois que a
+   camada de vídeo é liberada (`showStartHint`, que reaproveita a textura do
+   painel sem ligar o `adjustMode`, então o console continua recebendo tudo),
+   um cartão fixo no lançador quando o modo é imersivo, e uma seção própria no
+   README, fora da lista de recursos.
+
+22. **`Report a problem` é o caminho de um toque para receber log.** Dentro do
+   óculos não há cabo nem `adb`, e a lista de alvos de compartilhamento do
+   Horizon OS costuma estar vazia, então "manda o arquivo" nunca foi um pedido
+   razoável. O que sempre existe é navegador e área de transferência: o resumo
+   vai para o clipboard, o servidor local sobe, e o navegador abre a página de
+   nova issue com corpo pronto. O corpo na URL é truncado em 4000 caracteres
+   porque o limite prático é do caminho, não do GitHub; o texto inteiro fica no
+   clipboard. `copySummary` passou a reusar `buildReport`, para os dois não
+   divergirem.
+
 ## Onde as coisas estão paradas
 
 Aberto, em ordem de quanto incomoda:

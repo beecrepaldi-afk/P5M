@@ -7,10 +7,12 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
+import android.net.Uri
 import android.graphics.Typeface
 import android.os.Build
 import android.os.Bundle
 import android.text.method.ScrollingMovementMethod
+import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -65,6 +67,16 @@ class DiagnosticActivity: Activity()
 			setPadding(0, 12, 0, 12)
 		})
 
+		// Sozinho e no topo: e o unico botao aqui que serve a quem nao entende
+		// nada do que esta escrito no resto da tela.
+		root.addView(Button(this).apply {
+			text = "Report a problem"
+			setOnClickListener { reportProblem() }
+			layoutParams = LinearLayout.LayoutParams(
+				LinearLayout.LayoutParams.MATCH_PARENT,
+				LinearLayout.LayoutParams.WRAP_CONTENT)
+		})
+
 		// Duas fileiras, e nao oito botoes numa linha so.
 		//
 		// Com oito, cada um fica com um oitavo da largura, e acertar um deles
@@ -113,7 +125,97 @@ class DiagnosticActivity: Activity()
 
 		setContentView(root)
 		refresh()
+
+		// Quem chegou pelo "Report a problem" do lancador ja pediu o relatorio;
+		// obrigar a achar o botao de novo seria repetir a pergunta.
+		if(intent?.getBooleanExtra(EXTRA_REPORT, false) == true)
+			reportProblem()
 	}
+
+	/**
+	 * O caminho de um toque para o usuario nos mandar um log.
+	 *
+	 * Dentro do headset nao ha cabo, nao ha `adb`, e a lista de alvos de
+	 * compartilhamento do Horizon OS costuma estar vazia -- entao "manda o
+	 * arquivo" nao e um pedido razoavel. O que sempre existe e o navegador e a
+	 * area de transferencia, e e sobre esses dois que este fluxo se apoia:
+	 *
+	 *  1. o resumo vai para a area de transferencia;
+	 *  2. o servidor local sobe, para quem preferir pegar o diario inteiro do
+	 *     celular, na mesma rede;
+	 *  3. o navegador abre a pagina de nova issue com titulo e corpo prontos.
+	 *
+	 * O corpo vai na URL, e por isso truncado: o GitHub aceita a pagina, mas
+	 * URLs enormes nao atravessam todo servidor no caminho. Se o recorte cortar
+	 * algo, o texto completo continua na area de transferencia, e a instrucao na
+	 * tela diz para colar.
+	 */
+	private fun reportProblem()
+	{
+		val report = buildReport()
+		clipboard(report, "Report copied. Paste it if the page opens empty.")
+
+		val serverLine = if(server.url != null) server.url
+			else if(server.start()) server.url else null
+
+		val body = "**What happened**\n\n(describe it here)\n\n" +
+				"**What I expected**\n\n\n" +
+				"<details><summary>Diagnostics</summary>\n\n```\n" +
+				report.take(REPORT_URL_BUDGET) + "\n```\n</details>\n"
+		val url = "$ISSUE_URL?title=" + Uri.encode("[beta] ") +
+				"&labels=" + Uri.encode("beta") +
+				"&body=" + Uri.encode(body)
+
+		val opened = try
+		{
+			startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+			true
+		}
+		catch(e: Throwable)
+		{
+			Log.w("P5MVR", "No browser to open the issue page", e)
+			false
+		}
+
+		output.text = buildString {
+			append("--- how to send this ---\n\n")
+			if(opened)
+				append("A report page opened in the browser. Fill in what happened and\n" +
+						"press Submit. If the box came up empty, paste: the report is\n" +
+						"already on the clipboard.\n\n")
+			else
+				append("No browser answered here. The report is on the clipboard, so\n" +
+						"open $ISSUE_URL on any device and paste it.\n\n")
+			if(serverLine != null)
+				append("For the full diary instead of the summary, open\n\n    " +
+						"$serverLine\n\non your phone or PC, on this same network. It stops\n" +
+						"when you leave this screen.\n\n")
+			append("Nothing was sent anywhere on its own.\n\n")
+			append(report)
+		}
+	}
+
+	/** O recorte que vai no relatorio: o aparelho, a queda e os marcos. */
+	private fun buildReport(): String
+	{
+		val trace = Trace.read(this).orEmpty().lines()
+		val interesting = trace.filter { line -> SUMMARY_PATTERNS.any { line.contains(it) } }
+		return buildString {
+			append(deviceInfo())
+			append("\n")
+			P5MApp.lastCrash(this@DiagnosticActivity)?.let {
+				append("\n--- crash ---\n")
+				append(it.lines().take(12).joinToString("\n"))
+				append("\n")
+			}
+			append("\n--- milestones ---\n")
+			append(
+				if(interesting.isEmpty()) "(nothing recorded yet)"
+				else interesting.takeLast(SUMMARY_MAX_LINES).joinToString("\n")
+			)
+		}
+	}
+
 
 	private fun button(label: String, onClick: () -> Unit) = Button(this).apply {
 		text = label
@@ -133,26 +235,8 @@ class DiagnosticActivity: Activity()
 	 */
 	private fun copySummary()
 	{
-		val trace = Trace.read(this).orEmpty().lines()
-		val interesting = trace.filter { line ->
-			SUMMARY_PATTERNS.any { line.contains(it) }
-		}
-		val text = buildString {
-			append("=== P5M — summary ===\n")
-			P5MApp.lastCrash(this@DiagnosticActivity)?.let {
-				append("\n--- crash ---\n")
-				// Só o começo do stack trace: o topo diz o que quebrou, e o
-				// resto é o caminho do framework até lá.
-				append(it.lines().take(12).joinToString("\n"))
-				append("\n")
-			}
-			append("\n--- milestones ---\n")
-			append(
-				if(interesting.isEmpty()) "(nothing recorded yet)"
-				else interesting.takeLast(SUMMARY_MAX_LINES).joinToString("\n")
-			)
-		}
-		clipboard(text, "${interesting.size} summary line(s) copied")
+		val text = buildReport()
+		clipboard(text, "${text.lines().size} summary line(s) copied")
 	}
 
 	private fun toggleServer()
@@ -438,6 +522,20 @@ class DiagnosticActivity: Activity()
 			"E/", "W/P5MVR", "failed", "unavailable"
 		)
 		private const val FILE_PROVIDER_AUTHORITY = "io.github.gblandro.p5m.diagnostics"
+
+		/** Extra que faz a tela ja abrir montando o relatorio. */
+		const val EXTRA_REPORT = "io.github.gblandro.p5m.REPORT"
+
+		private const val ISSUE_URL = "https://github.com/beecrepaldi-afk/P5M/issues/new"
+
+		/**
+		 * Quanto do relatorio cabe na URL.
+		 *
+		 * Nao e limite do GitHub, e do caminho: navegador, proxy e servidor tem
+		 * cada um o seu, e oito mil e o menor que se encontra na pratica. O
+		 * texto inteiro segue na area de transferencia.
+		 */
+		private const val REPORT_URL_BUDGET = 4000
 
 		/**
 		 * Linhas que o chiaki repete aos milhares e que nao dizem nada sozinhas.

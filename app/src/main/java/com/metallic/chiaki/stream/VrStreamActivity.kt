@@ -91,6 +91,14 @@ class VrStreamActivity: ComponentActivity()
 		private const val VIDEO_LAYER_DELAY_MS = 1500L
 
 		/**
+		 * Quanto tempo o lembrete do L3+R3 fica na frente do jogador.
+		 *
+		 * Sete segundos: tempo de ler duas linhas sem pressa, e curto o bastante
+		 * para nao atrapalhar quem ja sabe e entrou direto no jogo.
+		 */
+		private const val HINT_MS = 7000L
+
+		/**
 		 * Teclas que valem como clique do touchpad do DualSense.
 		 *
 		 * O chiaki-ng nao mapeia o touchpad em gamepad nenhum: a constante
@@ -401,6 +409,7 @@ class VrStreamActivity: ComponentActivity()
 					Handler(Looper.getMainLooper()).postDelayed({
 						trace("Releasing the video layer")
 						bridge.setVideoLayerEnabled(true)
+						showStartHint()
 					}, VIDEO_LAYER_DELAY_MS)
 				}
 				is LoginPinRequestEvent ->
@@ -1196,6 +1205,75 @@ class VrStreamActivity: ComponentActivity()
 		screenPrefs.curvature < 0.5f -> "subtle"
 		screenPrefs.curvature < 0.8f -> "medium"
 		else -> "maximum"
+	}
+
+	/**
+	 * Mostra, no comeco do stream, como se abre o painel de ajustes.
+	 *
+	 * Sem isso o acorde e invisivel: nada na tela imersiva sugere que L3+R3
+	 * existe, e quem instala o app nao tem onde descobrir. Um beta inteiro pode
+	 * passar sem que a pessoa encontre o tamanho da tela.
+	 *
+	 * Reaproveita a camada do painel em vez de criar outra: e a mesma textura,
+	 * so com um desenho diferente. Nao mexe em `adjustMode`, entao o console
+	 * continua recebendo tudo enquanto o lembrete esta na tela.
+	 */
+	private fun showStartHint()
+	{
+		if(adjustMode)
+			return
+
+		val bitmap = hudBitmap ?: Bitmap.createBitmap(HUD_WIDTH, HUD_HEIGHT, Bitmap.Config.ARGB_8888)
+			.also { hudBitmap = it }
+		val canvas = Canvas(bitmap)
+		canvas.drawColor(Color.TRANSPARENT, android.graphics.PorterDuff.Mode.CLEAR)
+
+		// So uma faixa, e nao o painel inteiro: o resto da textura fica
+		// transparente e o jogo aparece atras dela.
+		val band = RectF(80f, 40f, HUD_WIDTH - 80f, 200f)
+		val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(224, 12, 14, 20) }
+		canvas.drawRoundRect(band, 26f, 26f, bg)
+		val edge = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+			style = Paint.Style.STROKE
+			strokeWidth = 3f
+			color = Color.argb(160, 120, 170, 255)
+		}
+		canvas.drawRoundRect(band, 26f, 26f, edge)
+
+		val chord = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+			color = Color.rgb(255, 214, 120)
+			textSize = 46f
+			typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+		}
+		canvas.drawText("L3 + R3", band.left + 40f, band.top + 72f, chord)
+
+		val what = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+			color = Color.rgb(232, 236, 245)
+			textSize = 40f
+			typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+		}
+		canvas.drawText("opens the settings panel", band.left + 250f, band.top + 72f, what)
+
+		val detail = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+			color = Color.argb(190, 200, 210, 230)
+			textSize = 28f
+		}
+		canvas.drawText("Press both stick buttons at the same time to move, resize and",
+				band.left + 40f, band.top + 118f, detail)
+		canvas.drawText("sharpen the screen. Same chord closes it.",
+				band.left + 40f, band.top + 152f, detail)
+
+		xr?.setHudBitmap(bitmap)
+		xr?.setHudVisible(true)
+		trace("Showing the L3+R3 hint")
+
+		// Se o painel de verdade abrir enquanto o lembrete esta na tela, quem
+		// manda e ele: esconder aqui apagaria o painel que a pessoa acabou de
+		// pedir.
+		handler.postDelayed({
+			if(!adjustMode)
+				xr?.setHudVisible(false)
+		}, HINT_MS)
 	}
 
 	private fun renderHud()

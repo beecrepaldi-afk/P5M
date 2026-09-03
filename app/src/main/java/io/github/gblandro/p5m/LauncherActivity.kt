@@ -95,6 +95,10 @@ class LauncherActivity: Activity()
 			launch(Intent(this, PsnRemoteActivity::class.java), "the remote connection")
 		})
 
+		// Antes de qualquer ajuste, e nao no rodape: o acorde e a unica forma de
+		// mexer na tela depois que o jogo comeca, e ninguem descobre sozinho.
+		coluna.addView(cartaoDoAcorde())
+
 		// ------------------------------------------------------------ imagem
 		coluna.addView(secao("Picture"))
 		coluna.addView(linha("Mode", { DisplayMode.label(currentMode()) }, { modeHint() }) {
@@ -186,6 +190,20 @@ class LauncherActivity: Activity()
 						+ "no console and no network. Tells network apart from everything else.") {
 			launch(Intent(this, BancoDeEnsaioActivity::class.java), "the test bench")
 		})
+		coluna.addView(navegacao("Report a problem",
+				"Packs up what happened in this session and opens a report you can send. "
+						+ "Nothing leaves the headset until you press send.") {
+			launch(Intent(this, DiagnosticActivity::class.java)
+					.putExtra(DiagnosticActivity.EXTRA_REPORT, true), "the report")
+		})
+
+		// --------------------------------------------------------------- apoio
+		coluna.addView(secao("Support"))
+		coluna.addView(navegacao("Support development on Patreon",
+				"P5M is free and the source is open. If it is useful to you, chipping in "
+						+ "pays for the hours that keep it moving.") {
+			abrir(PATREON_URL, "Patreon")
+		})
 
 		// ------------------------------------------------------------ rodapé
 		explicacao = TextView(this).apply {
@@ -222,6 +240,41 @@ class LauncherActivity: Activity()
 	}
 
 	// ------------------------------------------------------------- as peças
+
+	/**
+	 * O lembrete do acorde, em destaque e nao numa nota de rodape.
+	 *
+	 * Vale so no modo imersivo: no modo janela nao existe painel de ajuste, e
+	 * anunciar um atalho que nao faz nada e pior que nao anunciar nada.
+	 */
+	private fun cartaoDoAcorde(): View
+	{
+		val fila = LinearLayout(this).apply {
+			orientation = LinearLayout.HORIZONTAL
+			gravity = Gravity.CENTER_VERTICAL
+			setPadding(dp(18), dp(14), dp(18), dp(14))
+			background = fundoArredondado(COR_DESTAQUE_FUNDO)
+			addView(TextView(context).apply {
+				text = "L3 + R3"
+				setTextColor(COR_DESTAQUE)
+				setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+				typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+				setPadding(0, 0, dp(14), 0)
+			})
+			addView(TextView(context).apply {
+				text = "While playing, press both stick buttons to move, resize and "
+						.plus("sharpen the screen.")
+				setTextColor(COR_TEXTO)
+				setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+				setLineSpacing(dp(3).toFloat(), 1f)
+			})
+			layoutParams = comMargem(0, dp(22))
+		}
+		atualizacoes += {
+			fila.visibility = if(currentMode() == DisplayMode.IMMERSIVE) View.VISIBLE else View.GONE
+		}
+		return fila
+	}
 
 	private fun cabecalho() = LinearLayout(this).apply {
 		orientation = LinearLayout.HORIZONTAL
@@ -497,6 +550,17 @@ class LauncherActivity: Activity()
 		}
 	}
 
+	/**
+	 * Abre um endereco no navegador do headset.
+	 *
+	 * Separado do `launch` de proposito: uma activity nossa que nao abre e um
+	 * defeito do app, um link que nao abre e so um aparelho sem navegador.
+	 */
+	private fun abrir(url: String, what: String)
+	{
+		launch(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)), what)
+	}
+
 	private fun dp(valor: Int): Int =
 		(valor * resources.displayMetrics.density).toInt()
 
@@ -543,6 +607,8 @@ class LauncherActivity: Activity()
 		private const val CHIAKI_MAIN_ACTIVITY = "com.metallic.chiaki.main.MainActivity"
 		private const val TAG = "P5MVR"
 
+		private const val PATREON_URL = "https://patreon.com/gblandro"
+
 		private val COR_FUNDO = Color.parseColor("#0E0E13")
 		private val COR_CARTAO = Color.parseColor("#191921")
 		private val COR_CARTAO_PRESSIONADO = Color.parseColor("#262631")
@@ -555,5 +621,7 @@ class LauncherActivity: Activity()
 		private val COR_ACENTO_CLARO = Color.parseColor("#79A9FF")
 		private val COR_ALERTA = Color.parseColor("#FF8A80")
 		private val COR_ALERTA_FUNDO = Color.parseColor("#2A1618")
+		private val COR_DESTAQUE = Color.parseColor("#FFD678")
+		private val COR_DESTAQUE_FUNDO = Color.parseColor("#1E1A12")
 	}
 }
