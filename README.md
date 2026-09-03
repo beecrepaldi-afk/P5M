@@ -34,6 +34,12 @@ submodule here, used as it comes, and the few things I had to change live in
 
 The VR half is mine. Without their work this app doesn't exist.
 
+A fair amount of it was written with an AI assistant, working alongside me:
+research into the OpenXR extensions, a lot of the code, and most of the
+digging through logs. Every decision, every test on real hardware and
+everything that shipped went through me. Saying so because you deserve to know
+how the thing you are installing was made.
+
 ## What it does differently
 
 chiaki-ng's Android app runs on the Quest as a floating 2D window, because it
