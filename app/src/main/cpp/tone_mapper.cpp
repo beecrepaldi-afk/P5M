@@ -590,6 +590,23 @@ bool ToneMapper::Attach(ASurfaceTexture *texture)
  * Recriada quando a janela muda de tamanho, e so entao: alocar por quadro
  * seria pagar uma textura de tela inteira sessenta vezes por segundo.
  */
+/** A textura de um pixel, criada uma vez e nunca mais. Ver Render(). */
+GLuint ToneMapper::EnsureDummyTexture()
+{
+	if(dummy_tex_ != 0)
+		return dummy_tex_;
+	const uint8_t preto[4] = { 0, 0, 0, 255 };
+	glGenTextures(1, &dummy_tex_);
+	glBindTexture(GL_TEXTURE_2D, dummy_tex_);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, preto);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	return dummy_tex_;
+}
+
 bool ToneMapper::EnsureWindowTarget(int32_t width, int32_t height)
 {
 	if(window_tex_ != 0 && window_w_ == width && window_h_ == height)
@@ -835,6 +852,11 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 	// copia e um blit de framebuffer, feito pelo proprio GL, e a 1600x900 ela
 	// nao aparece na conta.
 	const bool to_window = target == 0;
+	// Uma passada instrumentada, a primeira da janela. Saber que houve erro nao
+	// diz qual chamada o produziu, e essa diferenca ja custou duas builds.
+	const bool depurar = to_window && !logged_window_;
+	if(depurar)
+		while(glGetError() != GL_NO_ERROR) { }
 	if(to_window)
 	{
 		if(!EnsureWindowTarget(width, height))
@@ -966,20 +988,34 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 	glUniform1i(loc_stereo_, stereo_ ? 1 : 0);
 	glUniform1f(loc_stereo_strength_, stereo_strength_);
 	glUniform1f(loc_convergence_, convergence_);
-	if(stereo_ && depth_tex_[depth_newest_] != 0)
-	{
-		glActiveTexture(GL_TEXTURE1);
-		glBindTexture(GL_TEXTURE_2D, depth_tex_[depth_newest_]);
-		glUniform1i(loc_depth_tex_, 1);
-		glActiveTexture(GL_TEXTURE0);
-	}
+	// O sampler da profundidade precisa de uma textura 2D valida SEMPRE, mesmo
+	// com o 3D desligado.
+	//
+	// Sem isto, `uDepthTex` fica com o valor padrao de um uniform de sampler,
+	// que e zero: apontando para a unidade 0, onde esta a textura EXTERNA do
+	// video. Duas amostragens de tipos diferentes na mesma unidade e
+	// GL_INVALID_OPERATION na hora do desenho, pela especificacao, e o desenho
+	// inteiro nao acontece.
+	//
+	// O ramo do 3D nem chega a rodar no shader com uStereo em zero, e isso nao
+	// importa: a validacao olha o estado das unidades de textura, e nao o
+	// caminho que o codigo tomaria.
+	glActiveTexture(GL_TEXTURE1);
+	glBindTexture(GL_TEXTURE_2D,
+			(stereo_ && depth_tex_[depth_newest_] != 0) ? depth_tex_[depth_newest_]
+					: EnsureDummyTexture());
+	glUniform1i(loc_depth_tex_, 1);
+	glActiveTexture(GL_TEXTURE0);
 
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_EXTERNAL_OES, external_tex_);
 	glUniform1i(loc_sampler_, 0);
 
+	const GLenum erro_antes = depurar ? glGetError() : GL_NO_ERROR;
+
 	glBindVertexArray(vao_);
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	const GLenum erro_desenho = depurar ? glGetError() : GL_NO_ERROR;
 
 	if(write_history)
 	{
@@ -996,12 +1032,15 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 	glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
 
 	// A copia para a tela, no modo janela.
+	GLenum erro_copia = GL_NO_ERROR;
 	if(to_window)
 	{
 		glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo_);
 		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
 		glBlitFramebuffer(0, 0, width, height, 0, 0, width, height,
 				GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		if(depurar)
+			erro_copia = glGetError();
 		// GL_NEAREST porque origem e destino tem o mesmo tamanho: nao ha o que
 		// filtrar, e pedir filtragem so custaria.
 	}
@@ -1016,8 +1055,10 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 	{
 		logged_window_ = true;
 		const GLenum err = glGetError();
-		LOGI("First window frame drawn: %dx%d, sharpen %.2f, pq %d, gl 0x%x",
-				width, height, sharpen, pq ? 1 : 0, err);
+		LOGI("First window frame drawn: %dx%d, sharpen %.2f, pq %d | "
+				"gl before 0x%x, draw 0x%x, blit 0x%x, after 0x%x",
+				width, height, sharpen, pq ? 1 : 0,
+				erro_antes, erro_desenho, erro_copia, err);
 	}
 
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -1043,6 +1084,14 @@ void ToneMapper::Destroy()
 	history_count_ = 0;
 	history_width_ = history_height_ = 0;
 	extrapolate_fn_ = nullptr;
+
+	if(window_tex_ != 0)
+		glDeleteTextures(1, &window_tex_);
+	window_tex_ = 0;
+	window_w_ = window_h_ = 0;
+	if(dummy_tex_ != 0)
+		glDeleteTextures(1, &dummy_tex_);
+	dummy_tex_ = 0;
 
 	if(depth_fbo_ != 0)
 		glDeleteFramebuffers(1, &depth_fbo_);

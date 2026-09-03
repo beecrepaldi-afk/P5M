@@ -102,6 +102,7 @@ private:
 	bool CompileProgram();
 	bool EnsureHistory(int32_t width, int32_t height);
 	bool EnsureWindowTarget(int32_t width, int32_t height);
+	GLuint EnsureDummyTexture();
 
 	ASurfaceTexture *surface_texture_ = nullptr;
 	bool attached_ = false;
@@ -121,6 +122,11 @@ private:
 	 * isso quando o alvo e a tela.
 	 */
 	GLuint window_tex_ = 0;
+	/**
+	 * Uma textura 2D de um pixel, so para o sampler da profundidade ter onde
+	 * apontar quando o 3D esta desligado. Ver Render().
+	 */
+	GLuint dummy_tex_ = 0;
 	int32_t window_w_ = 0;
 	int32_t window_h_ = 0;
 	GLuint vbo_ = 0;
