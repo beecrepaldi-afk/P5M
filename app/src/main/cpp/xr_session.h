@@ -279,7 +279,22 @@ public:
 	 * oculos obturador, onde os dois olhos dividem a mesma tela -- aqui
 	 * cortaria a taxa por olho pela metade em troca de nada.
 	 */
-	void SetStereoMode(int mode) { stereo_mode_ = mode; }
+	/**
+	 * `synthetic` separa duas origens que ate aqui dividiam o mesmo
+	 * interruptor.
+	 *
+	 * Com estereo sintetizado somos nos que produzimos os dois olhos, e cada um
+	 * vai para um swapchain proprio, inteiro. Com estereo empacotado e o
+	 * conteudo que ja chega com os dois olhos numa imagem so, e ai nao ha o que
+	 * fazer alem de recortar metades -- inclusive no caminho direto, onde nao
+	 * existe passada de GPU nossa para separa-las. A distincao importa porque e
+	 * o recorte, e nao o estereo, que briga com o filtro do compositor.
+	 */
+	void SetStereoMode(int mode, bool synthetic)
+	{
+		stereo_mode_ = mode;
+		stereo_synthetic_ = synthetic;
+	}
 
 	/**
 	 * Forca e convergencia do olho sintetizado.
@@ -384,8 +399,15 @@ private:
 	int32_t pending_gl_width_ = 0;
 	int32_t pending_gl_height_ = 0;
 	std::vector<XrSwapchainImageOpenGLESKHR> video_images_;
+	std::vector<XrSwapchainImageOpenGLESKHR> video_images_right_;
+	// Se o olho direito foi mesmo desenhado neste quadro. Escrito e lido so na
+	// thread do frame loop, entre o desenho e a submissao.
+	bool right_layer_ready_ = false;
 
 	XrSwapchain video_swapchain_ = XR_NULL_HANDLE;
+	// Segundo swapchain, so no estereo sintetizado: o olho direito. Mesmo
+	// tamanho e mesmo formato do primeiro.
+	XrSwapchain video_swapchain_right_ = XR_NULL_HANDLE;
 	// Formato do swapchain GL, guardado porque o historico da extrapolacao
 	// precisa nascer identico a ele.
 	int64_t video_gl_format_ = 0;
@@ -438,6 +460,7 @@ private:
 	// da submissao os dois casos sao identicos, e unificar evita dois caminhos
 	// que fariam a mesma coisa de jeitos que acabariam divergindo.
 	std::atomic<int> stereo_mode_{0};
+	std::atomic<bool> stereo_synthetic_{false};
 
 	// Distancia interpupilar em metros, lida do runtime. Zero ate a primeira
 	// leitura valida. Nao entra no desenho -- o runtime ja aplica a IPD ao
@@ -472,6 +495,11 @@ private:
 	bool color_space_supported_ = false;
 	bool refresh_rate_supported_ = false;
 	bool thread_settings_supported_ = false;
+	bool local_dimming_supported_ = false;
+	bool logged_local_dimming_ = false;
+	// Tid da thread que chamou StartFrameLoop, que e a principal do app. Lido
+	// pelo frame loop, escrito por outra thread: atomico.
+	std::atomic<uint32_t> main_thread_tid_{0};
 	bool auto_filter_supported_ = false;
 	bool recommended_resolution_supported_ = false;
 	bool perf_settings_supported_ = false;

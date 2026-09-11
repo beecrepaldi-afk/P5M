@@ -42,6 +42,7 @@ class DiagnosticActivity: Activity()
 {
 	private lateinit var output: TextView
 	private val server by lazy { LogServer(this) }
+	private var hid: DualSenseHid? = null
 
 	override fun onCreate(savedInstanceState: Bundle?)
 	{
@@ -106,6 +107,15 @@ class DiagnosticActivity: Activity()
 				Trace.clear(this@DiagnosticActivity)
 				refresh()
 			})
+		})
+
+		// Fileira propria para o controle. As duas perguntam a mesma coisa por
+		// caminhos diferentes -- uma pelos olhos, outra pela mao --, e separa-las
+		// do resto evita apertar "clear diary" querendo apertar uma delas.
+		root.addView(LinearLayout(this).apply {
+			orientation = LinearLayout.HORIZONTAL
+			addView(button("DualSense lights") { sondarDualSense() })
+			addView(button("DualSense haptics") { ensaiarHaptica() })
 		})
 
 		output = TextView(this).apply {
@@ -484,15 +494,86 @@ class DiagnosticActivity: Activity()
 				"Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})"
 	}
 
+	/**
+	 * Responde a unica pergunta que sustenta haptica crua e gatilhos no Quest:
+	 * um relatorio HID de saida chega ao DualSense por aqui?
+	 *
+	 * A resposta e a lightbar, e nao o texto: se ela varrer vermelho, verde e
+	 * azul, chegou. O texto na tela existe para o caso contrario, onde o que
+	 * importa e qual das quatro formas foi tentada e o que cada uma respondeu.
+	 */
+	private fun sondarDualSense()
+	{
+		if(!DualSenseHid.disponivel(this))
+		{
+			// O pedido de permissao volta em onRequestPermissionsResult, e a
+			// sonda recomeca de la. Pedir e sondar na mesma passada rodaria a
+			// sonda antes de o usuario ter respondido.
+			output.text = "Asking for Bluetooth permission. Answer the prompt, then press the button again."
+			requestPermissions(arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT), PEDIDO_BLUETOOTH)
+			return
+		}
+
+		output.text = "Two passes of red, green and blue, each colour held for a second. Watch the controller and note which pass lit up, if any."
+		val sonda = hid ?: DualSenseHid(this).also { hid = it }
+		Thread {
+			val relatorio = sonda.sondar()
+			runOnUiThread {
+				output.text = "--- DualSense HID probe ---\n\n" + relatorio +
+						"\nBoth passes go through the interrupt channel. Did either one light up?"
+			}
+		}.start()
+	}
+
+	/**
+	 * Bancada da haptica: um tom conhecido na bobina, sem console no meio.
+	 *
+	 * Em jogo a resposta chega como "achei estranho", porque o que se sente e a
+	 * soma de tudo. Aqui e um tom de 90 Hz quase na escala cheia, quatro vezes,
+	 * e a unica diferenca entre as passadas e como a rota de audio foi armada
+	 * antes. O que se quer saber e uma coisa so: qual delas fez a bobina tocar.
+	 */
+	private fun ensaiarHaptica()
+	{
+		if(!DualSenseHid.disponivel(this))
+		{
+			output.text = "Asking for Bluetooth permission. Answer the prompt, then press the button again."
+			requestPermissions(arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT), PEDIDO_BLUETOOTH)
+			return
+		}
+
+		output.text = "Three bursts of a 90 Hz tone: full strength, two thirds, one third. Hold the controller and judge the first one — that is the ceiling."
+		val ponte = hid ?: DualSenseHid(this).also { hid = it }
+		Thread {
+			val relatorio = DualSenseHaptics(this, ponte).ensaiar()
+			runOnUiThread {
+				output.text = "--- DualSense haptics bench ---\n\n" + relatorio +
+						"\nWas the first burst strong? If yes, the ceiling is high and the game track is what is quiet. If no, this is as hard as the coil goes."
+			}
+		}.start()
+	}
+
+	override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>,
+		grantResults: IntArray)
+	{
+		super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+		// Nao refaz a acao sozinho: o pedido pode ter vindo de qualquer um dos
+		// dois botoes, e adivinhar qual deles erraria metade das vezes.
+		if(requestCode == PEDIDO_BLUETOOTH && DualSenseHid.disponivel(this))
+			output.text = "Bluetooth permission granted. Press the button again."
+	}
+
 	override fun onDestroy()
 	{
 		super.onDestroy()
 		// Nao deixa servidor de pe depois que a tela fecha.
 		server.stop()
+		hid?.fechar()
 	}
 
 	companion object
 	{
+		private const val PEDIDO_BLUETOOTH = 4201
 		private const val MAX_LOG_LINES = 400
 		private const val MAX_MARK_LINES = 200
 		private const val SUMMARY_MAX_LINES = 60
@@ -509,7 +590,7 @@ class DiagnosticActivity: Activity()
 			"Vertical flip", "First submission", "Layer shape",
 			"RENDERER_MAIN", "low latency mode", "Gamepad", "Input devices",
 			"Virtual speakers", "asked for blind", "Window with shader",
-			"Audio output", "Rumble", "P5M: ",
+			"Audio output", "Rumble", "P5M: ", "Haptics 10s:", "Haptics timing:", "Input timing:", "Menu control:",
 			// So a contagem, e nao as linhas "available:" com os nomes: a
 			// lista inteira sao mais de dez linhas e o resumo tem sessenta.
 			// Ela continua no diario, que o "Copy all" leva.

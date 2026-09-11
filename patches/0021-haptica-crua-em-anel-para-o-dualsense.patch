@@ -1,0 +1,323 @@
+--- a/android/app/src/main/cpp/chiaki-jni.c
++++ b/android/app/src/main/cpp/chiaki-jni.c
+@@ -125,6 +125,52 @@
+ 	return E->NewObject(env, profile_class, profile_ctor, profile.width, profile.height, profile.max_fps, profile.bitrate, codec);
+ }
+ 
++#include <stdatomic.h>
++#include <math.h>
++
++// P5M: o anel guarda pouco de proposito. A 3 kHz estereo de 8 bits a trilha
++// corre a 6000 bytes por segundo, entao 1024 bytes sao uns 170 ms -- folga de
++// sobra para o tranco da rede, e pouco o bastante para um atraso acumulado
++// nunca virar eco tardio no controle.
++#define P5M_HAPTICS_RING_BYTES 1024
++
++// Acima disto o leitor pula para a frente em vez de entregar o passado. Dois
++// relatorios, uns 21 ms: haptica atrasada nao e haptica, e um efeito que chega
++// depois do tiro e pior do que efeito nenhum. Comecou em quatro relatorios e
++// caiu pela metade quando o atraso foi sentido em jogo -- do lado do Java ha
++// outra fila, e as duas folgas somam.
++#define P5M_HAPTICS_MAX_LAG 128
++
++// Compressao da trilha crua: lei mu, a mesma da telefonia digital.
++//
++// O problema aqui e o problema classico dela: uma faixa dinamica larga tem de
++// caber em oito bits. A trilha vai de um corpo de 150 a picos de 6000 no mesmo
++// jogo -- quarenta para um -- e oito bits com sinal tem 127 degraus.
++//
++// As curvas anteriores eram invencao minha e cada uma sacrificava uma ponta.
++// Ganho puro deixava o corpo em quatro degraus. Ganho com joelho levantou o
++// corpo e esmagou o topo: na dev.163 um pico de 2552 e outro de 5711 -- o dobro
++// da energia -- sairam como 116 e 122. A lei mu nao sacrifica ponta nenhuma
++// porque comprime de forma continua, mais perto de zero e menos perto do teto,
++// que e exatamente como a percepcao funciona.
++//
++// Na mesma trilha: corpo de 200 sai em 35 em vez de 31, e os dois picos passam
++// a sair em 102 e 125. O que se ganha e ordem -- um impacto grande volta a ser
++// distinguivel de um enorme -- sem perder o corpo, que era a conquista da
++// dev.160 e nao pode ser desfeita.
++//
++// A referencia e a amplitude que satura a escala. Seis mil vem da medida: os
++// maiores picos vistos em jogo ficam entre 4700 e 6200, e por o teto exatamente
++// neles gasta a escala inteira sem cortar o que importa.
++#define P5M_HAPTICS_REFERENCIA 6000.0f
++
++// Quanto a curva se dobra. Duzentos e cinquenta e cinco e o valor da telefonia,
++// pensado para voz; sessenta e tres dobra menos e deixa mais contraste no topo,
++// que e onde estao os impactos.
++#define P5M_HAPTICS_MU 63.0f
++
++#define P5M_HAPTICS_PEAK_EVERY 500
++
+ typedef struct android_chiaki_session_t
+ {
+ 	ChiakiSession session;
+@@ -162,6 +208,40 @@
+ 	// guardamos o ponteiro so para poder conduzir a furacao de NAT.
+ 	ChiakiHolepunchSession holepunch;
+ 
++	// P5M: anel da haptica crua, para quem entrega ao DualSense.
++	//
++	// A trilha e escrita pela thread do takion e lida pela thread que fala com
++	// o controle, e por isso e um anel de um produtor e um consumidor so, com
++	// dois indices atomicos e nenhum cadeado. Empurrar quadro a quadro pelo JNI
++	// seria o desenho obvio e o errado: anexar e desanexar a thread do takion
++	// cem vezes por segundo e caro, e ela e a mesma que entrega video. Aqui ela
++	// so escreve em memoria; quem atravessa a fronteira e a thread que ja e do
++	// Java, na cadencia que o controle pede.
++	//
++	// As amostras entram ja convertidas para 8 bits com sinal, que e o formato
++	// do relatorio 0x32 -- converter na escrita evita guardar o dobro e
++	// reconverter na leitura.
++	uint8_t haptics_ring[P5M_HAPTICS_RING_BYTES];
++	_Atomic size_t haptics_ring_w;
++	_Atomic size_t haptics_ring_r;
++	_Atomic uint32_t haptics_dropped;
++	_Atomic uint32_t haptics_skipped;
++
++	// P5M: pico da trilha crua antes da conversao, para o diario. E o unico
++	// numero que diz se a haptica que nao se sente e falta de ganho ou falta de
++	// trilha, e as duas coisas se corrigem em lugares diferentes.
++	uint32_t haptics_peak;
++	unsigned int haptics_peak_count;
++	uint32_t haptics_clipped;
++
++	// P5M: soma dos quadrados das amostras, para a media quadratica.
++	//
++	// O pico descreve uma amostra em cinco segundos; a mao sente o corpo do
++	// sinal. Uma trilha esparsa bate 117 de 127 no log e continua anemica na
++	// mao, e sem este numero as duas situacoes sao indistinguiveis daqui.
++	double haptics_soma_quadrados;
++	uint32_t haptics_amostras;
++
+ 	// P5M: estado da conversao de haptica em vibracao (ver o callback abaixo).
+ 	uint32_t haptics_accum_l;
+ 	uint32_t haptics_accum_r;
+@@ -248,6 +328,27 @@
+ #define P5M_HAPTICS_GAIN 2
+ #define P5M_HAPTICS_FLOOR 40
+ 
++/**
++ * P5M: lei mu, para caber a trilha de haptica em oito bits.
++ *
++ * Devolve o valor ja em [-1, 1]. Cresce depressa perto de zero e devagar perto
++ * do teto: e a mesma forma que a telefonia digital usa para caber voz em oito
++ * bits, e vale aqui pela mesma razao -- a diferenca entre nada e pouco importa
++ * muito mais do que a diferenca entre muito e muitissimo.
++ *
++ * Acima da referencia satura. Nao e corte: a curva ja chega la achatada, e o
++ * que passa disso e um impacto que ja estava no maximo do que a bobina faz.
++ */
++static float p5m_mu(float amostra)
++{
++	float modulo = amostra < 0.0f ? -amostra : amostra;
++	modulo /= P5M_HAPTICS_REFERENCIA;
++	if(modulo > 1.0f)
++		modulo = 1.0f;
++	float comprimido = log1pf(P5M_HAPTICS_MU * modulo) / log1pf(P5M_HAPTICS_MU);
++	return amostra < 0.0f ? -comprimido : comprimido;
++}
++
+ static void android_chiaki_haptics_frame(uint8_t *buf, size_t buf_size, void *user)
+ {
+ 	AndroidChiakiSession *session = user;
+@@ -263,6 +364,96 @@
+ 				buf_size, samples);
+ 	}
+ 
++	// A trilha crua vai para o anel antes de virar envoltoria. As duas saidas
++	// sao independentes: quem escolhe entre elas e a preferencia do usuario, e
++	// alimentar as duas custa uma passada de copia por quadro.
++	{
++		size_t w = atomic_load_explicit(&session->haptics_ring_w, memory_order_relaxed);
++		size_t r = atomic_load_explicit(&session->haptics_ring_r, memory_order_acquire);
++		size_t livre = P5M_HAPTICS_RING_BYTES - (w - r);
++		if(livre < samples * 2)
++		{
++			// Uma linha na primeira vez, e so a contagem depois. Anel cheio quer
++			// dizer que o consumidor parou ou nao acompanha, e as duas coisas se
++			// diagnosticam pela primeira ocorrencia -- as seguintes so fariam o
++			// diario girar e apagar o comeco, que e a parte que interessa.
++			if(atomic_fetch_add_explicit(&session->haptics_dropped, 1, memory_order_relaxed) == 0)
++				CHIAKI_LOGW(session->log, "P5M: haptics ring full, dropping frames");
++		}
++		else
++		{
++			for(size_t i = 0; i < samples; i++)
++			{
++				int16_t l = 0, r16 = 0;
++				memcpy(&l, buf + i * sample_size, sizeof(int16_t));
++				memcpy(&r16, buf + i * sample_size + sizeof(int16_t), sizeof(int16_t));
++
++				uint32_t abs_l = (uint32_t)(l < 0 ? -(int32_t)l : (int32_t)l);
++				uint32_t abs_r = (uint32_t)(r16 < 0 ? -(int32_t)r16 : (int32_t)r16);
++				if(abs_l > session->haptics_peak)
++					session->haptics_peak = abs_l;
++				if(abs_r > session->haptics_peak)
++					session->haptics_peak = abs_r;
++
++				session->haptics_soma_quadrados +=
++						(double)abs_l * abs_l + (double)abs_r * abs_r;
++				session->haptics_amostras += 2;
++
++				// A amostra do controle e de 8 bits COM sinal, e o repouso e
++				// zero. Fonte: o DS5Dongle escreve `int8_t` e escala
++				// float[-1,1] por 127.
++				if(abs_l >= P5M_HAPTICS_REFERENCIA || abs_r >= P5M_HAPTICS_REFERENCIA)
++					session->haptics_clipped++;
++
++				int32_t gl = (int32_t)(p5m_mu((float)l) * 127.0f);
++				int32_t gr = (int32_t)(p5m_mu((float)r16) * 127.0f);
++				if(gl > 127) gl = 127; else if(gl < -128) gl = -128;
++				if(gr > 127) gr = 127; else if(gr < -128) gr = -128;
++
++				session->haptics_ring[(w + i * 2) % P5M_HAPTICS_RING_BYTES] = (uint8_t)(int8_t)gl;
++				session->haptics_ring[(w + i * 2 + 1) % P5M_HAPTICS_RING_BYTES] = (uint8_t)(int8_t)gr;
++			}
++			atomic_store_explicit(&session->haptics_ring_w, w + samples * 2, memory_order_release);
++		}
++	}
++
++	// O pico vai ao diario de tempos em tempos, e nao a cada quadro: cem quadros
++	// por segundo de "pico: 812" nao seria diario, seria ruido. Zera depois de
++	// contar, para a linha falar do periodo e nao da sessao inteira.
++	if(++session->haptics_peak_count >= P5M_HAPTICS_PEAK_EVERY)
++	{
++		// O pico bruto, quanto ele vira depois do ganho, e quantas amostras
++		// bateram no teto. As tres juntas dizem o que fazer; so a segunda, que
++		// era o que este log trazia antes, nao distingue "chegou ao teto uma
++		// vez" de "esta no teto o tempo todo" -- e a diferenca entre um pico
++		// forte e uma onda quadrada.
++		{
++			CHIAKI_LOGW(session->log,
++					"P5M: haptics peak %u of 32767 (swings %u of 127, %u saturated)",
++					session->haptics_peak,
++					(unsigned int)(p5m_mu((float)session->haptics_peak) * 127.0f),
++					session->haptics_clipped);
++
++			// A media quadratica do mesmo periodo, ja convertida pela mesma
++			// curva. Junto com o pico ela diz o que fazer: pico alto com media
++			// baixa e trilha esparsa, e o que falta e levantar o corpo sem
++			// mexer no pico -- ganho puro nao resolve isso, porque o pico ja
++			// esta no teto. Pico e media juntos e sinal cheio, e ai o limite
++			// esta no controle e nao aqui.
++			double medio = session->haptics_amostras
++					? sqrt(session->haptics_soma_quadrados / session->haptics_amostras)
++					: 0.0;
++			CHIAKI_LOGW(session->log, "P5M: haptics body %u of 32767 (swings %u of 127)",
++					(unsigned int)medio,
++					(unsigned int)(p5m_mu((float)medio) * 127.0f));
++			session->haptics_soma_quadrados = 0.0;
++			session->haptics_amostras = 0;
++		}
++		session->haptics_peak = 0;
++		session->haptics_peak_count = 0;
++		session->haptics_clipped = 0;
++	}
++
+ 	uint32_t sum_l = 0, sum_r = 0;
+ 	for(size_t i = 0; i < samples; i++)
+ 	{
+@@ -711,6 +902,60 @@
+ 	android_chiaki_video_decoder_set_render_to_surface(&session->video_decoder, render != JNI_FALSE);
+ }
+ 
++/**
++ * P5M: entrega ao Java a haptica crua acumulada, ja em 8 bits com sinal.
++ *
++ * Devolve quantos bytes coube em `out`, que pode ser menos do que cabe --
++ * inclusive zero, quando o jogo esta em silencio. Silencio nao e falha: quem
++ * chama e que decide se manda quadro mudo ou nao manda nada.
++ *
++ * Quando o atraso passa do teto, o leitor pula para a frente em vez de
++ * entregar o passado. Isso e seguro aqui e nao seria do outro lado: o indice de
++ * leitura tem um dono so, e e esta funcao.
++ */
++JNIEXPORT jint JNICALL JNI_FCN(sessionHapticsRead)(JNIEnv *env, jobject obj, jlong ptr, jbyteArray out)
++{
++	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
++	if(!session || !out)
++		return 0;
++
++	jsize cabe = E->GetArrayLength(env, out);
++	if(cabe <= 0)
++		return 0;
++
++	size_t w = atomic_load_explicit(&session->haptics_ring_w, memory_order_acquire);
++	size_t r = atomic_load_explicit(&session->haptics_ring_r, memory_order_relaxed);
++	size_t tem = w - r;
++
++	if(tem > P5M_HAPTICS_MAX_LAG)
++	{
++		r = w - P5M_HAPTICS_MAX_LAG;
++		tem = P5M_HAPTICS_MAX_LAG;
++		if(atomic_fetch_add_explicit(&session->haptics_skipped, 1, memory_order_relaxed) == 0)
++			CHIAKI_LOGW(session->log, "P5M: haptics running late, skipping ahead");
++	}
++
++	size_t n = tem < (size_t)cabe ? tem : (size_t)cabe;
++	if(!n)
++	{
++		atomic_store_explicit(&session->haptics_ring_r, r, memory_order_release);
++		return 0;
++	}
++
++	// Duas copias no maximo, porque o trecho pedido pode dobrar a esquina do
++	// anel. Sair com uma so por padrao seria otimizar o caso raro.
++	size_t inicio = r % P5M_HAPTICS_RING_BYTES;
++	size_t primeira = P5M_HAPTICS_RING_BYTES - inicio;
++	if(primeira > n)
++		primeira = n;
++	E->SetByteArrayRegion(env, out, 0, (jsize)primeira, (const jbyte *)(session->haptics_ring + inicio));
++	if(n > primeira)
++		E->SetByteArrayRegion(env, out, (jsize)primeira, (jsize)(n - primeira), (const jbyte *)session->haptics_ring);
++
++	atomic_store_explicit(&session->haptics_ring_r, r + n, memory_order_release);
++	return (jint)n;
++}
++
+ JNIEXPORT void JNICALL JNI_FCN(sessionSetControllerState)(JNIEnv *env, jobject obj, jlong ptr, jobject controller_state_java)
+ {
+ 	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
+--- a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+@@ -77,10 +77,11 @@
+ 	val duid: String = "",
+ 	val psnToken: String = "",
+ 	val psnAccountId: ByteArray = ByteArray(0),
+-	// P5M: como este cliente se anuncia ao console. Ver a explicacao no
+-	// chiaki-jni.c, onde o campo e lido: em resumo, DualSense traz haptica crua
+-	// que nao temos como entregar, e DualShock 4 traz a vibracao ja reduzida
+-	// pelo proprio console.
++	// P5M: como este cliente se anuncia ao console. DualSense faz o console
++	// mandar a haptica crua como trilha PCM; DualShock 4 faz o console reduzi-la
++	// a dois motores antes de mandar. O comentario anterior aqui dizia que a
++	// crua nao tinha como ser entregue -- tem, por relatorio HID de saida pelo
++	// Bluetooth, e o caminho esta no DualSenseHid do lado do P5M.
+ 	val dualsense: Boolean = false
+ ): Parcelable
+ 
+@@ -106,6 +107,7 @@
+ 		// P5M: recebidos nos 32 bits altos, perdidos nos baixos.
+ 		@JvmStatic external fun sessionPacketStats(ptr: Long): Long
+ 		@JvmStatic external fun sessionSetVideoRenderToSurface(ptr: Long, render: Boolean)
++		@JvmStatic external fun sessionHapticsRead(ptr: Long, out: ByteArray): Int
+ 		@JvmStatic external fun sessionSetControllerState(ptr: Long, controllerState: ControllerState)
+ 		@JvmStatic external fun sessionSetLoginPin(ptr: Long, pin: String)
+ 		@JvmStatic external fun discoveryServiceCreate(result: CreateResult, options: DiscoveryServiceOptions, javaService: DiscoveryService)
+@@ -514,6 +516,14 @@
+ 			ChiakiNative.sessionSetVideoRenderToSurface(nativePtr, render)
+ 	}
+ 
++	/**
++	 * P5M: le a haptica crua que o console mandou, em 8 bits com sinal.
++	 *
++	 * Devolve quantos bytes de `out` foram preenchidos, e zero quando o jogo
++	 * esta em silencio. Nao bloqueia: a cadencia e de quem chama.
++	 */
++	fun hapticsRead(out: ByteArray): Int = ChiakiNative.sessionHapticsRead(nativePtr, out)
++
+ 	fun setControllerState(controllerState: ControllerState)
+ 	{
+ 		ChiakiNative.sessionSetControllerState(nativePtr, controllerState)

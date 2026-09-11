@@ -27,6 +27,7 @@ funcoes, e a imitacao ali nao esconde nada.
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -66,7 +67,7 @@ def baixar_reais():
             with open(caminho, "wb") as f:
                 f.write(dados)
         except Exception as e:
-            print(f"  sem os cabecalhos do Khronos ({e}); pulando")
+            print(f"  sem os cabecalhos do Khronos ({e}); verificacao incompleta")
             return False
     return True
 
@@ -115,6 +116,47 @@ def stubs_android():
 #include <signal.h>
 #undef SIGSTKSZ
 #define SIGSTKSZ 32768
+#ifdef _WIN32
+// Declaracoes POSIX usadas pelo Android e ausentes no CRT do Windows.
+// So verificam tipos e sintaxe: nao representam o layout/ABI do bionic.
+#include <cstddef>
+typedef unsigned long sigset_t;
+struct siginfo_t { void *si_addr; };
+struct sigaction {
+    void (*sa_sigaction)(int, siginfo_t *, void *);
+    sigset_t sa_mask;
+    int sa_flags;
+};
+struct stack_t { void *ss_sp; int ss_flags; size_t ss_size; };
+#define SA_SIGINFO 4
+#define SA_ONSTACK 0x08000000
+#ifndef SIGBUS
+#define SIGBUS 7
+#endif
+#ifndef SIGTRAP
+#define SIGTRAP 5
+#endif
+extern "C" int gettid(void);
+extern "C" int sigaction(int, const struct sigaction *, struct sigaction *);
+extern "C" int sigaltstack(const stack_t *, stack_t *);
+extern "C" int sigemptyset(sigset_t *);
+#endif
+""")
+
+    # Assinatura fixa de dladdr/Dl_info (bionic/libc/include/dlfcn.h).
+    # No Linux usa o cabecalho do host; nao gera funcoes a partir do codigo.
+    escrever("dlfcn.h", """#pragma once
+#ifdef _WIN32
+struct Dl_info {
+    const char *dli_fname;
+    void *dli_fbase;
+    const char *dli_sname;
+    void *dli_saddr;
+};
+extern "C" int dladdr(const void *, Dl_info *);
+#else
+#include_next <dlfcn.h>
+#endif
 """)
 
     escrever("android/log.h", """#pragma once
@@ -192,14 +234,22 @@ struct JavaVM {
 
 
 def main():
-    if subprocess.call(["which", "g++"], stdout=subprocess.DEVNULL) != 0:
+    # `which` e um programa Unix, nao uma API do Python. No Windows nem
+    # chegavamos a procurar o compilador: a verificacao caia antes disso.
+    compilador = shutil.which(os.environ.get("CXX", "g++"))
+    if not compilador and not os.environ.get("CXX") and os.name == "nt":
+        portatil = os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                                "Programs", "w64devkit", "bin", "g++.exe")
+        if os.path.isfile(portatil):
+            compilador = portatil
+    if not compilador:
         print("Compilacao nativa")
-        print("  sem g++; pulando")
-        return 0
+        print("  sem compilador C++; instale g++ ou defina CXX com seu caminho")
+        return 1
 
     print("Compilacao nativa")
     if not baixar_reais():
-        return 0
+        return 1
     stubs_android()
     real = os.path.join(CACHE, "real")
     inc = os.path.join(CACHE, "stub")
@@ -211,13 +261,17 @@ def main():
         fonte = os.path.join(CPP, nome)
         # Os de verdade ANTES dos imitados: se um dia sobrar um imitado com o
         # mesmo nome, e o de verdade que tem de ganhar.
-        cmd = ["g++", "-std=c++17", "-fsyntax-only",
+        cmd = [compilador, "-std=c++17", "-fsyntax-only",
                f"-I{real}", f"-I{inc}", f"-I{CPP}",
                "-include", os.path.join(CACHE, "stub", "forcado.h"), fonte]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        erros = [l for l in r.stderr.splitlines() if ": error:" in l]
-        if erros:
-            falhas += len(erros)
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+        # Um compilador que falha sem escrever literalmente ': error:'
+        # (erro fatal, traducao, processo encerrado) tambem reprova.
+        if r.returncode != 0:
+            erros = [l for l in r.stderr.splitlines() if "error:" in l]
+            if not erros:
+                erros = r.stderr.splitlines() or [f"compilador terminou com codigo {r.returncode}"]
+            falhas += 1
             print(f"  FALHA: {nome}")
             for l in erros[:8]:
                 print(f"    {l.strip()}")

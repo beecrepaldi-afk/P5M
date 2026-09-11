@@ -1,0 +1,162 @@
+--- a/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt
+@@ -4,6 +4,8 @@
+ 
+ import android.graphics.SurfaceTexture
+ import android.util.Log
++import android.os.Handler
++import android.os.Looper
+ import android.view.*
+ import androidx.lifecycle.LiveData
+ import androidx.lifecycle.MutableLiveData
+@@ -45,9 +47,15 @@
+ 
+ 	// P5M: a thread que fura o NAT, enquanto ela existir.
+ 	private var psnThread: Thread? = null
++	private val mainHandler = Handler(Looper.getMainLooper())
+ 
+ 	fun shutdown()
+ 	{
++		// Desvincula antes de parar: o stop gera QuitEvent numa outra thread.
++		// Esse evento nao pode atingir a proxima conexao nem reabrir um dialogo.
++		val closing = session
++		session = null
++		closing?.eventCallback = null
+ 		// P5M: a furação de NAT corre numa thread e usa a sessão nativa por
+ 		// dentro dela. Liberar a sessão embaixo dessa thread é uso de memória
+ 		// liberada, e não é hipótese: derrubou o processo com "pthread_mutex_lock
+@@ -61,7 +69,7 @@
+ 				false
+ 			else
+ 			{
+-				session?.cancelPsn()
++				closing?.cancelPsn()
+ 				t.join(PSN_JOIN_TIMEOUT_MS)
+ 				t.isAlive
+ 			}
+@@ -79,8 +87,8 @@
+ 			return
+ 		}
+ 
+-		session?.stop()
+-		session?.dispose()
++		closing?.stop()
++		closing?.dispose()
+ 		session = null
+ 		_state.value = StreamStateIdle
+ 		//surfaceTexture?.release()
+@@ -111,12 +119,16 @@
+ 		try
+ 		{
+ 			val session = Session(connectInfo, logManager.createNewFile().file.absolutePath, logVerbose)
++			this.session = session
+ 			_state.value = StreamStateConnecting
+-			session.eventCallback = this::eventCallback
++			session.eventCallback = { event ->
++				// Confere na entrega, nao so na origem: a fila pode atravessar
++				// shutdown/resume e carregar o Quit da sessao anterior.
++				mainHandler.post { if(this.session === session) eventCallback(event) }
++			}
+ 			val surface = surface
+ 			if(surface != null)
+ 				session.setSurface(surface)
+-			this.session = session
+ 			// P5M: numa conexao remota via PSN e preciso furar o NAT antes de
+ 			// iniciar a sessao, e isso bloqueia por dezenas de segundos falando
+ 			// com os servidores da Sony. Numa conexao local o duid vem vazio e
+@@ -134,8 +146,9 @@
+ 					val err = session.connectPsn(connectInfo.duid, connectInfo.ps5)
+ 					if(err.isSuccess)
+ 						session.start()
+-					else
+-						_state.postValue(StreamStateCreateError(CreateError(err)))
++					else mainHandler.post {
++						if(this.session === session) _state.value = StreamStateCreateError(CreateError(err))
++					}
+ 				}
+ 				psnThread?.start()
+ 			}
+@@ -150,19 +163,13 @@
+ 	{
+ 		when(event)
+ 		{
+-			is ConnectedEvent -> _state.postValue(StreamStateConnected)
+-			is QuitEvent -> _state.postValue(
+-				StreamStateQuit(
+-					event.reason,
+-					event.reasonString
+-				)
+-			)
+-			is LoginPinRequestEvent -> _state.postValue(
+-				StreamStateLoginPinRequest(
+-					event.pinIncorrect
+-				)
+-			)
+-			is RumbleEvent -> _rumbleState.postValue(event)
++			is ConnectedEvent -> _state.value = StreamStateConnected
++			is QuitEvent -> {
++				Log.i("P5MVR", "Window session ended: ${event.reason} ${event.reasonString ?: ""}")
++				_state.value = StreamStateQuit(event.reason, event.reasonString)
++			}
++			is LoginPinRequestEvent -> _state.value = StreamStateLoginPinRequest(event.pinIncorrect)
++			is RumbleEvent -> _rumbleState.value = event
+ 		}
+ 	}
+ 
+--- a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
+@@ -185,6 +185,7 @@
+ 	{
+ 		super.onResume()
+ 		hideSystemUI()
++		android.util.Log.i("P5MVR", "Window lifecycle: resume")
+ 		viewModel.session.resume()
+ 	}
+ 
+@@ -200,6 +201,7 @@
+ 		// sessao nativa, depois o produtor de video, e so entao o super deixa
+ 		// os observadores liberarem a SurfaceTexture e pararem a thread GL.
+ 		// Antes a haptica sobrevivia ao dispose e o GL morria antes do codec.
++		android.util.Log.i("P5MVR", "Window lifecycle: pause, finishing=$isFinishing")
+ 		stopHaptics()
+ 		rumble?.set(0, 0)
+ 		if(::viewModel.isInitialized) viewModel.session.pause()
+@@ -229,6 +231,7 @@
+ 
+ 	private fun reconnect()
+ 	{
++		android.util.Log.i("P5MVR", "Window reconnect requested")
+ 		stopHaptics()
+ 		viewModel.session.shutdown()
+ 		viewModel.session.resume()
+@@ -324,7 +327,10 @@
+ 			hapticsSession = null
+ 		}
+ 
+-		if(haptics == null && sessaoNativa != null &&
++		// Um objeto nativo tambem existe quando a conexao falha. O diario
++		// da dev.173 mostrou HID sendo inicializado para cada recusa do PS5.
++		if(state != StreamStateConnected) stopHaptics()
++		if(state == StreamStateConnected && !isFinishing && haptics == null && sessaoNativa != null &&
+ 				io.github.gblandro.p5m.StreamQualityPrefs(this).hapticRumble &&
+ 				io.github.gblandro.p5m.DualSenseHid.disponivel(this))
+ 			haptics = io.github.gblandro.p5m.DualSenseHaptics(
+--- a/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/stream/StreamViewModel.kt
+@@ -16,7 +16,6 @@
+ 	val preferences = Preferences(application)
+ 	val logManager = LogManager(application)
+ 
+-	private var _session: StreamSession? = null
+ 	val input = StreamInput(application, preferences)
+ 	val session = StreamSession(connectInfo, logManager, preferences.logVerbose, input)
+ 
+@@ -29,7 +28,7 @@
+ 	override fun onCleared()
+ 	{
+ 		super.onCleared()
+-		_session?.shutdown()
++		session.shutdown()
+ 	}
+ 
+ 	fun setOnScreenControlsEnabled(enabled: Boolean)

@@ -68,7 +68,14 @@ android {
 
         externalNativeBuild {
             cmake {
-                arguments "-DCHIAKI_ENABLE_TESTS=OFF",
+                // Reaproveita objetos identicos entre builds. Na CI o cache do
+                // ccache atravessa execucoes, e quase toda build daqui muda
+                // meia duzia de linhas nossas e nada da libchiaki, do OpenSSL
+                // ou do curl -- que sao a maior parte do que se compila. Sem
+                // ccache instalado, o CMake ignora estas duas linhas.
+                arguments "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
+                        "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
+                        "-DCHIAKI_ENABLE_TESTS=OFF",
                         "-DCHIAKI_ENABLE_CLI=OFF",
                         "-DCHIAKI_ENABLE_GUI=OFF",
                         "-DCHIAKI_ENABLE_SETSU=OFF",
@@ -204,4 +211,9 @@ dependencies {
     implementation "com.google.oboe:oboe:1.9.3"
     // Loader OpenXR oficial do Khronos, com headers via prefab.
     implementation "org.khronos.openxr:openxr_loader_for_android:1.1.41"
+
+    // Alcanca BluetoothHidHost, que e @SystemApi e esta na lista de bloqueio
+    // de API escondida. A isencao instalada em DualSenseHid nomeia tres
+    // classes, e nao abre a lista inteira.
+    implementation "org.lsposed.hiddenapibypass:hiddenapibypass:6.1"
 }

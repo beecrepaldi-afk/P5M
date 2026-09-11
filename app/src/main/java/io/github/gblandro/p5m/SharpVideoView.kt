@@ -33,7 +33,7 @@ class SharpVideoView(
 {
 	private val filter = VideoFilter()
 	private var surfaceTexture: SurfaceTexture? = null
-	private var surface: Surface? = null
+	@Volatile private var surface: Surface? = null
 	private var viewportWidth = 0
 	private var viewportHeight = 0
 	private var quadrosDesenhados = 0
@@ -70,7 +70,7 @@ class SharpVideoView(
 
 			// De volta à thread principal: quem recebe é a sessão do chiaki, que
 			// não é feita para ser tocada daqui.
-			post { onSurfaceReady(created) }
+			post { if(surface === created && created.isValid) onSurfaceReady(created) }
 		}
 
 		override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int)
@@ -82,7 +82,7 @@ class SharpVideoView(
 
 		override fun onDrawFrame(gl: GL10?)
 		{
-			if(surface == null || viewportWidth == 0)
+			if(surface == null || viewportWidth <= 0 || viewportHeight <= 0)
 			{
 				// Um caso silencioso que ja existia: sem superficie ou com
 				// largura zero a view desenha nada, para sempre, e o log nao

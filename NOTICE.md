@@ -20,6 +20,15 @@ this is too. `LICENSE` has the full text. You get the same freedoms it gives:
 use it, study it, change it, pass it on. Anyone you pass it to gets the source
 and the same rights.
 
+## DualSense output reports
+
+The byte layout of the DualSense Bluetooth output report in `DualSenseHid.kt` --
+the field offsets, the validity flags, and the CRC over the `0xA2` channel tag --
+was read from
+[CloudPad-Android-Dualsense-Wireless](https://github.com/TechAntohere/CloudPad-Android-Dualsense-Wireless)
+by TechAntohere, also under AGPL-3.0. The code here is our own and much smaller,
+but the hardware knowledge it encodes is theirs.
+
 ## Not affiliated with anyone
 
 This project has nothing to do with Sony Interactive Entertainment or Meta

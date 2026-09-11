@@ -38,7 +38,7 @@ object WindowVideo
 	fun attach(activity: Activity, surfaceView: SurfaceView, session: StreamSession)
 	{
 		val quality = StreamQualityPrefs(activity)
-		val sharpen = quality.sharpenAmount
+		val sharpen = quality.windowSharpenAmount
 		val owner = activity as? LifecycleOwner
 
 		// Dez bits obrigam o shader, tenha ou não sido pedida a conversão.
@@ -85,6 +85,9 @@ object WindowVideo
 		{
 			override fun onPause(owner: LifecycleOwner)
 			{
+				// StreamActivity pausa o produtor ANTES de notificar o ciclo de
+				// vida. Nao guardar uma Surface liberada para o proximo resume.
+				session.attachToSurface(null)
 				// Soltar antes de parar a thread do GL, e não no onDestroy: com
 				// ela parada os eventos na fila não rodam mais, e o que ficasse
 				// por soltar só morreria junto com o processo. A GLSurfaceView
@@ -104,8 +107,8 @@ object WindowVideo
 			override fun onDestroy(owner: LifecycleOwner) = view.release()
 		})
 
-		Log.i(TAG, "Window with shader: sharpness ${quality.sharpness} "
-				+ "(${StreamQualityPrefs.SHARPNESS_NAMES[quality.sharpness]})"
+		Log.i(TAG, "Window with shader: sharpness ${quality.windowSharpness} "
+				+ "(${StreamQualityPrefs.SHARPNESS_NAMES[quality.windowSharpness]})"
 				+ (if(quality.tenBit) ", 10-bit PQ source" else ", 8-bit SDR source"))
 	}
 }

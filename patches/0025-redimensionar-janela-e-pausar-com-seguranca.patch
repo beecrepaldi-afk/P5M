@@ -1,0 +1,92 @@
+--- a/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt
+@@ -188,15 +188,15 @@
+ 
+ 			override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int)
+ 			{
+-				val surface = holder.surface
+-				this@StreamSession.surface = surface
+-				session?.setSurface(surface)
++				// P5M: o lado nativo distingue resize de troca real de destino.
++				// Surface.generationId nao pertence ao SDK publico do Android.
++				attachToSurface(holder.surface)
++				Log.i("P5MVR", "Window resized: ${width}x$height")
+ 			}
+ 
+ 			override fun surfaceDestroyed(holder: SurfaceHolder)
+ 			{
+-				this@StreamSession.surface = null
+-				session?.setSurface(null)
++				attachToSurface(null)
+ 			}
+ 		})
+ 	}
+--- a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
+@@ -188,11 +188,22 @@
+ 		viewModel.session.resume()
+ 	}
+ 
++	private fun stopHaptics() {
++		haptics?.stop()
++		haptics = null
++		hapticsSession = null
++	}
++
+ 	override fun onPause()
+ 	{
++		// P5M: o resize/foco pode pausar a activity. Primeiro para quem le a
++		// sessao nativa, depois o produtor de video, e so entao o super deixa
++		// os observadores liberarem a SurfaceTexture e pararem a thread GL.
++		// Antes a haptica sobrevivia ao dispose e o GL morria antes do codec.
++		stopHaptics()
++		rumble?.set(0, 0)
++		if(::viewModel.isInitialized) viewModel.session.pause()
+ 		super.onPause()
+-		rumble?.stop()
+-		viewModel.session.pause()
+ 	}
+ 
+ 	override fun onDestroy()
+@@ -218,6 +229,7 @@
+ 
+ 	private fun reconnect()
+ 	{
++		stopHaptics()
+ 		viewModel.session.shutdown()
+ 		viewModel.session.resume()
+ 	}
+--- a/android/app/src/main/cpp/video-decoder.c
++++ b/android/app/src/main/cpp/video-decoder.c
+@@ -203,7 +203,6 @@
+ 	if(decoder->codec)
+ 	{
+ #if __ANDROID_API__ >= 23
+-		CHIAKI_LOGI(decoder->log, "Video decoder already initialized, swapping surface");
+ 		// P5M: uma Surface abandonada devolve NULL aqui.
+ 		//
+ 		// Foi assim que o processo caiu com SIGSEGV em ANativeWindow_release:
+@@ -218,7 +217,22 @@
+ 			CHIAKI_LOGE(decoder->log, "ANativeWindow_fromSurface() returned NULL on swap; keeping the current window");
+ 			goto beach;
+ 		}
+-		AMediaCodec_setOutputSurface(decoder->codec, new_window);
++		// P5M: resize pode preservar a mesma janela nativa mesmo mudando as
++		// dimensoes. Nao reconfigurar o codec para seu proprio destino; libera
++		// apenas a referencia adicional adquirida por fromSurface.
++		if(new_window == decoder->window)
++		{
++			ANativeWindow_release(new_window);
++			goto beach;
++		}
++		CHIAKI_LOGI(decoder->log, "Video decoder already initialized, swapping surface");
++		media_status_t swap_result = AMediaCodec_setOutputSurface(decoder->codec, new_window);
++		if(swap_result != AMEDIA_OK)
++		{
++			CHIAKI_LOGE(decoder->log, "Surface swap failed: %d; keeping the current window", (int)swap_result);
++			ANativeWindow_release(new_window);
++			goto beach;
++		}
+ 		if(decoder->window)
+ 			ANativeWindow_release(decoder->window);
+ 		decoder->window = new_window;

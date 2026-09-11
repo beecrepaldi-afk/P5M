@@ -99,7 +99,26 @@ void main()
 	// maior frequencia que existe num quadro -- entao legenda e HUD saltavam
 	// para a frente, separados do fundo. Foi o defeito relatado no primeiro
 	// teste, e "o texto fica estranho" e exatamente o que essa pista causa.
-	float d = clamp(0.60 * chao + 0.15 * detalhe + 0.25 * sat, 0.0, 1.0);
+	//
+	// A rampa do chao pesa conforme haja chao.
+	//
+	// Ela e a pista mais forte -- "o que esta embaixo da tela esta perto" --, e
+	// numa cena de terceira pessoa com o piso enquadrado ela acerta quase
+	// sozinha. Numa parede, num close ou num menu de tela cheia nao ha chao
+	// nenhum, e ela continuava impondo a mesma inclinacao global: a imagem
+	// inteira tombava para tras sem que nada na cena pedisse.
+	//
+	// O que distingue os dois casos e gradiente vertical. Um piso que se afasta
+	// clareia ou escurece de baixo para cima; uma parede chapada, uma cara em
+	// close e um fundo de menu nao. Onde nao ha essa variacao a rampa recua
+	// para menos da metade da autoridade e as outras duas pistas ficam com o que
+	// ela devolveu -- na mesma proporcao entre si, que ja foi ajustada e nao e o
+	// que esta em teste aqui.
+	float grad_v = abs(dot(s - n, media));
+	float peso_chao = mix(0.25, 0.60, smoothstep(0.010, 0.075, grad_v));
+	float resto = 1.0 - peso_chao;
+	float d = clamp(peso_chao * chao + resto * (0.375 * detalhe + 0.625 * sat),
+			0.0, 1.0);
 
 	// Contraste em escala fina, de um texel: e o que separa texto de textura.
 	// Parede de tijolo tem detalhe largo; letra tem borda dura de um pixel para
@@ -164,6 +183,12 @@ uniform int uEncode;
 uniform mat4 uTexMatrix;
 
 uniform int uStereo;
+// Qual olho esta sendo desenhado: -1 esquerdo, +1 direito.
+//
+// Antes o lado saia da posicao do pixel dentro de um alvo do dobro da largura.
+// Cada olho agora tem alvo proprio, do tamanho da fonte, e o lado deixa de ser
+// deduzivel da coordenada -- vem de fora, uma vez por passada.
+uniform float uEye;
 // Disparidade maxima, em fracao da largura da fonte. O teto vem da distancia
 // interpupilar lida do runtime: acima dela os olhos teriam de divergir, o que
 // nao e desconforto, e impossivel.
@@ -283,12 +308,10 @@ void main()
 	vec2 uv = vUv;
 	if(uStereo == 1)
 	{
-		// Metade esquerda do alvo e o olho esquerdo. Dentro da metade a
-		// coordenada volta a cobrir a fonte inteira, entao cada olho recebe a
-		// imagem toda -- e nao meia imagem, que e o que aconteceria se o alvo
-		// tivesse a largura da fonte.
-		float lado = vScreen.x < 0.5 ? -1.0 : 1.0;
-		vec2 meia = vec2(fract(vScreen.x * 2.0), vScreen.y);
+		// O alvo tem o tamanho da fonte e pertence a um olho so, entao a
+		// coordenada da tela ja cobre a imagem inteira: nao ha metade a
+		// desdobrar.
+		vec2 meia = vScreen;
 
 		// O deslocamento acontece no espaco normalizado, antes da matriz da
 		// SurfaceTexture. E o mesmo espaco em que o mapa de profundidade foi
@@ -300,7 +323,7 @@ void main()
 		// imagem nao anda para o lado quando o efeito liga, e o erro se reparte
 		// entre os dois em vez de pesar todo num.
 		float d = texture(uDepthTex, meia).r;
-		meia.x += lado * 0.5 * uStereoStrength * (d - uConvergence);
+		meia.x += uEye * 0.5 * uStereoStrength * (d - uConvergence);
 		uv = (uTexMatrix * vec4(meia, 0.0, 1.0)).xy;
 	}
 
@@ -407,6 +430,7 @@ bool ToneMapper::CompileProgram()
 	loc_texel_step_ = glGetUniformLocation(program_, "uTexelStep");
 	loc_encode_ = glGetUniformLocation(program_, "uEncode");
 	loc_stereo_ = glGetUniformLocation(program_, "uStereo");
+	loc_eye_ = glGetUniformLocation(program_, "uEye");
 	loc_stereo_strength_ = glGetUniformLocation(program_, "uStereoStrength");
 	loc_convergence_ = glGetUniformLocation(program_, "uConvergence");
 	loc_depth_tex_ = glGetUniformLocation(program_, "uDepthTex");
@@ -525,22 +549,32 @@ bool ToneMapper::EnableExtrapolation(GLenum format)
 	return true;
 }
 
-bool ToneMapper::EnsureHistory(int32_t width, int32_t height)
+/**
+ * O historico e por olho.
+ *
+ * A extrapolacao preve o proximo quadro a partir dos dois anteriores DAQUELA
+ * imagem. No 3D as duas imagens sao diferentes -- e essa diferenca e o efeito
+ * inteiro --, entao um historico compartilhado preveria o olho direito a partir
+ * do esquerdo e o erro apareceria como profundidade tremendo, que e exatamente
+ * o desconforto que se quer evitar.
+ */
+bool ToneMapper::EnsureHistory(int32_t width, int32_t height, int slot)
 {
-	if(history_[0] != 0 && history_width_ == width && history_height_ == height)
+	GLuint *hist = history_[slot];
+	if(hist[0] != 0 && history_width_[slot] == width && history_height_[slot] == height)
 		return true;
 
-	if(history_[0] != 0)
-		glDeleteTextures(2, history_);
-	history_[0] = history_[1] = 0;
-	history_newest_ = -1;
-	history_count_ = 0;
+	if(hist[0] != 0)
+		glDeleteTextures(2, hist);
+	hist[0] = hist[1] = 0;
+	history_newest_[slot] = -1;
+	history_count_[slot] = 0;
 
 	while(glGetError() != GL_NO_ERROR) { }
-	glGenTextures(2, history_);
+	glGenTextures(2, hist);
 	for(int i = 0; i < 2; i++)
 	{
-		glBindTexture(GL_TEXTURE_2D, history_[i]);
+		glBindTexture(GL_TEXTURE_2D, hist[i]);
 		// Armazenamento imutavel: o formato tem de bater exatamente com o do
 		// swapchain, e glTexStorage2D e o que garante isso sem depender de o
 		// driver escolher um formato interno equivalente por conta propria.
@@ -551,8 +585,8 @@ bool ToneMapper::EnsureHistory(int32_t width, int32_t height)
 		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	}
 	glBindTexture(GL_TEXTURE_2D, 0);
-	history_width_ = width;
-	history_height_ = height;
+	history_width_[slot] = width;
+	history_height_[slot] = height;
 	// Mesmo cuidado: sem esvaziar a fila antes, um erro alheio seria cobrado
 	// desta funcao.
 	return glGetError() == GL_NO_ERROR;
@@ -635,6 +669,26 @@ bool ToneMapper::EnsureWindowTarget(int32_t width, int32_t height)
 	return true;
 }
 
+/**
+ * O mapa de profundidade guarda meia precisao quando o aparelho deixa.
+ *
+ * Em RGBA8 a media exponencial do fim da passada trava. `mix(ant, d, alfa)` com
+ * `alfa` em 0,12 -- que e o valor de cena parada, justamente onde se quer
+ * estabilidade -- anda 0,12 da diferenca, e num alvo de 8 bits qualquer passo
+ * menor que meio nivel arredonda de volta ao ponto de partida. Diferencas
+ * abaixo de cerca de 4/255 nunca convergem: em vez de chegar devagar, o mapa
+ * simplesmente para onde esta.
+ *
+ * A magnitude e pequena -- 1,6% da faixa, subpixel depois do teto de
+ * disparidade --, entao isto e acabamento e nao conserto. Mas o alvo tem um
+ * dezesseis avos dos pixels e a troca custa so o dobro por pixel dele.
+ *
+ * Duas condicoes, e nao uma: alem de o formato ser renderizavel, ele precisa
+ * aceitar filtragem linear. Sem `OES_texture_half_float_linear` a textura fica
+ * incompleta na leitura e devolve preto -- e preto aqui nao da erro, da um mapa
+ * de profundidade zerado, que e um sintoma mudo. Por isso a extensao e conferida
+ * antes, e nao depois.
+ */
 bool ToneMapper::EnsureDepthTargets(int32_t width, int32_t height)
 {
 	const int32_t w = width > 4 ? width / 4 : 1;
@@ -647,29 +701,85 @@ bool ToneMapper::EnsureDepthTargets(int32_t width, int32_t height)
 	depth_tex_[0] = depth_tex_[1] = 0;
 	depth_has_prev_ = false;
 
-	glGenTextures(2, depth_tex_);
-	for(int i = 0; i < 2; i++)
-	{
-		glBindTexture(GL_TEXTURE_2D, depth_tex_[i]);
-		glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, w, h);
-		// Linear na leitura: e o que faz o mapa pequeno voltar suave na passada
-		// principal, sem uma unica amostra a mais.
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	}
-	glBindTexture(GL_TEXTURE_2D, 0);
-
 	if(depth_fbo_ == 0)
 		glGenFramebuffers(1, &depth_fbo_);
+
+	bool meia_precisao = false;
+	{
+		GLint count = 0;
+		glGetIntegerv(GL_NUM_EXTENSIONS, &count);
+		bool renderizavel = false;
+		bool filtravel = false;
+		for(GLint i = 0; i < count; i++)
+		{
+			const char *name = (const char *)glGetStringi(GL_EXTENSIONS, (GLuint)i);
+			if(!name)
+				continue;
+			if(strcmp(name, "GL_EXT_color_buffer_half_float") == 0
+					|| strcmp(name, "GL_EXT_color_buffer_float") == 0)
+				renderizavel = true;
+			else if(strcmp(name, "GL_OES_texture_half_float_linear") == 0)
+				filtravel = true;
+		}
+		meia_precisao = renderizavel && filtravel;
+	}
+
+	const GLenum candidatos[2] = { GL_RGBA16F, GL_RGBA8 };
+	GLenum escolhido = 0;
+	for(int c = meia_precisao ? 0 : 1; c < 2 && escolhido == 0; c++)
+	{
+		while(glGetError() != GL_NO_ERROR) { }
+		glGenTextures(2, depth_tex_);
+		for(int i = 0; i < 2; i++)
+		{
+			glBindTexture(GL_TEXTURE_2D, depth_tex_[i]);
+			glTexStorage2D(GL_TEXTURE_2D, 1, candidatos[c], w, h);
+			// Linear na leitura: e o que faz o mapa pequeno voltar suave na
+			// passada principal, sem uma unica amostra a mais.
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		}
+		glBindTexture(GL_TEXTURE_2D, 0);
+
+		// A prova e anexar de verdade: a lista de extensoes diz o que o driver
+		// promete, e o framebuffer diz o que ele faz.
+		GLint anterior = 0;
+		glGetIntegerv(GL_FRAMEBUFFER_BINDING, &anterior);
+		glBindFramebuffer(GL_FRAMEBUFFER, depth_fbo_);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+				depth_tex_[0], 0);
+		const bool ok = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE
+				&& glGetError() == GL_NO_ERROR;
+		glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)anterior);
+
+		if(ok)
+			escolhido = candidatos[c];
+		else
+		{
+			glDeleteTextures(2, depth_tex_);
+			depth_tex_[0] = depth_tex_[1] = 0;
+		}
+	}
+
+	if(escolhido == 0)
+	{
+		if(!logged_depth_failure_)
+		{
+			logged_depth_failure_ = true;
+			LOGE("No renderable format for the depth target; 3D will have no depth");
+		}
+		return false;
+	}
 
 	depth_width_ = w;
 	depth_height_ = h;
 	if(!logged_depth_)
 	{
 		logged_depth_ = true;
-		LOGI("Depth pass: %dx%d (a quarter of %dx%d in each axis)", w, h, width, height);
+		LOGI("Depth pass: %dx%d (a quarter of %dx%d in each axis), format %s",
+				w, h, width, height, escolhido == GL_RGBA16F ? "RGBA16F" : "RGBA8");
 	}
 	return true;
 }
@@ -726,10 +836,14 @@ void ToneMapper::RenderDepth(const float *matrix, int32_t width, int32_t height)
 	glActiveTexture(GL_TEXTURE0);
 	depth_newest_ = destino;
 	depth_has_prev_ = true;
+	// Devolve o framebuffer. Quem chama pode sair antes de prender o seu -- e o
+	// caso do quadro previsto --, e deixar o alvo pequeno preso faria a proxima
+	// escrita cair nele.
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
 bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
-		float sharpen, bool encode, bool extrapolate)
+		float sharpen, bool encode, bool extrapolate, GLuint target_right)
 {
 	if(!attached_ || program_ == 0)
 		return false;
@@ -778,6 +892,54 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 		}
 	}
 
+	float matrix[16];
+	ASurfaceTexture_getTransformMatrix(surface_texture_, matrix);
+
+	// A profundidade primeiro, e num alvo proprio. Tem de acontecer antes de o
+	// framebuffer de destino ser preso: ela usa o seu, e trocar de framebuffer
+	// no meio da passada principal seria pior do que fazer as duas em ordem.
+	//
+	// So em quadro novo, e isso importa desde que a passada saiu de dentro do
+	// desenho. Num quadro repetido a imagem e a mesma, entao a estimativa
+	// tambem seria -- mas a media exponencial nao sabe disso: ela andaria mais
+	// uma vez sobre o mesmo dado, e o mapa avancaria ao dobro da velocidade
+	// pretendida. Alem de custar uma passada de GPU justamente nos quadros que
+	// a extrapolacao existe para baratear.
+	if(stereo_ && fresh)
+		RenderDepth(matrix, width, height);
+
+	if(stereo_ && target_right != 0)
+	{
+		// Os dois olhos, cada um no seu swapchain. As duas chamadas vao para
+		// variaveis proprias de proposito: escritas dentro de um `&&` a segunda
+		// nao aconteceria quando a primeira falhasse, e o olho direito ficaria
+		// com o conteudo de dois quadros atras -- que se ve como um tranco
+		// lateral, e nao como um quadro perdido.
+		const bool esq = DrawEye(target, width, height, pq, sharpen, encode,
+				extrapolate, fresh, matrix, -1, 0);
+		const bool dir = DrawEye(target_right, width, height, pq, sharpen, encode,
+				extrapolate, fresh, matrix, +1, 1);
+		return esq && dir;
+	}
+	return DrawEye(target, width, height, pq, sharpen, encode, extrapolate, fresh,
+			matrix, 0, 0);
+}
+
+/**
+ * Desenha um alvo: a imagem inteira, para um olho.
+ *
+ * Saiu de dentro do Render porque no 3D ela acontece duas vezes por quadro, uma
+ * por swapchain, enquanto tudo o que vem antes -- prender o buffer, decidir se
+ * o quadro e novo, estimar a profundidade -- acontece uma vez so. Chamar Render
+ * duas vezes consumiria dois quadros do decodificador para mostrar um.
+ *
+ * `eye` e -1, +1 ou 0 quando nao ha olho a distinguir. `slot` escolhe o par de
+ * texturas de historico, que e por olho.
+ */
+bool ToneMapper::DrawEye(GLuint target, int32_t width, int32_t height, bool pq,
+		float sharpen, bool encode, bool extrapolate, bool fresh, const float *matrix,
+		int eye, int slot)
+{
 	// Quadro previsto, quando nao ha um novo para mostrar.
 	//
 	// A fonte entrega 60 por segundo e o painel mostra 120: metade das passadas
@@ -788,10 +950,10 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 	// E extrapolacao e nao interpolacao: nada e esperado, entao nao ha latencia
 	// adicionada -- o preco e artefato no que foi previsto errado, nao atraso.
 	const bool use_history = extrapolate && extrapolate_fn_ && target != 0
-			&& EnsureHistory(width, height);
-	if(!fresh && use_history && history_count_ >= 2)
+			&& EnsureHistory(width, height, slot);
+	if(!fresh && use_history && history_count_[slot] >= 2)
 	{
-		const int newest = history_newest_;
+		const int newest = history_newest_[slot];
 		const int older = 1 - newest;
 
 		// A conferencia de erro so acontece ate a primeira vez que da certo.
@@ -807,7 +969,7 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 		if(checking)
 			while(glGetError() != GL_NO_ERROR) { }
 
-		extrapolate_fn_(history_[older], history_[newest], target, 0.5f);
+		extrapolate_fn_(history_[slot][older], history_[slot][newest], target, 0.5f);
 
 		if(!checking)
 			return true;
@@ -824,16 +986,6 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 		LOGW("glExtrapolateTex2DQCOM returned 0x%x; falling back to a full redraw", err);
 		extrapolate_fn_ = nullptr;
 	}
-
-	float matrix[16];
-	ASurfaceTexture_getTransformMatrix(surface_texture_, matrix);
-
-	// A profundidade primeiro, e num alvo proprio. Tem de acontecer antes de o
-	// framebuffer de destino ser preso: ela usa o seu, e trocar de framebuffer
-	// no meio da passada principal seria pior do que fazer as duas em ordem.
-	const int32_t fonte_w = stereo_ ? width / 2 : width;
-	if(stereo_)
-		RenderDepth(matrix, fonte_w, height);
 
 	// Alvo zero e a janela: no modo janela quem recebe o desenho e o
 	// framebuffer padrao da GLSurfaceView, e nao ha textura para anexar.
@@ -879,9 +1031,9 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 	int history_slot = 0;
 	if(write_history)
 	{
-		history_slot = history_newest_ < 0 ? 0 : 1 - history_newest_;
+		history_slot = history_newest_[slot] < 0 ? 0 : 1 - history_newest_[slot];
 		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D,
-				history_[history_slot], 0);
+				history_[slot][history_slot], 0);
 	}
 	else
 	{
@@ -977,15 +1129,15 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 	glUniform1i(loc_pq_, pq ? 1 : 0);
 	glUniform1f(loc_target_nits_, target_nits_);
 	glUniform1f(loc_sharpen_, sharpen);
-	// O passo de um texel e o da FONTE, e nao o do alvo. Com o alvo do dobro da
-	// largura no modo 3D, usar a largura dele daria meio texel -- a nitidez
-	// amostraria dentro do proprio pixel e praticamente sumiria, e as amostras
-	// da profundidade encolheriam junto.
-	float largura_fonte = stereo_ ? (float)width * 0.5f : (float)width;
-	glUniform2f(loc_texel_step_, largura_fonte > 0.0f ? 1.0f / largura_fonte : 0.0f,
+	// O passo de um texel e o da fonte, que agora e tambem o do alvo: cada olho
+	// tem alvo proprio do tamanho da imagem. Enquanto o alvo tinha o dobro da
+	// largura era preciso dividir aqui, senao a nitidez amostrava dentro do
+	// proprio pixel e praticamente sumia.
+	glUniform2f(loc_texel_step_, width > 0 ? 1.0f / (float)width : 0.0f,
 			height > 0 ? 1.0f / (float)height : 0.0f);
 	glUniform1i(loc_encode_, encode ? 1 : 0);
 	glUniform1i(loc_stereo_, stereo_ ? 1 : 0);
+	glUniform1f(loc_eye_, (float)eye);
 	glUniform1f(loc_stereo_strength_, stereo_strength_);
 	glUniform1f(loc_convergence_, convergence_);
 	// O sampler da profundidade precisa de uma textura 2D valida SEMPRE, mesmo
@@ -1019,9 +1171,9 @@ bool ToneMapper::Render(GLuint target, int32_t width, int32_t height, bool pq,
 
 	if(write_history)
 	{
-		history_newest_ = history_slot;
-		if(history_count_ < 2)
-			history_count_++;
+		history_newest_[slot] = history_slot;
+		if(history_count_[slot] < 2)
+			history_count_[slot]++;
 		// Solta o anexo: a proxima passada pode ser sem historico, e um anexo
 		// esquecido apontando para textura que sera reescrita e a receita do
 		// framebuffer incompleto que ja custou uma sessao aqui.
@@ -1077,12 +1229,15 @@ void ToneMapper::Destroy()
 		glDeleteVertexArrays(1, &vao_);
 	if(fbo_ != 0)
 		glDeleteFramebuffers(1, &fbo_);
-	if(history_[0] != 0)
-		glDeleteTextures(2, history_);
-	history_[0] = history_[1] = 0;
-	history_newest_ = -1;
-	history_count_ = 0;
-	history_width_ = history_height_ = 0;
+	for(int slot = 0; slot < 2; slot++)
+	{
+		if(history_[slot][0] != 0)
+			glDeleteTextures(2, history_[slot]);
+		history_[slot][0] = history_[slot][1] = 0;
+		history_newest_[slot] = -1;
+		history_count_[slot] = 0;
+		history_width_[slot] = history_height_[slot] = 0;
+	}
 	extrapolate_fn_ = nullptr;
 
 	if(window_tex_ != 0)

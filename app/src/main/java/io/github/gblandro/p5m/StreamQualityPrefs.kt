@@ -136,46 +136,26 @@ class StreamQualityPrefs(context: Context)
 		set(value) { prefs.edit().putBoolean(KEY_TONE_MAP, value).apply() }
 
 	/**
-	 * Nitidez em seis degraus: 0 nenhuma, 1 leve, 2 média, 3 forte, 4 MQSR,
-	 * 5 automática.
-	 *
-	 * O degrau 3 é exatamente o que havia antes — o `NORMAL_SHARPENING` do
-	 * compositor, que ficou forte demais. Os degraus abaixo dele existem porque
-	 * o bit não tem intensidade: no caminho direto eles saem de combiná-lo com o
-	 * supersampling, que amacia; no caminho com shader, de uma máscara de
-	 * nitidez com intensidade de verdade. Ver `Sharpness`, no lado nativo.
-	 *
-	 * Chave nova, e não a antiga reaproveitada: no valor velho o 1 significava
-	 * "nitidez ligada", e nesta escala significa "leve". Reler o mesmo número
-	 * numa escala diferente rebaixaria em silêncio a nitidez de quem já tinha
-	 * escolhido.
-	 *
-	 * Os degraus 4 e 5 não são intensidade, são algoritmos:
-	 *
-	 * **MQSR** é o `QUALITY_SHARPENING` — desde a v55 do Horizon OS, o Meta
-	 * Quest Super Resolution, que é o Snapdragon GSR com otimizações da Meta.
-	 *
-	 * Medido no Quest 3: funciona no caminho **com shader** e não no direto. A
-	 * diferença entre os dois é o swapchain — com shader é um GL sRGB que nós
-	 * criamos, no direto é um swapchain-Surface cujo formato o runtime escolhe
-	 * para o MediaCodec escrever, e um filtro que espera textura RGB não tem o
-	 * que fazer com aquilo.
-	 *
-	 * E, mesmo funcionando, ele é um **upscaler**: só tem o que fazer quando a
-	 * tela pede mais pixels do que a fonte entrega. Com a tela "no ponto", não
-	 * impressiona porque não há o que ampliar.
-	 *
-	 * **Automática** passa o bit `AUTO_LAYER_FILTER` com um conjunto de
-	 * candidatos, e o compositor escolhe quadro a quadro. Ele sabe a pose da
-	 * camada, a resolução do swapchain e a carga de GPU do momento; nós não
-	 * sabemos nada disso daqui.
+	 * Cinco escolhas visiveis, com os seis indices antigos preservados.
+	 * O 4 (MQSR explicito) migra para 5 (automatico), inclusive ao ciclar.
+	 * Renumerar o automatico mudaria preferencias persistidas e a fronteira JNI.
+	 * O filtro explicito produziu um disco seguindo a cabeca na dev.168;
+	 * agora MQSR so participa entre os candidatos do compositor no automatico.
+	 * Os niveis 0..3 continuam sendo intensidade; o 5 escolhe um algoritmo.
 	 */
 	var sharpness: Int
-		get() = prefs.getInt(KEY_SHARPNESS, SHARPNESS_MEDIUM).coerceIn(0, 5)
-		set(value) { prefs.edit().putInt(KEY_SHARPNESS, value.coerceIn(0, 5)).apply() }
+		get() = normalizeSharpness(prefs.getInt(KEY_SHARPNESS, SHARPNESS_MEDIUM))
+		set(value) { prefs.edit().putInt(KEY_SHARPNESS, normalizeSharpness(value)).apply() }
 
 	/** Intensidade correspondente ao degrau atual, para o caminho com shader. */
 	val sharpenAmount: Float get() = SHARPEN_AMOUNT[sharpness]
+
+	// A janela nao tem os filtros do compositor OpenXR. Uma preferencia antiga
+	// em automatico usa medium aqui, em vez de desligar a nitidez em silencio.
+	val windowSharpness: Int get() = if(sharpness >= SHARPNESS_MQSR) SHARPNESS_MEDIUM else sharpness
+	val windowSharpenAmount: Float get() = SHARPEN_AMOUNT[windowSharpness]
+	val windowUsesShader: Boolean get() = windowSharpenAmount > 0f || tenBit
+	val immersiveUsesShader: Boolean get() = toneMapped || syntheticStereo || tenBit
 
 	/**
 	 * Áudio espacial em quatro degraus: 0 desligado, 1 sutil, 2 normal, 3 forte.
@@ -353,8 +333,13 @@ class StreamQualityPrefs(context: Context)
 		const val SHARPNESS_MQSR = 4
 		const val SHARPNESS_AUTO = 5
 
+		// Preserva os indices persistidos/JNI. O antigo 4 agora escolhe o
+		// automatico: pedir MQSR sozinho produziu um disco seguindo a cabeca.
+		private fun normalizeSharpness(value: Int): Int =
+			value.coerceIn(0, 5).let { if(it == SHARPNESS_MQSR) SHARPNESS_AUTO else it }
+
 		val SHARPNESS_NAMES = listOf("off", "light", "medium", "strong",
-			"MQSR", "automatic")
+			"automatic", "automatic")
 
 		/**
 		 * Intensidade de cada degrau no caminho com shader.

@@ -56,7 +56,7 @@ public:
 	 * Devolve false quando nao havia frame novo nem antigo para desenhar.
 	 */
 	bool Render(GLuint target, int32_t width, int32_t height, bool pq, float sharpen,
-			bool encode, bool extrapolate = false);
+			bool encode, bool extrapolate = false, GLuint target_right = 0);
 
 	/**
 	 * Liga o olho sintetizado.
@@ -67,9 +67,12 @@ public:
 	 * mais forte da estimativa depende disso, e o compositor pode estar
 	 * invertendo a imagem.
 	 *
-	 * O alvo precisa ter o dobro da largura da fonte: cada olho ocupa uma
-	 * metade e recebe a imagem inteira. Sem isso cada olho ficaria com metade
-	 * da resolucao horizontal.
+	 * Cada olho tem um alvo proprio, do tamanho da fonte, passado ao Render
+	 * como `target` e `target_right`. Ja foi um alvo unico do dobro da largura,
+	 * com cada olho numa metade: funcionava, mas obrigava a submeter cada
+	 * camada como recorte de uma textura maior, e sobre um recorte o filtro de
+	 * nitidez do compositor produziu um X atravessando a tela. Dois alvos
+	 * inteiros custam o mesmo numero de pixels e devolvem o MQSR ao 3D.
 	 */
 	void SetStereo(bool on, float strength, float convergence, bool groundDown)
 	{
@@ -100,7 +103,10 @@ public:
 
 private:
 	bool CompileProgram();
-	bool EnsureHistory(int32_t width, int32_t height);
+	bool EnsureHistory(int32_t width, int32_t height, int slot);
+	bool DrawEye(GLuint target, int32_t width, int32_t height, bool pq, float sharpen,
+			bool encode, bool extrapolate, bool fresh, const float *matrix,
+			int eye, int slot);
 	bool EnsureWindowTarget(int32_t width, int32_t height);
 	GLuint EnsureDummyTexture();
 
@@ -140,6 +146,7 @@ private:
 	GLint loc_encode_ = -1;
 	GLint loc_texel_step_ = -1;
 	GLint loc_stereo_ = -1;
+	GLint loc_eye_ = -1;
 	GLint loc_depth_tex_ = -1;
 
 	// -- Passada da profundidade -------------------------------------------
@@ -190,14 +197,15 @@ private:
 	typedef void (*ExtrapolateFn)(GLuint src1, GLuint src2, GLuint output, GLfloat scale);
 	ExtrapolateFn extrapolate_fn_ = nullptr;
 	GLenum history_format_ = 0;
-	GLuint history_[2] = {0, 0};
-	int32_t history_width_ = 0;
-	int32_t history_height_ = 0;
+	// Um par por olho: [olho][duas mais recentes]. No mono so o par 0 nasce.
+	GLuint history_[2][2] = {{0, 0}, {0, 0}};
+	int32_t history_width_[2] = {0, 0};
+	int32_t history_height_[2] = {0, 0};
 	// Qual das duas guarda o quadro mais recente, e quantas já foram escritas:
 	// com uma só não há de onde extrapolar, e prever a partir de uma textura
 	// ainda em branco desenharia lixo no primeiro quadro da sessão.
-	int history_newest_ = -1;
-	int history_count_ = 0;
+	int history_newest_[2] = {-1, -1};
+	int history_count_[2] = {0, 0};
 	bool logged_extrapolation_ = false;
 	// Timestamp do ultimo buffer prendido. E o que separa quadro novo de quadro
 	// repetido: o updateTexImage devolve sucesso nos dois casos.

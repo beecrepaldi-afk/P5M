@@ -1,0 +1,96 @@
+--- a/android/app/src/main/java/com/metallic/chiaki/session/StreamInput.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/session/StreamInput.kt
+@@ -55,14 +55,16 @@
+ 		// vezes por segundo seria disco no caminho critico da entrada. A
+ 		// calibragem so muda na tela do lancador, que nao existe durante o
+ 		// stream.
+-		val (px, py) = io.github.gblandro.p5m.StickPrefs.aplicar(
+-				p5mSaida.leftX, p5mSaida.leftY, p5mCalibragemEsq)
+-		p5mSaida.leftX = px
+-		p5mSaida.leftY = py
+-		val (qx, qy) = io.github.gblandro.p5m.StickPrefs.aplicar(
+-				p5mSaida.rightX, p5mSaida.rightY, p5mCalibragemDir)
+-		p5mSaida.rightX = qx
+-		p5mSaida.rightY = qy
++		if(p5mAxesActive) {
++			val (px, py) = io.github.gblandro.p5m.StickPrefs.aplicar(
++					p5mSaida.leftX, p5mSaida.leftY, p5mCalibragemEsq)
++			p5mSaida.leftX = px
++			p5mSaida.leftY = py
++			val (qx, qy) = io.github.gblandro.p5m.StickPrefs.aplicar(
++					p5mSaida.rightX, p5mSaida.rightY, p5mCalibragemDir)
++			p5mSaida.rightX = qx
++			p5mSaida.rightY = qy
++		}
+ 
+ 		return p5mSaida
+ 	}
+@@ -71,14 +73,35 @@
+ 	private val p5mCalibragemDir by lazy { io.github.gblandro.p5m.StickPrefs(context).right }
+ 
+ 	private val sensorControllerState = ControllerState() // from Motion Sensors
+-	private val keyControllerState = ControllerState() // from KeyEvents
+-	private val motionControllerState = ControllerState() // from MotionEvents
++	private var keyControllerState = ControllerState() // from KeyEvents
++	private var motionControllerState = ControllerState() // from MotionEvents
+ 	var touchControllerState = ControllerState()
+ 		set(value)
+ 		{
+ 			field = value
+ 			controllerStateUpdated()
+ 		}
++
++	// P5M: uma desconexao nao entrega os eventos de soltar. Limpa as tres
++	// fontes juntas antes de publicar o estado neutro, nos dois modos.
++	var gamepadChangedCallback: (() -> Unit)? = null
++	private var p5mAxesActive = false
++	private val gamepads = io.github.gblandro.p5m.GamepadMonitor(context) {
++		p5mAxesActive = false
++		keyControllerState = ControllerState()
++		motionControllerState = ControllerState()
++		touchControllerState = ControllerState()
++		gamepadChangedCallback?.invoke()
++	}
++	val preferredGamepadId: Int? get() = gamepads.preferredDeviceId
++	fun acceptsGamepadAxes(deviceId: Int) = gamepads.acceptsAxes(deviceId)
++
++	private val gamepadLifecycleObserver = object: LifecycleObserver {
++		@OnLifecycleEvent(Lifecycle.Event.ON_RESUME)
++		fun onResume() = gamepads.start()
++		@OnLifecycleEvent(Lifecycle.Event.ON_PAUSE)
++		fun onPause() = gamepads.stop()
++	}
+ 
+ 	private val swapCrossMoon = preferences.swapCrossMoon
+ 
+@@ -138,6 +161,7 @@
+ 
+ 	fun observe(lifecycleOwner: LifecycleOwner)
+ 	{
++		lifecycleOwner.lifecycle.addObserver(gamepadLifecycleObserver)
+ 		if(preferences.motionEnabled)
+ 			lifecycleOwner.lifecycle.addObserver(motionLifecycleObserver)
+ 	}
+@@ -157,10 +181,12 @@
+ 		{
+ 			KeyEvent.KEYCODE_BUTTON_L2 -> {
+ 				keyControllerState.l2State = if(event.action == KeyEvent.ACTION_DOWN) UByte.MAX_VALUE else 0U
++				controllerStateUpdated()
+ 				return true
+ 			}
+ 			KeyEvent.KEYCODE_BUTTON_R2 -> {
+ 				keyControllerState.r2State = if(event.action == KeyEvent.ACTION_DOWN) UByte.MAX_VALUE else 0U
++				controllerStateUpdated()
+ 				return true
+ 			}
+ 		}
+@@ -225,6 +251,9 @@
+ 		if(event.source and InputDevice.SOURCE_CLASS_JOYSTICK != InputDevice.SOURCE_CLASS_JOYSTICK)
+ 			return false
+ 
++		if(!acceptsGamepadAxes(event.deviceId)) return true
++		p5mAxesActive = true
++
+ 		for(i in 0 until event.historySize)
+ 			aplicarEixos(event, i)
+ 		aplicarEixos(event, -1)

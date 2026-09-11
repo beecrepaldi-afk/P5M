@@ -99,7 +99,7 @@ JNIEXPORT void JNICALL JNI_FCN(nativeSetQuality)(JNIEnv *, jobject, jlong ptr,
 		case 1: params.sharpness = p5m::Sharpness::Light; break;
 		case 2: params.sharpness = p5m::Sharpness::Medium; break;
 		case 3: params.sharpness = p5m::Sharpness::Strong; break;
-		case 4: params.sharpness = p5m::Sharpness::Mqsr; break;
+		case 4: params.sharpness = p5m::Sharpness::Auto; break;
 		case 5: params.sharpness = p5m::Sharpness::Auto; break;
 		default: params.sharpness = p5m::Sharpness::Off; break;
 	}
@@ -160,10 +160,10 @@ JNIEXPORT void JNICALL JNI_FCN(nativeSetVerticalFlip)(JNIEnv *, jobject, jlong p
 }
 
 JNIEXPORT void JNICALL JNI_FCN(nativeSetStereoMode)(JNIEnv *, jobject, jlong ptr,
-		jint mode)
+		jint mode, jboolean synthetic)
 {
 	if(ptr)
-		Handle(ptr)->SetStereoMode((int)mode);
+		Handle(ptr)->SetStereoMode((int)mode, synthetic == JNI_TRUE);
 }
 
 JNIEXPORT void JNICALL JNI_FCN(nativeSetStereoTuning)(JNIEnv *, jobject, jlong ptr,

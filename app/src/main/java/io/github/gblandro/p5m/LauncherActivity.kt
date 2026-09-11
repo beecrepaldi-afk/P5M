@@ -3,6 +3,7 @@ package io.github.gblandro.p5m
 
 import android.app.Activity
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -12,51 +13,24 @@ import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
+import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 
-/**
- * Porta de entrada do app.
- *
- * O Horizon OS mostra **um ícone por pacote**, não um por activity de
- * lançamento. A tela de diagnóstico, que tinha entrada própria no lançador,
- * simplesmente nunca apareceu na biblioteca -- ficou inalcançável justamente
- * quando era mais necessária.
- *
- * Esta tela resolve isso sendo o único ponto de entrada, e de quebra é um
- * experimento: ela não usa AppCompat, nem layout XML, nem tema do chiaki-ng,
- * nem carrega biblioteca nativa nenhuma. Se ela renderizar, sabemos que o
- * processo sobe e que painel 2D funciona, e o problema está adiante. Se nem
- * ela renderizar, o problema é anterior a qualquer activity.
- *
- * ## Por que ela foi redesenhada
- *
- * Ela cresceu por acumulação: cada recurso novo virou mais um botão de largura
- * inteira, com um parágrafo cinza embaixo. Quatorze botões idênticos depois,
- * "Abrir P5M" -- a única coisa que alguém abre o app para fazer -- tinha
- * exatamente o mesmo peso visual que "profundidade da tela no 3D", e os oito
- * parágrafos simultâneos transformavam explicação em ruído.
- *
- * Três decisões consertam isso, e todas são sobre **hierarquia**:
- *
- * - **Jogar não é um ajuste.** A ação principal é um bloco só, colorido, no
- *   topo. Todo o resto é lista.
- * - **Ajuste é linha, não botão.** Rótulo à esquerda, valor à direita. Uma
- *   lista de ajustes se lê de relance; uma pilha de botões com o valor
- *   embutido no texto tem de ser lida palavra por palavra.
- * - **Uma explicação só, embaixo, sobre o que você acabou de tocar.** Era o
- *   que mais poluía: oito parágrafos disputando atenção para explicar coisas
- *   que ninguém está fazendo agora. Como texto de ajuda só interessa sobre o
- *   que se está mexendo, ele fica num lugar fixo e muda com o toque.
- *
- * E os ajustes de 3D só aparecem com o 3D ligado. Dependência mostrada custa
- * menos que dependência explicada.
+/** Lancador nativo: categorias compactas e uma pagina de ajustes por vez.
+ * O layout acompanha o tamanho medido da janela, inclusive sem recriar a
+ * activity. Os valores e a ajuda continuam vindo das preferencias reais.
  */
 class LauncherActivity: Activity()
 {
 	private lateinit var explicacao: TextView
 	private lateinit var status: TextView
+	private var categoria = "Play"
+	private var selecionarCategoria: ((String) -> Unit)? = null
+	private var renderedDensity = 0
+	private var renderedFontScale = 0f
 
 	/**
 	 * O que refazer depois de qualquer toque.
@@ -73,13 +47,20 @@ class LauncherActivity: Activity()
 	override fun onCreate(savedInstanceState: Bundle?)
 	{
 		super.onCreate(savedInstanceState)
+		categoria = savedInstanceState?.getString("category") ?: "Play"
+		construir()
+	}
+
+	private fun construir()
+	{
+		atualizacoes.clear()
+		renderedDensity = resources.configuration.densityDpi
+		renderedFontScale = resources.configuration.fontScale
 
 		val coluna = LinearLayout(this).apply {
 			orientation = LinearLayout.VERTICAL
-			setPadding(dp(28), dp(24), dp(28), dp(28))
+			setPadding(0, 0, 0, dp(8))
 		}
-
-		coluna.addView(cabecalho())
 
 		if(P5MApp.lastCrash(this) != null)
 			coluna.addView(avisoDeQueda())
@@ -101,18 +82,21 @@ class LauncherActivity: Activity()
 
 		// ------------------------------------------------------------ imagem
 		coluna.addView(secao("Picture"))
-		coluna.addView(linha("Mode", { DisplayMode.label(currentMode()) }, { modeHint() }) {
+		coluna.addView(linha("Mode", {
+			if(prefs.syntheticStereo) "Immersive (3D)" else DisplayMode.label(currentMode())
+		}, { modeHint() }, editavel = { !prefs.syntheticStereo }) {
 			val mode = DisplayMode.toggle(this)
 			Log.i(TAG, "Display mode: ${DisplayMode.label(mode)}")
 		})
-		coluna.addView(linha("Video path", { pathValue() }, { pathHint() }) {
+		coluna.addView(linha("Video path", { pathValue() }, { pathHint() },
+			editavel = { currentMode() == DisplayMode.IMMERSIVE }) {
 			// Três estados num botão só, e não dois, porque o segundo depende do
 			// primeiro: quadro previsto precisa do pipeline de GL que só existe
 			// no caminho com shader. Separados, seria possível pedir previsão no
 			// caminho direto -- e não fazer nada.
 			when
 			{
-				!prefs.toneMapped ->
+				!prefs.immersiveUsesShader ->
 				{
 					prefs.toneMapped = true
 					prefs.frameExtrapolation = false
@@ -120,7 +104,7 @@ class LauncherActivity: Activity()
 				!prefs.frameExtrapolation -> prefs.frameExtrapolation = true
 				else ->
 				{
-					prefs.toneMapped = false
+					prefs.toneMapped = prefs.syntheticStereo || prefs.tenBit
 					prefs.frameExtrapolation = false
 				}
 			}
@@ -132,8 +116,9 @@ class LauncherActivity: Activity()
 			Log.i(TAG, "10-bit: ${prefs.tenBit}")
 		})
 		coluna.addView(linha("Sharpness",
-				{ StreamQualityPrefs.SHARPNESS_NAMES[prefs.sharpness] }, { sharpHint() }) {
-			prefs.sharpness = (prefs.sharpness + 1) % 6
+				{ StreamQualityPrefs.SHARPNESS_NAMES[effectiveSharpness()] }, { sharpHint() }) {
+			prefs.sharpness = if(currentMode() == DisplayMode.WINDOW)
+				(effectiveSharpness() + 1) % 4 else (prefs.sharpness + 1) % 6
 			Log.i(TAG, "Sharpness: ${prefs.sharpness} "
 					+ "(${StreamQualityPrefs.SHARPNESS_NAMES[prefs.sharpness]})")
 		})
@@ -143,6 +128,7 @@ class LauncherActivity: Activity()
 		coluna.addView(linha("Emulated 3D", { if(prefs.syntheticStereo) "on" else "off" },
 				{ stereoHint() }) {
 			prefs.syntheticStereo = !prefs.syntheticStereo
+			if(prefs.syntheticStereo) DisplayMode.set(this, DisplayMode.IMMERSIVE)
 			Log.i(TAG, "Synthetic 3D: ${prefs.syntheticStereo}")
 		})
 		// Só aparecem com o 3D ligado: sem ele são dois controles que não fazem
@@ -159,21 +145,31 @@ class LauncherActivity: Activity()
 		})
 
 		// ------------------------------------------------------- mãos e ouvidos
-		coluna.addView(secao("Controller and sound"))
+		coluna.addView(secao("Controller"))
 		coluna.addView(linha("Rumble", { if(prefs.hapticRumble) "haptic" else "classic" },
 				{ rumbleHint() }) {
 			prefs.hapticRumble = !prefs.hapticRumble
 			Log.i(TAG, "Rumble: ${if(prefs.hapticRumble) "haptic (DualSense)"
 					else "classic (DualShock 4)"}")
+
+			// A permissao e pedida aqui, ao ligar, e nao na hora de conectar: um
+			// dialogo do sistema no meio da entrada do stream cairia por cima do
+			// modo imersivo, e responder a ele de dentro do headset com a sessao
+			// subindo e pior do que responder agora, parado no lancador.
+			if(prefs.hapticRumble && !DualSenseHid.disponivel(this))
+				requestPermissions(arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT),
+						PEDIDO_BLUETOOTH)
 		})
 		coluna.addView(linha("Spatial audio",
-				{ StreamQualityPrefs.SPATIAL_NAMES[prefs.spatialAudio] }, { audioHint() }) {
+				{ if(currentMode() == DisplayMode.WINDOW) "System" else StreamQualityPrefs.SPATIAL_NAMES[prefs.spatialAudio] },
+				{ audioHint() }, editavel = { currentMode() == DisplayMode.IMMERSIVE }) {
 			prefs.spatialAudio = (prefs.spatialAudio + 1) % 4
 			Log.i(TAG, "Spatial audio: ${prefs.spatialAudio} "
 					+ "(${StreamQualityPrefs.SPATIAL_NAMES[prefs.spatialAudio]})")
 		})
 		coluna.addView(linha("Settings chord",
-				{ StreamQualityPrefs.CHORD_NAMES[prefs.tuningChord] }, { chordHint() }) {
+				{ StreamQualityPrefs.CHORD_NAMES[prefs.tuningChord] }, { chordHint() },
+				visivel = { currentMode() == DisplayMode.IMMERSIVE }) {
 			prefs.tuningChord = (prefs.tuningChord + 1) % StreamQualityPrefs.CHORD_NAMES.size
 			Log.i(TAG, "Tuning chord: ${StreamQualityPrefs.CHORD_NAMES[prefs.tuningChord]}")
 		})
@@ -203,7 +199,7 @@ class LauncherActivity: Activity()
 		})
 
 		// --------------------------------------------------------------- apoio
-		coluna.addView(secao("Support"))
+		// O apoio fica em Tools, junto do diagnostico e dos links externos.
 		coluna.addView(navegacao("Support development on Patreon",
 				"P5M is free and the source is open. If it is useful to you, chipping in "
 						+ "pays for the hours that keep it moving.") {
@@ -215,11 +211,10 @@ class LauncherActivity: Activity()
 			setTextColor(COR_APAGADA)
 			setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
 			setLineSpacing(dp(3).toFloat(), 1f)
-			setPadding(dp(18), dp(16), dp(18), dp(16))
+			setPadding(dp(16), dp(13), dp(16), dp(13))
 			background = fundoArredondado(COR_RODAPE)
-			text = "Touch anything to see what it does."
+			text = "Choose Play to connect, or select a setting to see what it does."
 		}
-		coluna.addView(explicacao, comMargem(dp(20), 0))
 
 		status = TextView(this).apply {
 			setTextColor(COR_ALERTA)
@@ -227,21 +222,181 @@ class LauncherActivity: Activity()
 			gravity = Gravity.CENTER
 			visibility = View.GONE
 		}
-		coluna.addView(status, comMargem(dp(14), 0))
 
-		// Com rolagem: os ajustes cresceram e o que ficava no fim caía abaixo da
-		// borda da janela, inalcançável -- e o primeiro a cair foi justamente o
-		// diagnóstico, que existe para quando algo dá errado.
-		setContentView(ScrollView(this).apply {
-			setBackgroundColor(COR_FUNDO)
-			isFillViewport = true
-			addView(coluna, LinearLayout.LayoutParams(
-					LinearLayout.LayoutParams.MATCH_PARENT,
-					LinearLayout.LayoutParams.WRAP_CONTENT))
-		})
+		montarMenu(coluna)
 
 		atualizar()
 		Log.i(TAG, "LauncherActivity opened, version ${versionName()}")
+	}
+
+	override fun onSaveInstanceState(outState: Bundle) {
+		outState.putString("category", categoria)
+		super.onSaveInstanceState(outState)
+	}
+
+	override fun onConfigurationChanged(newConfig: Configuration) {
+		super.onConfigurationChanged(newConfig)
+		// Largura/altura sao tratadas pelo layout, preservando foco e rolagem.
+		// Recriar tudo a cada passo do resize gastava trabalho sem necessidade.
+		// So refaz as medidas em dp/sp se a escala realmente tiver mudado.
+		if(newConfig.densityDpi != renderedDensity || newConfig.fontScale != renderedFontScale)
+			construir()
+	}
+
+	@Suppress("DEPRECATION")
+	override fun onBackPressed() {
+		if(categoria != "Play") selecionarCategoria?.invoke("Play")
+		else super.onBackPressed()
+	}
+
+	private fun montarMenu(origem: LinearLayout) {
+		val paginas = linkedMapOf<String, MutableList<View>>("Play" to mutableListOf())
+		var grupo = "Play"
+		while(origem.childCount > 0) {
+			val view = origem.getChildAt(0)
+			origem.removeViewAt(0)
+			val nome = view.tag as? String
+			if(nome != null) {
+				grupo = nome
+				paginas[grupo] = mutableListOf()
+			} else paginas.getValue(grupo).add(view)
+		}
+		val descricoes = mapOf(
+			"Play" to "Your console, ready when you are.",
+			"Picture" to "Display mode, video and image clarity.",
+			"3D" to "Experimental depth from a flat video stream.",
+			"Controller" to "Haptics, sound and your in-game shortcut.",
+			"Tools" to "Diagnostics, testing and project support.")
+		val titulo = TextView(this).apply {
+			setTextColor(COR_TEXTO)
+			textSize = 26f
+			setTypeface(typeface, Typeface.BOLD)
+		}
+		val subtitulo = TextView(this).apply {
+			setTextColor(COR_APAGADA)
+			textSize = 14f
+			setPadding(0, dp(6), 0, dp(20))
+		}
+		val conteudo = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+		val rolagem = ScrollView(this).apply {
+			isFillViewport = true
+			addView(conteudo)
+		}
+		val detalhe = LinearLayout(this).apply {
+			orientation = LinearLayout.VERTICAL
+			setPadding(dp(20), dp(16), dp(20), dp(16))
+			background = fundoArredondado(COR_RODAPE)
+			addView(titulo)
+			addView(subtitulo)
+			addView(rolagem, LinearLayout.LayoutParams(-1, 0, 1f))
+			addView(explicacao)
+			addView(status)
+		}
+		explicacao.setPadding(dp(2), dp(14), dp(2), 0)
+		explicacao.background = null
+		val categorias = LinearLayout(this)
+		val barra = HorizontalScrollView(this).apply {
+			isHorizontalScrollBarEnabled = false
+		}
+		val botoes = linkedMapOf<String, TextView>()
+		fun selecionar(nome: String) {
+			categoria = nome
+			titulo.text = if(nome == "Play") "Let's play" else nome
+			subtitulo.text = descricoes[nome]
+			conteudo.removeAllViews()
+			for(view in paginas.getValue(nome)) conteudo.addView(view)
+			rolagem.scrollTo(0, 0)
+			for((key, view) in botoes) {
+				view.isSelected = key == nome
+				view.setTextColor(if(key == nome) COR_ACENTO_CLARO else COR_APAGADA)
+			}
+			explicar(if(nome == "Play") "Choose Play to find a console on your local network."
+				else "Select a setting to change it. Changes are saved automatically.")
+			atualizar()
+		}
+		for(nome in paginas.keys) {
+			val botao = TextView(this).apply {
+				id = View.generateViewId()
+				text = nome
+				textSize = 16f
+				setTypeface(typeface, Typeface.BOLD)
+				gravity = Gravity.CENTER_VERTICAL
+				setPadding(dp(16), dp(14), dp(16), dp(14))
+				minHeight = dp(48)
+				background = fundoTocavel(COR_FUNDO, COR_CARTAO_PRESSIONADO)
+				isFocusable = true
+				isClickable = true
+				setOnClickListener { selecionar(nome) }
+			}
+			botoes[nome] = botao
+			categorias.addView(botao)
+		}
+		selecionarCategoria = { nome -> selecionar(nome); botoes[nome]?.requestFocus() }
+		selecionar(categoria.takeIf { it in paginas } ?: "Play")
+		val paines = LinearLayout(this)
+		val moldura = LinearLayout(this).apply {
+			orientation = LinearLayout.VERTICAL
+			setPadding(dp(20), dp(16), dp(20), dp(16))
+			addView(cabecalho())
+			addView(paines, LinearLayout.LayoutParams(-1, 0, 1f))
+			addView(TextView(context).apply {
+				text = "D-pad / left stick  Navigate    Cross  Select    Circle  Back"
+				textSize = 12f
+				setTextColor(COR_APAGADA)
+				setPadding(dp(4), dp(12), 0, 0)
+			})
+		}
+		var largo: Boolean? = null
+		var baixo: Boolean? = null
+		// O painel do Quest muda de tamanho sem onCreate. O onMeasure usa a
+		// largura atual, e o listener so troca a disposicao ao cruzar o limite.
+		val raiz = object: FrameLayout(this) {
+			override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+				val limite = minOf(View.MeasureSpec.getSize(widthMeasureSpec), dp(960))
+				if(moldura.layoutParams.width != limite) moldura.layoutParams.width = limite
+				super.onMeasure(widthMeasureSpec, heightMeasureSpec)
+			}
+		}.apply {
+			setBackgroundColor(COR_FUNDO)
+			addView(moldura, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER_HORIZONTAL))
+		}
+		raiz.addOnLayoutChangeListener { _, l, t, r, b, _, _, _, _ ->
+			val amplo = r - l >= dp(720)
+			val curto = b - t < dp(560)
+			if(largo != amplo) {
+				largo = amplo
+				val foco = currentFocus
+				(categorias.parent as? android.view.ViewGroup)?.removeView(categorias)
+				paines.removeAllViews()
+				paines.orientation = if(amplo) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+				categorias.orientation = if(amplo) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+				for(botao in botoes.values) botao.layoutParams = LinearLayout.LayoutParams(
+					if(amplo) -1 else -2, -2).apply { bottomMargin = if(amplo) dp(6) else 0 }
+				if(amplo) {
+					paines.addView(categorias, LinearLayout.LayoutParams(dp(166), -1).apply { rightMargin = dp(18) })
+					paines.addView(detalhe, LinearLayout.LayoutParams(0, -1, 1f))
+				} else {
+					barra.addView(categorias)
+					paines.addView(barra, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
+					paines.addView(detalhe, LinearLayout.LayoutParams(-1, 0, 1f))
+				}
+				foco?.requestFocus()
+			}
+			if(baixo != curto) {
+				baixo = curto
+				// Em janela baixa, a ajuda rola junto: nunca esmaga os controles.
+				(explicacao.parent as? android.view.ViewGroup)?.removeView(explicacao)
+				if(curto) conteudo.addView(explicacao) else detalhe.addView(explicacao, 3)
+			}
+		}
+		// Trocar categoria preserva o rodape no layout compacto.
+		val trocar = selecionarCategoria!!
+		selecionarCategoria = { nome ->
+			trocar(nome)
+			if(baixo == true && explicacao.parent == null) conteudo.addView(explicacao)
+		}
+		for((nome, botao) in botoes) botao.setOnClickListener { selecionarCategoria?.invoke(nome) }
+		setContentView(raiz)
 	}
 
 	// ------------------------------------------------------------- as peças
@@ -256,7 +411,7 @@ class LauncherActivity: Activity()
 	{
 		val acorde = TextView(this).apply {
 			setTextColor(COR_DESTAQUE)
-			setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+			setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
 			typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
 			setPadding(0, 0, dp(14), 0)
 		}
@@ -318,30 +473,36 @@ class LauncherActivity: Activity()
 		setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
 		setTypeface(typeface, Typeface.BOLD)
 		gravity = Gravity.CENTER
-		setPadding(dp(20), dp(22), dp(20), dp(22))
+		setPadding(dp(20), dp(16), dp(20), dp(16))
 		background = fundoTocavel(COR_ACENTO, COR_ACENTO_PRESSIONADO)
 		isFocusable = true
 		isClickable = true
+		setOnFocusChangeListener { _, focused ->
+			if(focused) explicar("Find your console on the local network and start playing.")
+		}
 		setOnClickListener { onClick() }
-		layoutParams = comMargem(0, dp(10))
+		minWidth = dp(180)
+		layoutParams = LinearLayout.LayoutParams(-2, -2).apply { bottomMargin = dp(10) }
 	}
 
 	private fun acaoSecundaria(rotulo: String, dica: String, onClick: () -> Unit) =
 			TextView(this).apply {
 		text = rotulo
 		setTextColor(COR_TEXTO)
-		setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
-		gravity = Gravity.CENTER
-		setPadding(dp(20), dp(18), dp(20), dp(18))
+		setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+		gravity = Gravity.START or Gravity.CENTER_VERTICAL
+		setPadding(dp(18), dp(14), dp(18), dp(14))
 		background = fundoTocavel(COR_CARTAO, COR_CARTAO_PRESSIONADO)
 		isFocusable = true
 		isClickable = true
+		setOnFocusChangeListener { _, focused -> if(focused) explicar(dica) }
 		setOnClickListener { explicar(dica); onClick() }
 		layoutParams = comMargem(0, dp(22))
 	}
 
 	/** Cabeçalho de seção: separa sem pesar. Por isso pequeno, espaçado e apagado. */
 	private fun secao(titulo: String) = TextView(this).apply {
+		tag = titulo
 		text = titulo.uppercase()
 		setTextColor(COR_SECAO)
 		setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
@@ -359,32 +520,37 @@ class LauncherActivity: Activity()
 	 * velho; guardar como calculá-lo não tem esse defeito.
 	 */
 	private fun linha(rotulo: String, valor: () -> String, dica: () -> String,
-			visivel: () -> Boolean = { true }, onClick: () -> Unit): View
+			visivel: () -> Boolean = { true }, editavel: () -> Boolean = { true },
+			onClick: () -> Unit): View
 	{
 		val texto = TextView(this).apply {
 			text = rotulo
 			setTextColor(COR_TEXTO)
-			setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+			setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
 			layoutParams = LinearLayout.LayoutParams(0,
-					LinearLayout.LayoutParams.WRAP_CONTENT).apply { weight = 1f }
+					LinearLayout.LayoutParams.WRAP_CONTENT).apply { weight = 0.55f }
 		}
 		val valorView = TextView(this).apply {
-			setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+			layoutParams = LinearLayout.LayoutParams(0, -2, 0.45f)
+			setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
 			setTypeface(typeface, Typeface.BOLD)
 			gravity = Gravity.END
+			maxWidth = dp(220)
+			setPadding(dp(12), 0, 0, 0)
 		}
 		val fila = LinearLayout(this).apply {
 			orientation = LinearLayout.HORIZONTAL
 			gravity = Gravity.CENTER_VERTICAL
-			setPadding(dp(18), dp(16), dp(18), dp(16))
+			setPadding(dp(16), dp(13), dp(16), dp(13))
 			background = fundoTocavel(COR_CARTAO, COR_CARTAO_PRESSIONADO)
 			isFocusable = true
 			isClickable = true
+			setOnFocusChangeListener { _, focused -> if(focused) explicar(dica()) }
 			addView(texto)
 			addView(valorView)
 			layoutParams = comMargem(0, dp(6))
 			setOnClickListener {
-				onClick()
+				if(editavel()) onClick()
 				explicar(dica())
 				atualizar()
 			}
@@ -392,6 +558,8 @@ class LauncherActivity: Activity()
 		atualizacoes += {
 			val v = valor()
 			valorView.text = v
+			fila.contentDescription = "$rotulo: $v"
+			fila.isClickable = editavel()
 			// Valor desligado fica apagado. É o que deixa a lista inteira
 			// legível de relance: o que está ativo salta, o resto recua.
 			valorView.setTextColor(if(v == "off" || v == "off (2D)") COR_APAGADA else COR_ACENTO_CLARO)
@@ -405,14 +573,15 @@ class LauncherActivity: Activity()
 			LinearLayout(this).apply {
 		orientation = LinearLayout.HORIZONTAL
 		gravity = Gravity.CENTER_VERTICAL
-		setPadding(dp(18), dp(16), dp(18), dp(16))
+		setPadding(dp(16), dp(13), dp(16), dp(13))
 		background = fundoTocavel(COR_CARTAO, COR_CARTAO_PRESSIONADO)
 		isFocusable = true
 		isClickable = true
+		setOnFocusChangeListener { _, focused -> if(focused) explicar(dica) }
 		addView(TextView(context).apply {
 			text = rotulo
 			setTextColor(COR_TEXTO)
-			setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+			setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
 			layoutParams = LinearLayout.LayoutParams(0,
 					LinearLayout.LayoutParams.WRAP_CONTENT).apply { weight = 1f }
 		})
@@ -427,7 +596,7 @@ class LauncherActivity: Activity()
 
 	private fun explicar(texto: String)
 	{
-		explicacao.text = texto
+		if(::explicacao.isInitialized) explicacao.text = texto
 	}
 
 	private fun atualizar()
@@ -440,7 +609,9 @@ class LauncherActivity: Activity()
 
 	private fun currentMode(): Int = DisplayMode.current(this)
 
-	private fun modeHint() = if(currentMode() == DisplayMode.IMMERSIVE)
+	private fun modeHint() = if(prefs.syntheticStereo)
+		"3D requires immersive mode. Turn off Emulated 3D to choose Window."
+	else if(currentMode() == DisplayMode.IMMERSIVE)
 		"Curved screen, managed color, refresh rate matched to the source, and in-game "
 				.plus("tuning on L3+R3. Takes the whole display.")
 	else
@@ -449,17 +620,22 @@ class LauncherActivity: Activity()
 
 	private fun pathValue() = when
 	{
+		currentMode() == DisplayMode.WINDOW -> if(prefs.windowUsesShader) "shader (automatic)" else "direct (automatic)"
+		prefs.immersiveUsesShader && prefs.frameExtrapolation -> "shader + frames"
 		prefs.syntheticStereo -> "shader (3D)"
-		!prefs.toneMapped -> "direct"
-		!prefs.frameExtrapolation -> "shader"
-		else -> "shader + frames"
+		prefs.tenBit -> "shader (10-bit)"
+		prefs.immersiveUsesShader -> "shader"
+		else -> "direct"
 	}
 
 	private fun pathHint() = when
 	{
+		currentMode() == DisplayMode.WINDOW ->
+			"Window selects its video path from Sharpness and Color. Frame prediction is only available in immersive mode."
+		prefs.tenBit ->
+			"10-bit color requires tone mapping, so the shader stays on. Select to toggle experimental frame prediction."
 		prefs.syntheticStereo ->
-			"3D needs a GPU pass of ours to warp the image, so it holds the shader path "
-					.plus("on. Turn 3D off to get this back.")
+			"3D requires the shader. Select to toggle experimental frame prediction."
 		!prefs.toneMapped ->
 			"From the network to the compositor with no copy. The lowest latency there is."
 		!prefs.frameExtrapolation ->
@@ -470,21 +646,20 @@ class LauncherActivity: Activity()
 	}
 
 	private fun colorHint() = if(prefs.tenBit)
-		"No banding in gradients, but blown-out whites: this decoder does not tone map. "
-				.plus("Reconnect to switch.")
+		"10-bit gradients with shader tone mapping. Uses an extra GPU pass. Reconnect to switch."
 	else
 		"The Remote Play default, and what gives correct color today."
 
+	private fun effectiveSharpness() = if(currentMode() == DisplayMode.WINDOW) prefs.windowSharpness else prefs.sharpness
+
 	private fun sharpHint() = when
 	{
-		prefs.sharpness == 0 ->
+		effectiveSharpness() == 0 ->
 			"The image as the console delivers it, with no sharpening."
-		prefs.syntheticStereo && prefs.sharpness >= StreamQualityPrefs.SHARPNESS_MQSR ->
-			"MQSR does not apply in 3D — the layer is half of a texture there, and the "
-					.plus("compositor filter draws an X across it. Falls back to the shader.")
-		prefs.sharpness >= StreamQualityPrefs.SHARPNESS_MQSR ->
-			"A compositor filter, not a strength. MQSR only does anything with the screen "
-					.plus("big enough that there is something to upscale.")
+		effectiveSharpness() >= StreamQualityPrefs.SHARPNESS_MQSR ->
+			if(currentMode() == DisplayMode.IMMERSIVE)
+				"The compositor chooses the filter for the screen size and GPU load."
+			else "Automatic filtering is available in immersive mode. Choose light, medium or strong for window sharpening."
 		currentMode() == DisplayMode.IMMERSIVE ->
 			"This also changes in game, with Square on the tuning panel (L3+R3)."
 		else ->
@@ -497,7 +672,7 @@ class LauncherActivity: Activity()
 				.plus("second eye. It is a guess, so some scenes come out wrong — the aim ")
 				.plus("is a sense of volume, not accurate depth.")
 	else
-		"Turn this on to play in 3D. It holds the shader video path on and costs GPU. "
+		"Turning on 3D switches to immersive mode. Window is unavailable until 3D is off. "
 				.plus("Reconnect to switch.")
 
 	private fun strengthHint() =
@@ -523,19 +698,19 @@ class LauncherActivity: Activity()
 	}
 
 	private fun rumbleHint() = if(prefs.hapticRumble)
-		"The console sends raw haptics and we guess the strength from the envelope. It "
-				.plus("buzzes at moments the game never asked for. Reconnect to switch.")
+		"The console sends the raw haptics track and it goes straight to the DualSense "
+				.plus("coils over Bluetooth. Needs the controller paired. Reconnect to switch.")
 	else
 		"The console itself reduces the game's haptics to two motors, the way it does "
 				.plus("for a DualShock 4. Reconnect to switch.")
 
 	private fun audioHint() = when
 	{
-		prefs.spatialAudio == 0 ->
-			"Stereo as the console sends it, locked to your head."
 		currentMode() != DisplayMode.IMMERSIVE ->
 			"In window mode Horizon OS does the positioning, not this setting: the sound "
 					.plus("goes out through the system mixer so that it can.")
+		prefs.spatialAudio == 0 ->
+			"Stereo as the console sends it, locked to your head."
 		else ->
 			"The two channels become speakers on the screen. Turn your head and the sound "
 					.plus("stays where the screen is.")
@@ -602,8 +777,11 @@ class LauncherActivity: Activity()
 	 */
 	private fun fundoTocavel(normal: Int, aceso: Int) = StateListDrawable().apply {
 		addState(intArrayOf(android.R.attr.state_pressed), fundoArredondado(aceso))
-		addState(intArrayOf(android.R.attr.state_focused), fundoArredondado(aceso))
+		addState(intArrayOf(android.R.attr.state_focused), fundoArredondado(aceso).apply {
+			setStroke(dp(2), COR_ACENTO_CLARO)
+		})
 		addState(intArrayOf(android.R.attr.state_hovered), fundoArredondado(aceso))
+		addState(intArrayOf(android.R.attr.state_selected), fundoArredondado(COR_CARTAO_PRESSIONADO))
 		addState(intArrayOf(), fundoArredondado(normal))
 	}
 
@@ -618,6 +796,8 @@ class LauncherActivity: Activity()
 
 	companion object
 	{
+		private const val PEDIDO_BLUETOOTH = 4202
+
 		/**
 		 * Referenciada por nome para não arrastar as classes do chiaki-ng para
 		 * dentro desta tela: se elas falharem ao carregar, o carregamento tem

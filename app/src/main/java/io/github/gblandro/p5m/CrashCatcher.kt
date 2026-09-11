@@ -94,6 +94,7 @@ class P5MApp: Application()
 		// lento, estava esperando CPU junto com todo o resto.
 		val ticker = android.os.HandlerThread("p5m-diario").also { it.start() }
 		val handler = Handler(ticker.looper)
+		val uiWatchdog = UiWatchdog(this, handler)
 		val tick = object: Runnable {
 			override fun run()
 			{
@@ -108,8 +109,10 @@ class P5MApp: Application()
 
 			override fun onActivityStarted(activity: Activity)
 			{
-				if(visible++ == 0)
+				if(visible++ == 0) {
 					handler.post(tick)
+					uiWatchdog.start()
+				}
 			}
 
 			override fun onActivityStopped(activity: Activity)
@@ -117,16 +120,20 @@ class P5MApp: Application()
 				if(--visible <= 0)
 				{
 					visible = 0
+					uiWatchdog.stop()
 					handler.removeCallbacks(tick)
 					// Uma última passagem: o fim da sessão é justamente onde
 					// estão as linhas que explicam por que ela terminou.
-					Trace.captureNativeLines(this@P5MApp)
+					handler.post { Trace.captureNativeLines(this@P5MApp) }
 				}
 			}
 
 			override fun onActivityCreated(activity: Activity, state: Bundle?) = Unit
 			override fun onActivityResumed(activity: Activity) = Unit
-			override fun onActivityPaused(activity: Activity) = Unit
+			// AppCompat pode substituir o callback durante o resume. API 29+
+			// oferece este ponto depois que a activity concluiu a retomada.
+			override fun onActivityPostResumed(activity: Activity) = MenuController.attach(activity)
+			override fun onActivityPaused(activity: Activity) = MenuController.detach(activity)
 			override fun onActivitySaveInstanceState(activity: Activity, out: Bundle) = Unit
 			override fun onActivityDestroyed(activity: Activity) = Unit
 		})

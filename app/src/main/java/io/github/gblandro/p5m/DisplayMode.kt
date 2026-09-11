@@ -3,6 +3,7 @@ package io.github.gblandro.p5m
 
 import android.content.Context
 import android.content.Intent
+import android.app.Activity
 import android.util.Log
 
 /**
@@ -45,18 +46,21 @@ object DisplayMode
 		context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
 	fun current(context: Context): Int =
-		prefs(context).getInt(KEY_MODE, WINDOW).coerceIn(0, 1)
+		// Tambem cobre preferencias antigas que permitiam 3D em janela.
+		if(StreamQualityPrefs(context).syntheticStereo) IMMERSIVE
+		else prefs(context).getInt(KEY_MODE, WINDOW).coerceIn(0, 1)
 
 	fun set(context: Context, mode: Int)
 	{
-		prefs(context).edit().putInt(KEY_MODE, mode.coerceIn(0, 1)).apply()
+		val allowed = if(StreamQualityPrefs(context).syntheticStereo) IMMERSIVE else mode.coerceIn(0, 1)
+		prefs(context).edit().putInt(KEY_MODE, allowed).apply()
 	}
 
 	fun toggle(context: Context): Int
 	{
 		val next = if(current(context) == IMMERSIVE) WINDOW else IMMERSIVE
 		set(context, next)
-		return next
+		return current(context)
 	}
 
 	fun label(mode: Int) = if(mode == IMMERSIVE) "Immersive" else "Window"
@@ -165,6 +169,10 @@ object DisplayMode
 		context.startActivity(Intent(context, target).apply {
 			putExtra(com.metallic.chiaki.stream.StreamActivity.EXTRA_CONNECT_INFO,
 					connectInfo.copy(videoProfile = profile, dualsense = quality.hapticRumble))
+			(context as? Activity)?.let {
+				putExtra(StreamReturn.EXTRA_ACTIVITY, it.javaClass.name)
+				putExtra(StreamReturn.EXTRA_TASK, it.taskId)
+			}
 		})
 	}
 }

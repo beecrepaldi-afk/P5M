@@ -1,0 +1,119 @@
+--- a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
+@@ -116,17 +116,55 @@
+ 		// pedido identico -- durante vibracao continua os eventos chegam sem
+ 		// parar, e cada um deles e uma chamada de binder na thread que tambem
+ 		// entrega video.
+-		val rumble = io.github.gblandro.p5m.Rumble(Preferences(this).rumbleEnabled)
+-		rumble.attach(io.github.gblandro.p5m.Rumble.gamepadDeviceId())
+-		this.rumble = rumble
++		// P5M: com a haptica crua em jogo, o Rumble nasce desligado.
++		//
++		// Nao e so para as duas saidas nao se somarem. A buzina de teste que ele
++		// manda ao abrir a sessao passa pelo caminho de vibracao do Android, e
++		// mandar intensidade poe a bobina do controle em modo motor, onde ela
++		// ignora a trilha de audio. A buzina trocava o modo do controle bem na
++		// hora em que a entrega crua comecava.
++		//
++		// Desligado ele nao varre, nao busca alvo e nao buzina. Se a ponte nao
++		// subir, um Rumble de verdade nasce no lugar.
++		val crua = io.github.gblandro.p5m.StreamQualityPrefs(this).hapticRumble &&
++				io.github.gblandro.p5m.DualSenseHid.disponivel(this)
++		if(crua)
++			this.rumble = io.github.gblandro.p5m.Rumble(false)
++		else
++			ligarRumble()
+ 		viewModel.session.rumbleState.observe(this, Observer {
+-			rumble.set(it.left.toInt(), it.right.toInt())
++			if(haptics?.entregando != true)
++				rumble?.set(it.left.toInt(), it.right.toInt())
+ 		})
+ 	}
+ 
+ 	// Um motor girando nao pode sobreviver a tela que o ligou.
+ 	private var rumble: io.github.gblandro.p5m.Rumble? = null
+ 
++	// P5M: a haptica crua, quando o console a manda e ha DualSense para receber.
++	private var haptics: io.github.gblandro.p5m.DualSenseHaptics? = null
++
++	// P5M: a sessao nativa para a qual a haptica foi ligada.
++	//
++	// Nao e zelo: uma conexao que falha no aperto de mao -- Senkusha sem pong,
++	// cookie sem ack -- e refeita, e refazer cria uma sessao nativa NOVA. A
++	// thread da haptica continuava lendo o anel da antiga, que ninguem mais
++	// alimentava, enquanto o anel da nova enchia sem ninguem drenar. O diario
++	// mostrava isso como "ring full, dropping frames" com a nossa fila em zero
++	// byte de pico, e a sessao inteira saia muda.
++	private var hapticsSession: com.metallic.chiaki.lib.Session? = null
++
++	// P5M: o Rumble de verdade, para quando a haptica crua nao puder ser
++	// entregue. Fica aqui, e nao numa variavel local, porque quem descobre isso
++	// e a thread da haptica, minutos depois do onCreate.
++	private fun ligarRumble()
++	{
++		val r = io.github.gblandro.p5m.Rumble(Preferences(this).rumbleEnabled)
++		r.attach(io.github.gblandro.p5m.Rumble.gamepadDeviceId())
++		this.rumble?.stop()
++		this.rumble = r
++	}
++
+ 	private val controlsDisposable = CompositeDisposable()
+ 
+ 	override fun onAttachFragment(fragment: Fragment)
+@@ -159,6 +197,20 @@
+ 
+ 	override fun onDestroy()
+ 	{
++		// P5M: a haptica para ANTES do super, e nao depois.
++		//
++		// Quem libera a sessao nativa e o shutdown do StreamSession, chamado
++		// pelo onCleared do ViewModel -- e o ViewModelStore e limpo por um
++		// observador de ciclo de vida que roda dentro do super.onDestroy(). O
++		// laco da haptica le do ponteiro nativo cem vezes por segundo, entao
++		// parar depois do super deixaria uma thread lendo memoria liberada.
++		//
++		// O stop() faz join na thread de entrega, entao quando ele volta nao ha
++		// mais ninguem lendo.
++		haptics?.stop()
++		haptics = null
++		hapticsSession = null
++
+ 		super.onDestroy()
+ 		rumble?.stop()
+ 		controlsDisposable.dispose()
+@@ -239,6 +291,35 @@
+ 	{
+ 		binding.progressBar.visibility = if(state == StreamStateConnecting) View.VISIBLE else View.GONE
+ 
++		// P5M: a haptica crua sobe aqui, e nao junto com o Rumble no onCreate.
++		//
++		// O Rumble so precisa do gamepad, que ja existe antes de qualquer
++		// conexao; a haptica le da sessao nativa, que so nasce quando o stream
++		// comeca. Ligar as duas no mesmo lugar seria arrumado e leria um
++		// ponteiro nulo.
++		//
++		// Sem isto, o modo janela ficava com a envoltoria no motor enquanto o
++		// imersivo tinha a trilha inteira -- mesmo anuncio ao console, mesma
++		// preferencia, e duas vibracoes diferentes conforme a tela.
++		val sessaoNativa = viewModel.session.session
++
++		// Trocou a sessao debaixo da haptica: para a antiga antes de qualquer
++		// coisa, porque o laco dela le do ponteiro nativo que esta indo embora.
++		if(haptics != null && sessaoNativa !== hapticsSession)
++		{
++			haptics?.stop()
++			haptics = null
++			hapticsSession = null
++		}
++
++		if(haptics == null && sessaoNativa != null &&
++				io.github.gblandro.p5m.StreamQualityPrefs(this).hapticRumble &&
++				io.github.gblandro.p5m.DualSenseHid.disponivel(this))
++			haptics = io.github.gblandro.p5m.DualSenseHaptics(
++					this, io.github.gblandro.p5m.DualSenseHid(this))
++				.also { h -> h.start(sessaoNativa) { runOnUiThread { ligarRumble() } } }
++				.also { hapticsSession = sessaoNativa }
++
+ 		when(state)
+ 		{
+ 			is StreamStateQuit ->

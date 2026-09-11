@@ -221,15 +221,18 @@ class XrBridge(private val activity: Activity)
 	 * Diz se a imagem carrega os dois olhos: 0 mono, 1 lado a lado, 2 uma sobre
 	 * a outra.
 	 *
-	 * Vale para as duas origens de estereo, e e a mesma chave de proposito: um
-	 * video que ja veio lado a lado do console, e a saida do nosso proprio
-	 * sintetizador, que escreve os dois olhos na mesma textura. Do lado da
-	 * submissao os dois sao a mesma coisa.
+	 * Vale para as duas origens de estereo, e `synthetic` diz qual delas e.
+	 *
+	 * Do lado da submissao elas deixaram de ser a mesma coisa. Um video que ja
+	 * veio com os dois olhos numa imagem so obriga cada camada a ser metade
+	 * dessa imagem; a saida do nosso sintetizador vai para um swapchain por
+	 * olho, e cada camada leva uma imagem inteira. So a segunda aceita o filtro
+	 * de nitidez do compositor -- sobre recorte ele desenha um X na tela.
 	 */
-	fun setStereoMode(mode: Int)
+	fun setStereoMode(mode: Int, synthetic: Boolean = false)
 	{
 		if(nativePtr != 0L)
-			nativeSetStereoMode(nativePtr, mode)
+			nativeSetStereoMode(nativePtr, mode, synthetic)
 	}
 
 	/**
@@ -296,7 +299,7 @@ class XrBridge(private val activity: Activity)
 	private external fun nativeSetLayerShape(ptr: Long, shape: Int)
 	private external fun nativeSetVideoLayerEnabled(ptr: Long, enabled: Boolean)
 	private external fun nativeSetVerticalFlip(ptr: Long, enabled: Boolean)
-	private external fun nativeSetStereoMode(ptr: Long, mode: Int)
+	private external fun nativeSetStereoMode(ptr: Long, mode: Int, synthetic: Boolean)
 	private external fun nativeSetStereoTuning(ptr: Long, strength: Float, convergence: Float)
 	private external fun nativeSetWideColor(ptr: Long, wide: Boolean)
 	private external fun nativeSetSpatialAudio(strength: Float)

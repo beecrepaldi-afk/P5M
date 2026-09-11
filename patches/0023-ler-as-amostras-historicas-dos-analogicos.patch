@@ -1,0 +1,82 @@
+--- a/android/app/src/main/java/com/metallic/chiaki/session/StreamInput.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/session/StreamInput.kt
+@@ -200,21 +200,61 @@
+ 		return true
+ 	}
+ 
++	/**
++	 * P5M: le tambem as amostras historicas, e nao so a ultima.
++	 *
++	 * O Android junta os eventos de eixo que chegaram desde o quadro anterior e
++	 * entrega todos num MotionEvent so: a posicao mais recente nos campos
++	 * normais, e as intermediarias no historico. Ler so a mais recente joga fora
++	 * todas as outras, e a taxa efetiva com que o console recebe os analogicos
++	 * cai para a taxa de quadros da tela -- por volta de 90 por segundo -- em vez
++	 * da taxa com que o controle fala, que e bem maior.
++	 *
++	 * Nao da para pedir ao DualSense que fale mais rapido: o intervalo do
++	 * relatorio HID e coisa da pilha de Bluetooth e nao ha API para isso. Mas
++	 * parar de descartar o que ele ja mandou nao custa nada e recupera o que
++	 * havia sido perdido de graca. Um giro rapido de analogico passa a chegar ao
++	 * console como a curva que foi, e nao como uma amostra por quadro.
++	 *
++	 * Cada amostra vira um envio, porque a libchiaki manda quando o estado muda.
++	 * Nao e exagero: e a taxa em que o proprio controle fala, e a mesma que o
++	 * console receberia dele diretamente.
++	 */
+ 	fun onGenericMotionEvent(event: MotionEvent): Boolean
+ 	{
+ 		if(event.source and InputDevice.SOURCE_CLASS_JOYSTICK != InputDevice.SOURCE_CLASS_JOYSTICK)
+ 			return false
++
++		for(i in 0 until event.historySize)
++			aplicarEixos(event, i)
++		aplicarEixos(event, -1)
++		return true
++	}
++
++	/**
++	 * Copia um instante do evento para o estado e o envia.
++	 *
++	 * `amostra` e o indice no historico, ou -1 para a posicao atual -- que e a
++	 * mais recente e nao esta no historico. As duas leituras existem com nomes
++	 * diferentes na API, e por isso a escolha e feita aqui, uma vez, em vez de
++	 * espalhar `if` por doze linhas.
++	 */
++	private fun aplicarEixos(event: MotionEvent, amostra: Int)
++	{
++		fun eixo(id: Int) = if(amostra < 0) event.getAxisValue(id)
++			else event.getHistoricalAxisValue(id, amostra)
+ 		fun Float.signedAxis() = (this * Short.MAX_VALUE).toInt().toShort()
+ 		fun Float.unsignedAxis() = (this * UByte.MAX_VALUE.toFloat()).toUInt().toUByte()
+-		motionControllerState.leftX = event.getAxisValue(MotionEvent.AXIS_X).signedAxis()
+-		motionControllerState.leftY = event.getAxisValue(MotionEvent.AXIS_Y).signedAxis()
+-		motionControllerState.rightX = event.getAxisValue(MotionEvent.AXIS_Z).signedAxis()
+-		motionControllerState.rightY = event.getAxisValue(MotionEvent.AXIS_RZ).signedAxis()
+-		motionControllerState.l2State = event.getAxisValue(MotionEvent.AXIS_LTRIGGER).unsignedAxis()
+-		motionControllerState.r2State = event.getAxisValue(MotionEvent.AXIS_RTRIGGER).unsignedAxis()
++
++		motionControllerState.leftX = eixo(MotionEvent.AXIS_X).signedAxis()
++		motionControllerState.leftY = eixo(MotionEvent.AXIS_Y).signedAxis()
++		motionControllerState.rightX = eixo(MotionEvent.AXIS_Z).signedAxis()
++		motionControllerState.rightY = eixo(MotionEvent.AXIS_RZ).signedAxis()
++		motionControllerState.l2State = eixo(MotionEvent.AXIS_LTRIGGER).unsignedAxis()
++		motionControllerState.r2State = eixo(MotionEvent.AXIS_RTRIGGER).unsignedAxis()
+ 		motionControllerState.buttons = motionControllerState.buttons.let {
+-			val dpadX = event.getAxisValue(MotionEvent.AXIS_HAT_X)
+-			val dpadY = event.getAxisValue(MotionEvent.AXIS_HAT_Y)
++			val dpadX = eixo(MotionEvent.AXIS_HAT_X)
++			val dpadY = eixo(MotionEvent.AXIS_HAT_Y)
+ 			val dpadButtons =
+ 				(if(dpadX > 0.5f) ControllerState.BUTTON_DPAD_RIGHT else 0U) or
+ 						(if(dpadX < -0.5f) ControllerState.BUTTON_DPAD_LEFT else 0U) or
+@@ -226,8 +266,6 @@
+ 					ControllerState.BUTTON_DPAD_UP).inv() or
+ 					dpadButtons
+ 		}
+-		//Log.i("StreamSession", "motionEvent => $motionControllerState")
+ 		controllerStateUpdated()
+-		return true
+ 	}
+ }
+\ No newline at end of file

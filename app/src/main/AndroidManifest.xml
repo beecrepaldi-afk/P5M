@@ -22,7 +22,16 @@
     <!-- WifiLock em modo de baixa latencia: impede o radio de dormir entre
          pacotes durante a sessao. Sem esta permissao createWifiLock lanca. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- moveTaskToFront no retorno do stream. Durante o imersivo o Horizon nao
+         lista a tarefa do painel 2D em appTasks (diario da dev.178), entao ela
+         e trazida pelo numero gravado na abertura. Permissao comum, sem pedido. -->
+    <uses-permission android:name="android.permission.REORDER_TASKS" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <!-- A sonda de relatorio HID de saida fala com o DualSense ja pareado.
+         Nao ha varredura nem descoberta: por isso BLUETOOTH_CONNECT sozinha,
+         sem BLUETOOTH_SCAN, que arrastaria pedido de localizacao junto. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <!-- Sem isto o loader OpenXR nao enxerga o runtime do Horizon OS no Android 11+. -->
     <queries>
@@ -95,8 +104,9 @@
         <activity
             android:name="io.github.gblandro.p5m.LauncherActivity"
             android:exported="true"
-            android:theme="@android:style/Theme.Material"
-            android:configChanges="keyboard|keyboardHidden|orientation|screenSize">
+            android:theme="@android:style/Theme.Material.NoActionBar"
+            android:resizeableActivity="true"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize|smallestScreenSize|screenLayout|density|uiMode|navigation">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -107,7 +117,7 @@
         <!-- Painel 2D: descoberta, pareamento e ajustes. Vem inteiro do chiaki-ng.
              Aberta explicitamente pelo lancador, nao pela biblioteca. -->
         <activity android:name=".main.MainActivity"
-            android:configChanges="keyboard|keyboardHidden|orientation|screenSize"
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize|smallestScreenSize|screenLayout"
             android:exported="true">
             <intent-filter>
                 <category android:name="com.oculus.intent.category.2D" />
@@ -131,7 +141,7 @@
             android:theme="@style/StreamTheme"
             android:resizeableActivity="true"
             android:exported="false"
-            android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|density|uiMode">
+            android:configChanges="keyboard|keyboardHidden|orientation|screenSize|smallestScreenSize|screenLayout|density|uiMode|navigation">
             <intent-filter>
                 <category android:name="com.oculus.intent.category.2D" />
                 <action android:name="android.intent.action.MAIN" />

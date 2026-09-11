@@ -42,6 +42,9 @@ import com.metallic.chiaki.lib.Session
 import com.metallic.chiaki.main.MainActivity
 import com.metallic.chiaki.session.StreamInput
 import io.github.gblandro.p5m.P5MApp
+import io.github.gblandro.p5m.DualSenseHaptics
+import io.github.gblandro.p5m.DualSenseHid
+import io.github.gblandro.p5m.InputArrival
 import io.github.gblandro.p5m.Rumble
 import io.github.gblandro.p5m.ScreenPrefs
 import io.github.gblandro.p5m.TouchpadPointer
@@ -145,13 +148,15 @@ class VrStreamActivity: ComponentActivity()
 	private var lastReceived = 0L
 	private var lastLost = 0L
 	private var lastDropped = 0L
-	private var preferredDeviceId: Int? = null
+	private val preferredDeviceId: Int? get() = input?.preferredGamepadId
 	private var rumble: Rumble? = null
+	private var haptics: DualSenseHaptics? = null
 	/**
 	 * O touchpad do controle. Mesma classe do modo janela, de proposito: dois
 	 * tratamentos para o mesmo botao acabariam divergindo.
 	 */
 	private val touchpadPointer = TouchpadPointer { pressed -> setTouchpadPressed(pressed) }
+	private val inputArrival = InputArrival(System.nanoTime())
 	private var touchpadDown = false
 
 	/**
@@ -218,6 +223,9 @@ class VrStreamActivity: ComponentActivity()
 	{
 		override fun run()
 		{
+			// Antes da saúde, que volta cedo quando a sessão OpenXR não existe.
+			trace(inputArrival.report(System.nanoTime(),
+					if(android.os.Build.VERSION.SDK_INT >= 34) "ns" else "ms"))
 			logHealth()
 			handler.postDelayed(this, HEALTH_PERIOD_MS)
 		}
@@ -286,6 +294,7 @@ class VrStreamActivity: ComponentActivity()
 	private var thumbRDown = false
 	private var r1Down = false
 	private var quitArmed = false
+	private var returnActivated = false
 
 	override fun onCreate(savedInstanceState: Bundle?)
 	{
@@ -338,11 +347,11 @@ class VrStreamActivity: ComponentActivity()
 		// Surface, o outro de textura GL.
 		// O 3D sintetizado tem de vir antes de tudo que dependa dele: ele obriga
 		// o caminho com shader (a deformacao precisa de uma passada de GPU
-		// nossa) e dobra a largura do alvo (cada olho ocupa uma metade). Os dois
-		// sao decididos na criacao do swapchain, que acontece logo abaixo --
-		// ligar depois nao teria efeito nenhum nesta sessao.
+		// nossa) e faz nascer um segundo swapchain, um por olho. Os dois sao
+		// decididos na criacao do swapchain, que acontece logo abaixo -- ligar
+		// depois nao teria efeito nenhum nesta sessao.
 		val synth3d = qualityPrefs.syntheticStereo
-		bridge.setStereoMode(if(synth3d) 1 else qualityPrefs.stereoMode)
+		bridge.setStereoMode(if(synth3d) 1 else qualityPrefs.stereoMode, synth3d)
 		if(synth3d)
 		{
 			bridge.setStereoTuning(qualityPrefs.stereoDisparity(),
@@ -352,7 +361,7 @@ class VrStreamActivity: ComponentActivity()
 					+ "convergence ${(qualityPrefs.stereoConvergence * 100).toInt()}%")
 		}
 
-		val toneMapped = qualityPrefs.toneMapped || synth3d
+		val toneMapped = qualityPrefs.immersiveUsesShader
 		bridge.setRenderPath(if(toneMapped) 1 else 0, qualityPrefs.tenBit)
 		trace("Video path: ${if(toneMapped) "shader" else "direct"}, " +
 				"source ${if(qualityPrefs.tenBit) "10-bit PQ" else "8-bit SDR"}")
@@ -399,8 +408,9 @@ class VrStreamActivity: ComponentActivity()
 		bridge.selectDisplayRefreshRate(StreamQualityPrefs.SOURCE_FPS)
 
 		val streamInput = StreamInput(this, Preferences(this))
-		streamInput.observe(this)
 		input = streamInput
+		streamInput.gamepadChangedCallback = { resetGamepadGestures() }
+		streamInput.observe(this)
 
 		val logManager = LogManager(this)
 		val newSession = try
@@ -444,7 +454,23 @@ class VrStreamActivity: ComponentActivity()
 					Log.i(TAG, "Session ended: ${event.reason} ${event.reasonString ?: ""}")
 					runOnUiThread { finish() }
 				}
-				is RumbleEvent -> rumble?.set(event.left.toInt(), event.right.toInt())
+				// Com a trilha crua saindo, o motor cala.
+				//
+				// As duas saidas continuam ligadas de proposito -- se a ponte com
+				// o controle nao subir, a envoltoria no motor e o que salva a
+				// sessao --, mas enquanto as duas funcionam quem se sente e o
+				// motor: ele e grosseiro e muito mais forte que a bobina, e o
+				// resultado e a vibracao de sempre com um chiado por baixo, que
+				// e o oposto do que a trilha crua existe para dar.
+				//
+				// Zero em vez de nao mandar nada: o Rumble descarta valor
+				// repetido, entao insistir em zero e barato, e parar de falar
+				// com ele deixaria a ultima intensidade presa no motor.
+				is RumbleEvent ->
+					if(haptics?.entregando == true)
+						rumble?.set(0, 0)
+					else
+						rumble?.set(event.left.toInt(), event.right.toInt())
 			}
 		}
 		streamInput.controllerStateChangedCallback = { state ->
@@ -456,7 +482,40 @@ class VrStreamActivity: ComponentActivity()
 
 		// Depois do logInputDevices, que e quem decide o preferredDeviceId: o
 		// destino da vibracao e o mesmo controle de onde vem os analogicos.
-		rumble = Rumble(Preferences(this).rumbleEnabled).also { it.attach(preferredDeviceId) }
+		// Com a haptica crua em jogo, o Rumble nasce desligado.
+		//
+		// Nao e so para nao somar as duas: a buzina de teste que ele manda ao
+		// abrir a sessao passa pelo caminho de vibracao do Android, e mandar
+		// intensidade poe a bobina do controle em modo motor -- onde ela ignora
+		// a trilha de audio. A buzina trocava o modo do controle bem na hora em
+		// que a entrega crua comecava, e o que se sentia era so ela.
+		//
+		// Desligado ele nao varre, nao busca alvo e nao buzina. Se a ponte com o
+		// controle nao subir, um Rumble de verdade nasce no lugar.
+		val crua = qualityPrefs.hapticRumble && DualSenseHid.disponivel(this)
+		val ligarRumble = {
+			rumble = Rumble(Preferences(this).rumbleEnabled).also { it.attach(preferredDeviceId) }
+		}
+		if(crua)
+			rumble = Rumble(false)
+		else
+			ligarRumble()
+
+		// Com o cliente anunciado como DualSense, o console manda a haptica crua
+		// e a envoltoria que o patch 0009 calcula nao serve para nada -- ela
+		// existe para o caso de nao haver onde entregar a trilha. Havendo, a
+		// trilha vai inteira.
+		//
+		// As duas saidas ficam ligadas ao mesmo tempo de proposito: se a ponte
+		// com o controle nao subir, a envoltoria continua chegando ao motor, e a
+		// sessao degrada em vez de ficar muda. O `Rumble` ja descarta valor
+		// repetido, entao o custo de manter os dois e o de uma comparacao.
+		if(crua)
+			haptics = DualSenseHaptics(this, DualSenseHid(this)).also { h ->
+				h.start(newSession) { runOnUiThread { ligarRumble() } }
+			}
+		else if(qualityPrefs.hapticRumble)
+			trace("Raw haptics asked for, but Bluetooth permission is missing")
 
 		newSession.setSurface(surface)
 		session = newSession
@@ -628,11 +687,17 @@ class VrStreamActivity: ComponentActivity()
 		val de = Throwable().stackTrace.drop(1)
 			.firstOrNull { it.className.startsWith("com.") }
 		trace("Finishing the activity, asked for by ${de ?: "an unknown source"}")
+		if(!returnActivated)
+		{
+			returnActivated = true
+			io.github.gblandro.p5m.StreamReturn.activate(this, intent)
+		}
 		super.finish()
 	}
 
 	override fun onDestroy()
 	{
+		resetGamepadGestures()
 		super.onDestroy()
 		trace("Lifecycle: onDestroy (isFinishing=$isFinishing)")
 		// Antes do dispose, e nao depois: o tick dos medidores lê o contador de
@@ -650,6 +715,21 @@ class VrStreamActivity: ComponentActivity()
 		// sessão é uso de memória liberada. Isso derrubou o processo com
 		// "pthread_mutex_lock called on a destroyed mutex", dentro de
 		// chiaki_holepunch_session_start.
+		// A haptica para ANTES de tudo que possa liberar a sessao, e nao junto
+		// com o rumble no fim.
+		//
+		// O laco dela le do ponteiro nativo cem vezes por segundo. Parar depois
+		// do dispose -- que e onde ele estava, e onde a leitura de codigo nao
+		// acusa nada -- deixa uma thread lendo memoria liberada por ate um
+		// periodo inteiro. Este projeto ja perdeu duas sessoes para exatamente
+		// esta forma de corrida, uma no decodificador e outra no holepunch, e as
+		// duas apareceram como queda nativa sem linha nossa na pilha.
+		//
+		// O stop() faz join na thread de entrega, entao quando ele volta nao ha
+		// mais ninguem lendo.
+		haptics?.stop()
+		haptics = null
+
 		val furacaoPresa = psnThread?.let { t ->
 			if(!t.isAlive)
 				false
@@ -689,6 +769,7 @@ class VrStreamActivity: ComponentActivity()
 				it.dispose()
 			}
 		wifiLock.release()
+
 		rumble?.stop()
 		rumble = null
 		session = null
@@ -832,7 +913,6 @@ class VrStreamActivity: ComponentActivity()
 	private fun logInputDevices()
 	{
 		val ids = InputDevice.getDeviceIds()
-		val named = mutableListOf<Int>()
 		var gamepads = 0
 		for(id in ids)
 		{
@@ -855,8 +935,6 @@ class VrStreamActivity: ComponentActivity()
 			gamepads++
 			// Os controles Touch do headset entram sem nome de HID, no formato
 			// "Device 0x...". Um gamepad pareado se identifica.
-			if(!device.name.startsWith("Device 0x"))
-				named.add(id)
 
 			// hasKeys responde o que o driver realmente expoe. Se L3 e R3 vierem
 			// false, o acorde do modo de ajuste e impossivel neste controle e o
@@ -880,8 +958,7 @@ class VrStreamActivity: ComponentActivity()
 		}
 		trace("Input devices: ${ids.size} in total, $gamepads gamepad(s)")
 
-		// Nomeado ganha de anonimo, e o primeiro nomeado ganha dos demais.
-		preferredDeviceId = named.firstOrNull()
+		// A selecao acompanha reconexoes no StreamInput dos dois modos.
 		if(preferredDeviceId != null)
 			trace("Sticks taken from '${InputDevice.getDevice(preferredDeviceId!!)?.name}' " +
 					"(id=$preferredDeviceId); the others are ignored for axes")
@@ -997,6 +1074,7 @@ class VrStreamActivity: ComponentActivity()
 
 	override fun onGenericMotionEvent(event: MotionEvent): Boolean
 	{
+		registrarChegada(event)
 		// Em modo de ajuste os analogicos ficam mudos, para nao vazar movimento
 		// para o jogo enquanto o usuario mexe na tela -- mas o D-pad tem de ser
 		// lido aqui, porque e aqui que ele chega.
@@ -1008,6 +1086,28 @@ class VrStreamActivity: ComponentActivity()
 		if(!isPreferredGamepad(event.deviceId))
 			return true
 		return input?.onGenericMotionEvent(event) ?: super.onGenericMotionEvent(event)
+	}
+
+	/**
+	 * Alimenta o `InputArrival` com cada amostra dos analógicos do controle.
+	 *
+	 * Antes do desvio do modo de ajuste, que emudece os analógicos para o jogo
+	 * mas não para a medida. As amostras em lote vêm como históricas, cada uma
+	 * com o próprio horário; contar só o do evento esconderia justamente as
+	 * rajadas que a medida procura. Nanossegundos só existem na API 34; abaixo
+	 * dela o horário vem arredondado a ms, e a linha diz qual foi.
+	 */
+	private fun registrarChegada(event: MotionEvent)
+	{
+		if(event.actionMasked != MotionEvent.ACTION_MOVE ||
+				event.source and InputDevice.SOURCE_JOYSTICK != InputDevice.SOURCE_JOYSTICK ||
+				!isPreferredGamepad(event.deviceId))
+			return
+		val nanos = android.os.Build.VERSION.SDK_INT >= 34
+		for(i in 0 until event.historySize)
+			inputArrival.sample(if(nanos) event.getHistoricalEventTimeNanos(i)
+					else event.getHistoricalEventTime(i) * 1_000_000L)
+		inputArrival.sample(if(nanos) event.eventTimeNanos else event.eventTime * 1_000_000L)
 	}
 
 	/**
@@ -1079,8 +1179,23 @@ class VrStreamActivity: ComponentActivity()
 	 */
 	private fun isPreferredGamepad(deviceId: Int): Boolean
 	{
-		val preferred = preferredDeviceId ?: return true
-		return deviceId == preferred
+		return input?.acceptsGamepadAxes(deviceId) ?: true
+	}
+
+	/** Desligar o controle nao produz ACTION_UP. Nao deixar um acorde ou
+	 * uma saida por Circle disparar sozinho depois da reconexao.
+	 */
+	private fun resetGamepadGestures()
+	{
+		thumbLDown = false
+		thumbRDown = false
+		r1Down = false
+		hatX = 0
+		hatY = 0
+		quitArmed = false
+		handler.removeCallbacks(holdTick)
+		handler.removeCallbacks(quitTick)
+		touchpadPointer.release()
 	}
 
 	/**

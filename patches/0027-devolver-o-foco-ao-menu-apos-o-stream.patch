@@ -1,0 +1,23 @@
+diff --git a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
+index f2045d5..42b62ec 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
+@@ -448,6 +448,18 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
+ 
+ 	private fun adjustStreamViewAspect() = adjustSurfaceViewAspect()
+ 
++	private var returnActivated = false
++
++	override fun finish()
++	{
++		if(!returnActivated)
++		{
++			returnActivated = true
++			io.github.gblandro.p5m.StreamReturn.activate(this, intent)
++		}
++		super.finish()
++	}
++
+ 	override fun dispatchKeyEvent(event: KeyEvent) = viewModel.input.dispatchKeyEvent(event) || super.dispatchKeyEvent(event)
+ 	override fun onGenericMotionEvent(event: MotionEvent) = viewModel.input.onGenericMotionEvent(event) || super.onGenericMotionEvent(event)
+ 

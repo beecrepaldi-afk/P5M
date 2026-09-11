@@ -19,6 +19,11 @@ jobs:
     # Necessario para o passo de release publicar a tag e o APK.
     permissions:
       contents: write
+      # Uma issue e o unico lugar onde o texto de uma falha da CI chega ate
+      # quem trabalha neste repositorio de fora dele: o log do Actions mora num
+      # blob do Azure que a politica de saida daqui recusa, e a API so devolve
+      # um redirecionamento para la. Ver o passo "Diagnostico" no fim.
+      issues: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,18 +54,73 @@ jobs:
       - name: Android SDK
         uses: android-actions/setup-android@v3
 
+      # O NDK sao mais de um giga que nao mudam entre builds. Baixar de novo a
+      # cada push custava mais de meio minuto por build, e a chave e a lista de
+      # componentes: enquanto ela nao mudar, nada e rebaixado.
+      - name: Cache do NDK e do SDK
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.ANDROID_SDK_ROOT }}/ndk/26.3.11579264
+            ${{ env.ANDROID_SDK_ROOT }}/cmake/3.22.1
+            ${{ env.ANDROID_SDK_ROOT }}/platforms/android-34
+            ${{ env.ANDROID_SDK_ROOT }}/build-tools/34.0.0
+          key: android-ndk26.3.11579264-cmake3.22.1-p34-bt34.0.0
+
       - name: NDK e CMake
         run: |
           sdkmanager --install "ndk;26.3.11579264" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0"
 
       # A libchiaki gera os stubs nanopb em tempo de build, o que exige protoc e
       # o gerador Python do nanopb rodando no HOST -- nao no alvo Android.
+      # O pip nao pode mais escrever no Python do sistema sem dizer que sabe.
+      #
+      # Imagem de runner nova, PEP 668: o Python do sistema vem marcado como
+      # gerenciado externamente, e `pip install` sem `--break-system-packages`
+      # sai na hora com `externally-managed-environment`. O build 165 passou
+      # aqui em 04/09 e o 166 falhou em 09/09 sem que nada deste passo mudasse,
+      # e o passo inteiro morreu em sete segundos -- que e o tempo de um
+      # `apt-get update` seguido de um pip que nem tentou.
+      #
+      # A tentativa sem a bandeira vem primeiro de proposito: onde ela nao e
+      # necessaria, nada muda, e onde e, a segunda linha resolve. Assim o passo
+      # deixa de depender de qual imagem o `ubuntu-latest` aponta hoje.
       - name: protoc e gerador nanopb
         run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-          python3 -m pip install --upgrade "protobuf<6"
+          set -x
+          # Tudo tambem para um arquivo: se este passo cair, e este texto que o
+          # passo de diagnostico publica.
+          exec > >(tee -a "$RUNNER_TEMP/protoc.log") 2>&1
+          # `update` que falha nao e motivo para parar: o indice que veio na
+          # imagem costuma bastar para os dois pacotes abaixo, e insistir aqui
+          # ja derrubou builds por um espelho fora do ar.
+          sudo apt-get update || echo "apt-get update falhou; seguindo com o indice da imagem"
+          sudo apt-get install -y protobuf-compiler ccache \
+            || (sleep 10 && sudo apt-get install -y protobuf-compiler ccache)
+          python3 -m pip install --upgrade "protobuf<6" \
+            || python3 -m pip install --upgrade --break-system-packages "protobuf<6"
           protoc --version
+
+      # Publica o motivo da falha onde de para ler de fora.
+      #
+      # Existe porque o log do Actions e servido por um host que a rede daqui
+      # nao alcanca, e sem ele a alternativa e adivinhar de build em build --
+      # que ja custou duas. Sai junto com o passo assim que a causa for
+      # entendida; nao e para ficar.
+      - name: Diagnostico da falha
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Build ${GITHUB_RUN_NUMBER}, commit ${GITHUB_SHA}"
+            echo
+            echo '```'
+            tail -n 120 "$RUNNER_TEMP/protoc.log" 2>/dev/null || echo "(sem log)"
+            echo '```'
+          } > "$RUNNER_TEMP/corpo.md"
+          gh issue create --title "CI ${GITHUB_RUN_NUMBER}: falha no passo do protoc" \
+            --body-file "$RUNNER_TEMP/corpo.md" || true
 
       # Tag v1.2.3 vira a versao 1.2.3 e um release definitivo. Push em branch
       # vira 0.1.0-dev.<build> e atualiza o release rolante 'dev'.
@@ -83,6 +143,17 @@ jobs:
           echo "P5M_VERSION_NAME=$VERSION" >> "$GITHUB_ENV"
           echo "P5M_VERSION_CODE=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
           echo "Versao: $VERSION (code $GITHUB_RUN_NUMBER)"
+
+      # A libchiaki, o OpenSSL, o json-c e o curl sao a maior parte do que se
+      # compila aqui e mudam quase nunca -- o que muda a cada push sao meia
+      # duzia de linhas nossas. O ccache reconhece isso pelo conteudo, e nao
+      # pela data, entao atravessa ate uma arvore recriada do zero.
+      - name: Cache do ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ github.run_number }}
+          restore-keys: ccache-
 
       - name: Cache Gradle
         uses: actions/cache@v4

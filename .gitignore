@@ -8,3 +8,6 @@ local.properties
 *.jks
 .env
 .cache-cabecalhos/
+
+# Cache do Python das ferramentas; entrou por engano no commit 3dcd1d9.
+__pycache__/

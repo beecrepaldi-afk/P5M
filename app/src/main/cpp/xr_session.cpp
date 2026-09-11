@@ -230,6 +230,25 @@ bool XrVideoSession::Create(JavaVM *vm, jobject activity)
 		refresh_rate_supported_ = true;
 	}
 
+	// Atenuacao local do painel.
+	//
+	// O Quest 3 tem retroiluminacao em zonas, e por padrao ela fica no modo
+	// conservador porque uma interface comum tem branco espalhado pela tela
+	// inteira. Uma camada de video em quarto escuro e o caso oposto: quase tudo
+	// e preto, e sem atenuacao local esse preto sai cinza -- que e o que faz uma
+	// cena noturna parecer lavada.
+	//
+	// So vale no modo escuro. Com passthrough ligado o compositor mostra o
+	// quarto, o painel tem conteudo claro em toda parte, e ligar isto nao muda
+	// nada -- por isso o modo e escolhido por frame, e nao uma vez na abertura.
+	if(has_ext(XR_META_LOCAL_DIMMING_EXTENSION_NAME))
+	{
+		extensions.push_back(XR_META_LOCAL_DIMMING_EXTENSION_NAME);
+		local_dimming_supported_ = true;
+	}
+	else
+		LOGW("XR_META_local_dimming unavailable; black stays panel black");
+
 	// Declara ao sistema qual thread desenha. Sem isso a thread do frame loop e
 	// tratada como qualquer outra: pode ser escalonada num nucleo pequeno e
 	// perder a fatia de tempo bem na hora de submeter o frame, o que aparece
@@ -882,14 +901,18 @@ bool XrVideoSession::UpdateHudLayer(XrCompositionLayerQuad &layer, float yaw)
 
 bool XrVideoSession::CreateGlVideoSwapchain(int32_t width, int32_t height)
 {
-	// No modo 3D o alvo tem o dobro da largura: cada olho ocupa uma metade e
-	// recebe a imagem inteira. Sem isso cada olho ficaria com metade da
-	// resolucao horizontal, e uma tela 3D borrada nao troca por uma 2D nitida.
+	// No estereo sintetizado nascem dois swapchains do tamanho da fonte, um por
+	// olho, em vez de um do dobro da largura com um olho em cada metade.
 	//
-	// video_width_ passa a ser a largura dobrada, e e o que a submissao quer:
-	// ela divide o imageRect ao meio para achar a metade de cada olho.
-	if(stereo_mode_.load() != 0)
-		width *= 2;
+	// Os pixels sao os mesmos. O que muda e como a camada se submete: com dois
+	// alvos inteiros cada olho e uma imagem completa, e com um alvo dobrado
+	// cada olho e um recorte. Sobre recorte o filtro de nitidez do compositor
+	// desenhou um X atravessando a tela -- medido em hardware --, e por isso o
+	// 3D vinha sem MQSR nenhum, que e o maior ganho de nitidez que existe aqui.
+	//
+	// Estereo empacotado, o que ja chega com os dois olhos na mesma imagem,
+	// continua como estava: la o recorte e a propria natureza do conteudo.
+	const bool dois_alvos = stereo_synthetic_.load() && stereo_mode_.load() != 0;
 
 	uint32_t format_count = 0;
 	if(XR_FAILED(xrEnumerateSwapchainFormats(session_, 0, &format_count, nullptr))
@@ -936,14 +959,26 @@ bool XrVideoSession::CreateGlVideoSwapchain(int32_t width, int32_t height)
 		return false;
 	}
 
+	// Sair daqui sem desfazer o swapchain deixaria o handle vivo com a lista de
+	// imagens vazia -- um estado que mente para todo mundo que pergunta se ha
+	// video, porque a pergunta e feita pelo handle.
 	uint32_t image_count = 0;
 	if(XR_FAILED(xrEnumerateSwapchainImages(video_swapchain_, 0, &image_count, nullptr))
 			|| image_count == 0)
+	{
+		xrDestroySwapchain(video_swapchain_);
+		video_swapchain_ = XR_NULL_HANDLE;
 		return false;
+	}
 	video_images_.assign(image_count, {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR});
 	if(XR_FAILED(xrEnumerateSwapchainImages(video_swapchain_, image_count, &image_count,
 			reinterpret_cast<XrSwapchainImageBaseHeader *>(video_images_.data()))))
+	{
+		xrDestroySwapchain(video_swapchain_);
+		video_swapchain_ = XR_NULL_HANDLE;
+		video_images_.clear();
 		return false;
+	}
 
 	// O runtime cria os nomes de textura no contexto EGL corrente. Se nao houver
 	// contexto na thread que chama, o xrCreateSwapchain ainda devolve XR_SUCCESS
@@ -967,6 +1002,44 @@ bool XrVideoSession::CreateGlVideoSwapchain(int32_t width, int32_t height)
 	video_gl_format_ = chosen;
 	video_width_ = width;
 	video_height_ = height;
+
+	if(dois_alvos)
+	{
+		XrResult res2 = xrCreateSwapchain(session_, &info, &video_swapchain_right_);
+		if(XR_FAILED(res2))
+		{
+			// Sem o segundo alvo o 3D nao tem para onde ir. Derruba o primeiro
+			// tambem: meio caminho aqui viraria camada apontando para swapchain
+			// nulo dentro do xrEndFrame, que e queda nativa e nao imagem
+			// faltando.
+			LOGE("xrCreateSwapchain(right eye): %s", XrResultStr(instance_, res2));
+			xrDestroySwapchain(video_swapchain_);
+			video_swapchain_ = XR_NULL_HANDLE;
+			video_images_.clear();
+			video_swapchain_right_ = XR_NULL_HANDLE;
+			return false;
+		}
+
+		uint32_t direita = 0;
+		xrEnumerateSwapchainImages(video_swapchain_right_, 0, &direita, nullptr);
+		video_images_right_.assign(direita, {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR});
+		if(direita == 0 || XR_FAILED(xrEnumerateSwapchainImages(video_swapchain_right_,
+				direita, &direita,
+				reinterpret_cast<XrSwapchainImageBaseHeader *>(video_images_right_.data()))))
+		{
+			LOGE("The right eye swapchain returned no images");
+			xrDestroySwapchain(video_swapchain_right_);
+			video_swapchain_right_ = XR_NULL_HANDLE;
+			video_images_right_.clear();
+			xrDestroySwapchain(video_swapchain_);
+			video_swapchain_ = XR_NULL_HANDLE;
+			video_images_.clear();
+			return false;
+		}
+		LOGI("Synthetic 3D: a second %dx%d swapchain for the right eye, %u images",
+				width, height, direita);
+	}
+
 	LOGI("GL video swapchain: %dx%d, format 0x%llx, %u images", width, height,
 			(unsigned long long)chosen, image_count);
 	return true;
@@ -1048,18 +1121,18 @@ bool XrVideoSession::RenderVideoThroughShader()
 		nitidez = quality_.sharpness;
 	}
 
-	// MQSR e automatico nao existem no 3D, e a tabela de intensidades tem zero
-	// nessas duas posicoes -- foi feita assim porque quem afiava era o
-	// compositor. Sem o desvio abaixo, escolher MQSR com o 3D ligado deixaria a
-	// imagem sem realce nenhum, em silencio, e pareceria que o botao quebrou.
-	if(stereo_mode_.load() != 0
+	// O desvio que punha MQSR e automatico no shader quando o 3D estava ligado
+	// saiu daqui: com um swapchain inteiro por olho a camada deixou de ser
+	// recorte, e o filtro do compositor volta a valer. Ele so continua sendo
+	// preciso no estereo empacotado, onde o recorte e inevitavel.
+	if(stereo_mode_.load() != 0 && !stereo_synthetic_.load()
 			&& (nitidez == Sharpness::Mqsr || nitidez == Sharpness::Auto))
 	{
 		sharpen = 1.0f;
 		if(!logged_stereo_sharpen_)
 		{
 			logged_stereo_sharpen_ = true;
-			LOGI("3D is on: the compositor filter does not apply to a layer that is "
+			LOGI("Packed 3D: the compositor filter does not apply to a layer that is "
 					"half of a texture, so sharpening falls back to the shader");
 		}
 	}
@@ -1071,7 +1144,10 @@ bool XrVideoSession::RenderVideoThroughShader()
 	// olhos gira para fora. O limite sai da IPD que o runtime informou e da
 	// largura angular da tela, porque a mesma separacao em pixels vale mais
 	// numa tela grande e perto do que numa pequena e longe.
-	if(stereo_mode_.load() != 0)
+	// O sintetizador so entra quando o estereo e nosso. Com conteudo que ja
+	// chega com os dois olhos, deformar por profundidade adivinhada poria um
+	// estereo em cima do outro.
+	if(stereo_synthetic_.load() && stereo_mode_.load() != 0)
 	{
 		ScreenParams params;
 		{
@@ -1096,12 +1172,48 @@ bool XrVideoSession::RenderVideoThroughShader()
 	else
 		tone_mapper_.SetStereo(false, 0.0f, 0.0f, true);
 
+	// O olho direito, quando existe, e adquirido junto: o desenho dos dois
+	// acontece numa passada so do tone mapper, que assim consome um quadro do
+	// decodificador e nao dois.
+	uint32_t index_right = 0;
+	bool right_acquired = false;
+	// Zerado a cada quadro: a submissao le isto depois, e um valor herdado do
+	// quadro anterior mandaria o compositor compor uma imagem que ninguem
+	// escreveu -- e, na primeira falha, uma que nunca foi liberada.
+	right_layer_ready_ = false;
+	if(video_swapchain_right_ != XR_NULL_HANDLE)
+	{
+		XrSwapchainImageAcquireInfo acquire_right{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+		if(XR_SUCCEEDED(xrAcquireSwapchainImage(video_swapchain_right_, &acquire_right,
+				&index_right)))
+		{
+			XrSwapchainImageWaitInfo wait_right{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+			wait_right.timeout = XR_INFINITE_DURATION;
+			right_acquired = XR_SUCCEEDED(xrWaitSwapchainImage(video_swapchain_right_,
+					&wait_right));
+			if(!right_acquired)
+			{
+				// Adquirida e nao esperada continua sendo nossa: sem soltar, o
+				// rodizio do swapchain trava no quadro seguinte.
+				XrSwapchainImageReleaseInfo solta{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+				xrReleaseSwapchainImage(video_swapchain_right_, &solta);
+			}
+		}
+	}
+
 	if(XR_SUCCEEDED(xrWaitSwapchainImage(video_swapchain_, &wait)))
 		drawn = tone_mapper_.Render(video_images_[index].image, video_width_, video_height_,
-				tone_map_pq_.load(), sharpen, false, extrapolate);
+				tone_map_pq_.load(), sharpen, false, extrapolate,
+				right_acquired ? video_images_right_[index_right].image : 0);
 
 	XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 	xrReleaseSwapchainImage(video_swapchain_, &release);
+	if(right_acquired)
+	{
+		XrSwapchainImageReleaseInfo release_right{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+		xrReleaseSwapchainImage(video_swapchain_right_, &release_right);
+		right_layer_ready_ = drawn;
+	}
 	return drawn;
 }
 
@@ -1530,6 +1642,10 @@ void XrVideoSession::StartFrameLoop()
 {
 	if(running_.exchange(true))
 		return;
+	// Quem chama isto e a activity, na thread principal do app -- e este e o
+	// unico ponto em que temos o tid dela. O frame loop precisa dele para
+	// declara-la ao runtime, e la dentro `gettid()` ja devolveria outra coisa.
+	main_thread_tid_.store((uint32_t)gettid());
 	frame_thread_ = std::thread(&XrVideoSession::FrameLoop, this);
 }
 
@@ -1602,6 +1718,26 @@ void XrVideoSession::FrameLoop()
 					XrResultStr(instance_, res));
 		else
 			LOGI("Frame loop thread declared as RENDERER_MAIN (tid %u)", tid);
+
+		// A thread principal do app tambem, e por um motivo diferente.
+		//
+		// Ela nao desenha, mas e ela que recebe entrada, roda o ciclo de vida da
+		// activity e entrega os quadros do decodificador. Se o sistema a puser
+		// num nucleo pequeno, o atraso nao aparece no frame loop -- aparece
+		// antes dele, como quadro que chegou tarde, e procurar isso no lugar
+		// errado ja custou tempo aqui. Declarar as duas e o que a documentacao
+		// do Horizon pede; declarar so uma e meio caminho.
+		const uint32_t main_tid = main_thread_tid_.load();
+		if(main_tid != 0)
+		{
+			XrResult mres = pfnSetAndroidApplicationThreadKHR(session_,
+					XR_ANDROID_THREAD_TYPE_APPLICATION_MAIN_KHR, main_tid);
+			if(XR_FAILED(mres))
+				LOGW("xrSetAndroidApplicationThreadKHR(APPLICATION_MAIN, %u): %s", main_tid,
+						XrResultStr(instance_, mres));
+			else
+				LOGI("App main thread declared as APPLICATION_MAIN (tid %u)", main_tid);
+		}
 	}
 
 	while(running_ && !exit_requested_)
@@ -1883,16 +2019,18 @@ void XrVideoSession::RenderFrame()
 		// camada e composta pelo compositor nos dois caminhos. Entao esses dois
 		// valem sempre, e la o shader nao afia nada (a tabela de intensidades
 		// tem zero nas duas posicoes).
-		// No 3D o filtro do compositor sai de cena.
+		// O que tira o filtro do compositor de cena e o recorte, e nao o 3D.
 		//
-		// Com o olho sintetizado a camada entra duas vezes, cada uma pegando
-		// metade de uma textura do dobro da largura. O MQSR e o automatico
-		// filtram cada camada por conta, e sobre meia textura o resultado
-		// relatado em hardware foi um X discreto atravessando a tela -- o filtro
-		// nao foi feito para uma camada que e um recorte de outra. O realce por
-		// shader nao tem esse problema: ele acontece antes, sobre a imagem
-		// inteira, e continua valendo nos degraus de 1 a 3.
-		const bool compositor_owns_filter = stereo_mode_.load() == 0
+		// Quando a camada e metade de uma textura maior, o MQSR e o automatico
+		// desenharam um X discreto atravessando a tela -- medido em hardware.
+		// O filtro nao foi feito para uma camada que e um recorte de outra.
+		//
+		// Isso hoje acontece so no estereo empacotado, em que o conteudo ja
+		// chega com os dois olhos numa imagem so e nao ha como nao recortar. No
+		// estereo que nos sintetizamos cada olho tem swapchain proprio e entra
+		// inteiro, entao o filtro vale como vale no mono.
+		const bool recorta_a_camada = stereo_mode_.load() != 0 && !stereo_synthetic_.load();
+		const bool compositor_owns_filter = !recorta_a_camada
 				&& (render_path_ == RenderPath::Direct
 						|| quality.sharpness == Sharpness::Mqsr
 						|| quality.sharpness == Sharpness::Auto);
@@ -1920,13 +2058,8 @@ void XrVideoSession::RenderFrame()
 							XR_COMPOSITION_LAYER_SETTINGS_NORMAL_SHARPENING_BIT_FB;
 					break;
 				case Sharpness::Mqsr:
-					// Sozinho, sem o normal junto. A especificacao e explicita:
-					// com os dois de sharpening ligados, o normal tem
-					// precedencia -- e o MQSR nunca rodaria, parecendo defeito
-					// dele quando seria erro nosso.
-					layer_settings.layerFlags |=
-							XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SHARPENING_BIT_FB;
-					break;
+					// Compatibilidade com o indice antigo. O MQSR explicito fez
+					// um disco acompanhar a cabeca; so participa como candidato.
 				case Sharpness::Auto:
 					// O bit automatico exige um conjunto de candidatos junto: a
 					// especificacao manda o runtime devolver
@@ -2089,35 +2222,50 @@ void XrVideoSession::RenderFrame()
 					: (image_layout_supported_ ? "off" : "NOT SUPPORTED"));
 		}
 
-		// Estereo: a mesma swapchain entra duas vezes, cada vez com metade da
-		// imagem e um olho. Nao ha copia nem passada de GPU nenhuma -- so uma
-		// camada a mais na lista, que e o que torna este modo praticamente de
-		// graca comparado a qualquer coisa que sintetize imagem.
+		// Estereo: duas camadas, uma por olho. A geometria nao muda -- a tela
+		// continua do mesmo tamanho e no mesmo lugar --, so muda o que cada olho
+		// enxerga.
+		//
+		// Duas formas de chegar la. No estereo que nos sintetizamos cada olho ja
+		// tem um swapchain proprio, e a camada leva a imagem inteira dele. No
+		// empacotado ha uma imagem so com os dois olhos dentro, e a camada leva
+		// metade dela.
 		const int stereo = stereo_mode_.load();
 		if(stereo != 0)
 		{
-			XrRect2Di esquerdo = cylinder.subImage.imageRect;
-			XrRect2Di direito = esquerdo;
-			if(stereo == 1)
+			cylinder_right = cylinder;
+			if(stereo_synthetic_.load())
 			{
-				esquerdo.extent.width /= 2;
-				direito.extent.width /= 2;
-				direito.offset.x += esquerdo.extent.width;
+				// Nosso estereo: um swapchain por olho, imagem inteira em cada
+				// camada. Se o segundo alvo nao existir -- criacao falhou, ou o
+				// quadro nao pode ser adquirido --, os dois olhos veem o
+				// esquerdo. Um quadro sem profundidade se nota menos do que meia
+				// imagem esticada, que e o que o recorte abaixo faria com um
+				// alvo que nao tem mais o dobro da largura.
+				if(video_swapchain_right_ != XR_NULL_HANDLE && right_layer_ready_)
+					cylinder_right.subImage.swapchain = video_swapchain_right_;
 			}
 			else
 			{
-				esquerdo.extent.height /= 2;
-				direito.extent.height /= 2;
-				direito.offset.y += esquerdo.extent.height;
+				XrRect2Di esquerdo = cylinder.subImage.imageRect;
+				XrRect2Di direito = esquerdo;
+				if(stereo == 1)
+				{
+					esquerdo.extent.width /= 2;
+					direito.extent.width /= 2;
+					direito.offset.x += esquerdo.extent.width;
+				}
+				else
+				{
+					esquerdo.extent.height /= 2;
+					direito.extent.height /= 2;
+					direito.offset.y += esquerdo.extent.height;
+				}
+				cylinder.subImage.imageRect = esquerdo;
+				cylinder_right.subImage.imageRect = direito;
 			}
-			// A geometria da camada nao muda: a tela continua do mesmo tamanho
-			// e no mesmo lugar. O que muda e qual pedaco da textura cada olho
-			// enxerga.
-			cylinder_right = cylinder;
 			cylinder.eyeVisibility = XR_EYE_VISIBILITY_LEFT;
-			cylinder.subImage.imageRect = esquerdo;
 			cylinder_right.eyeVisibility = XR_EYE_VISIBILITY_RIGHT;
-			cylinder_right.subImage.imageRect = direito;
 		}
 
 		if(layer_shape_.load() == LayerShape::Cylinder)
@@ -2195,6 +2343,26 @@ void XrVideoSession::RenderFrame()
 	end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 	end_info.layerCount = (uint32_t)layers.size();
 	end_info.layers = layers.empty() ? nullptr : layers.data();
+
+	// Atenuacao local: ligada so quando a cena e nossa.
+	//
+	// Com passthrough o quarto ocupa a tela toda e as zonas claras mandam na
+	// retroiluminacao de qualquer jeito; no escuro, em volta da tela so ha
+	// preto, e e ai que ela desce o suficiente para o preto ser preto.
+	XrLocalDimmingFrameEndInfoMETA dimming{XR_TYPE_LOCAL_DIMMING_FRAME_END_INFO_META};
+	if(local_dimming_supported_)
+	{
+		dimming.localDimmingMode = passthrough_enabled_.load()
+				? XR_LOCAL_DIMMING_MODE_OFF_META
+				: XR_LOCAL_DIMMING_MODE_ON_META;
+		dimming.next = end_info.next;
+		end_info.next = &dimming;
+		if(!logged_local_dimming_)
+		{
+			logged_local_dimming_ = true;
+			LOGI("Local dimming attached to the frame (off while passthrough is on)");
+		}
+	}
 	xrEndFrame(session_, &end_info);
 }
 
@@ -2216,10 +2384,14 @@ void XrVideoSession::Destroy()
 	if(video_swapchain_ != XR_NULL_HANDLE)
 		xrDestroySwapchain(video_swapchain_);
 	video_swapchain_ = XR_NULL_HANDLE;
+	if(video_swapchain_right_ != XR_NULL_HANDLE)
+		xrDestroySwapchain(video_swapchain_right_);
+	video_swapchain_right_ = XR_NULL_HANDLE;
 
 	tone_mapper_.Destroy();
 	tone_mapper_ready_ = false;
 	video_images_.clear();
+	video_images_right_.clear();
 	pending_gl_width_ = 0;
 	pending_gl_height_ = 0;
 

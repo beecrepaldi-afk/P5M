@@ -79,6 +79,23 @@ class LogServer(private val context: Context)
 		val body = when
 		{
 			path.startsWith("/crash") -> P5MApp.lastCrash(context) ?: "(no crash recorded)"
+
+			// Rotas de recorte. O diario inteiro passa de cem mil caracteres, e
+			// quem esta caçando um defeito quase sempre quer uma familia de
+			// linhas -- as da haptica, as do video -- ou so o fim. Puxar tudo
+			// para achar vinte linhas e caro de todo jeito, e por rede de
+			// terceiro e pior ainda.
+			//
+			// O termo vem do proprio caminho, sem parametro de consulta: e uma
+			// linha de requisicao lida a mao, e um caminho e mais facil de
+			// digitar num navegador do que uma consulta com escape.
+			path.startsWith("/grep/") -> filtrar(context, path.removePrefix("/grep/"))
+			path.startsWith("/haptics") -> filtrar(context, "aptics")
+			path.startsWith("/video") -> filtrar(context, "Video 10s")
+			// As duas medidas de tempo do enlace, lado a lado: envio da háptica
+			// e chegada da entrada. Uma sem a outra não separa as hipóteses.
+			path.startsWith("/timing") -> filtrar(context, "timing:")
+			path.startsWith("/tail") -> ultimas(context, 120)
 			else -> buildString {
 				append("=== P5M — diagnostics ===\n\n")
 				P5MApp.lastCrash(context)?.let {
@@ -89,6 +106,30 @@ class LogServer(private val context: Context)
 			}
 		}
 		write(client.getOutputStream(), body)
+	}
+
+	/**
+	 * As linhas do diario que contem o termo, sem diferenciar maiuscula.
+	 *
+	 * Sem expressao regular de proposito: quem le isto esta com o headset na
+	 * cabeca ou digitando num navegador de celular, e "contem" resolve o caso
+	 * real. Uma expressao mal formada devolveria vazio e pareceria diario vazio.
+	 */
+	private fun filtrar(context: Context, termo: String): String
+	{
+		val diario = Trace.read(context) ?: return "(diary empty)"
+		val alvo = termo.trim('/').lowercase()
+		if(alvo.isEmpty())
+			return diario
+		val achadas = diario.lineSequence().filter { it.lowercase().contains(alvo) }.toList()
+		return if(achadas.isEmpty()) "(no line contains '$alvo')"
+			else achadas.joinToString("\n")
+	}
+
+	private fun ultimas(context: Context, quantas: Int): String
+	{
+		val linhas = (Trace.read(context) ?: return "(diary empty)").lines()
+		return linhas.takeLast(quantas).joinToString("\n")
 	}
 
 	private fun write(out: OutputStream, body: String)
