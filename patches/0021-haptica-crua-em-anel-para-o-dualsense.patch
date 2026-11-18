@@ -1,6 +1,8 @@
+diff --git a/android/app/src/main/cpp/chiaki-jni.c b/android/app/src/main/cpp/chiaki-jni.c
+index c3551cc..9342e64 100644
 --- a/android/app/src/main/cpp/chiaki-jni.c
 +++ b/android/app/src/main/cpp/chiaki-jni.c
-@@ -125,6 +125,52 @@
+@@ -125,6 +125,59 @@ JNIEXPORT jobject JNICALL JNI_FCN(videoProfilePreset)(JNIEnv *env, jobject obj,
  	return E->NewObject(env, profile_class, profile_ctor, profile.width, profile.height, profile.max_fps, profile.bitrate, codec);
  }
  
@@ -18,7 +20,10 @@
 +// depois do tiro e pior do que efeito nenhum. Comecou em quatro relatorios e
 +// caiu pela metade quando o atraso foi sentido em jogo -- do lado do Java ha
 +// outra fila, e as duas folgas somam.
-+#define P5M_HAPTICS_MAX_LAG 128
++// P5M dev.208: 128 -> 384. Com 128 (uns dois pacotes) toda rajada de Wi-Fi
++// pulava trilha aqui, e o lado Java recebia uns 90% do que o controle consome.
++// Quem segura o atraso agora e a reamostragem do DualSenseHaptics.
++#define P5M_HAPTICS_MAX_LAG 384
 +
 +// Compressao da trilha crua: lei mu, a mesma da telefonia digital.
 +//
@@ -41,7 +46,11 @@
 +// A referencia e a amplitude que satura a escala. Seis mil vem da medida: os
 +// maiores picos vistos em jogo ficam entre 4700 e 6200, e por o teto exatamente
 +// neles gasta a escala inteira sem cortar o que importa.
-+#define P5M_HAPTICS_REFERENCIA 6000.0f
++// P5M dev.208: 6000 -> 16384, e a curva passou a ser linear (p5m_mu). Com a
++// lei mu e 6000, um pico de 2700 saia a 103 de 127 e um fundo de 109 a 23: o
++// dono jogou no PS5 e achou a nossa mais forte que a do console, e aspera. O
++// console leva 16 bits a bobina em linha reta; 16384 da o dobro dele.
++#define P5M_HAPTICS_REFERENCIA 16384.0f
 +
 +// Quanto a curva se dobra. Duzentos e cinquenta e cinco e o valor da telefonia,
 +// pensado para voz; sessenta e tres dobra menos e deixa mais contraste no topo,
@@ -53,7 +62,7 @@
  typedef struct android_chiaki_session_t
  {
  	ChiakiSession session;
-@@ -162,6 +208,40 @@
+@@ -162,6 +215,40 @@ typedef struct android_chiaki_session_t
  	// guardamos o ponteiro so para poder conduzir a furacao de NAT.
  	ChiakiHolepunchSession holepunch;
  
@@ -94,7 +103,7 @@
  	// P5M: estado da conversao de haptica em vibracao (ver o callback abaixo).
  	uint32_t haptics_accum_l;
  	uint32_t haptics_accum_r;
-@@ -248,6 +328,27 @@
+@@ -248,6 +335,30 @@ static void android_chiaki_event_cb(ChiakiEvent *event, void *user)
  #define P5M_HAPTICS_GAIN 2
  #define P5M_HAPTICS_FLOOR 40
  
@@ -115,14 +124,17 @@
 +	modulo /= P5M_HAPTICS_REFERENCIA;
 +	if(modulo > 1.0f)
 +		modulo = 1.0f;
-+	float comprimido = log1pf(P5M_HAPTICS_MU * modulo) / log1pf(P5M_HAPTICS_MU);
-+	return amostra < 0.0f ? -comprimido : comprimido;
++	// P5M dev.208: linear. A lei mu (log1pf com P5M_HAPTICS_MU) deformava a
++	// onda -- um seno entrava e saia achatado -- e o que se sentia era timbre
++	// aspero, alem de forca demais nos sinais fracos. O nome ficou por ser
++	// chamado de tres lugares.
++	return amostra < 0.0f ? -modulo : modulo;
 +}
 +
  static void android_chiaki_haptics_frame(uint8_t *buf, size_t buf_size, void *user)
  {
  	AndroidChiakiSession *session = user;
-@@ -263,6 +364,96 @@
+@@ -263,6 +374,96 @@ static void android_chiaki_haptics_frame(uint8_t *buf, size_t buf_size, void *us
  				buf_size, samples);
  	}
  
@@ -219,7 +231,7 @@
  	uint32_t sum_l = 0, sum_r = 0;
  	for(size_t i = 0; i < samples; i++)
  	{
-@@ -711,6 +902,60 @@
+@@ -711,6 +912,60 @@ JNIEXPORT void JNICALL JNI_FCN(sessionSetVideoRenderToSurface)(JNIEnv *env, jobj
  	android_chiaki_video_decoder_set_render_to_surface(&session->video_decoder, render != JNI_FALSE);
  }
  
@@ -280,9 +292,11 @@
  JNIEXPORT void JNICALL JNI_FCN(sessionSetControllerState)(JNIEnv *env, jobject obj, jlong ptr, jobject controller_state_java)
  {
  	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
+diff --git a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+index 4f607a4..79370a2 100644
 --- a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
 +++ b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
-@@ -77,10 +77,11 @@
+@@ -77,10 +77,11 @@ data class ConnectInfo(
  	val duid: String = "",
  	val psnToken: String = "",
  	val psnAccountId: ByteArray = ByteArray(0),
@@ -298,7 +312,7 @@
  	val dualsense: Boolean = false
  ): Parcelable
  
-@@ -106,6 +107,7 @@
+@@ -106,6 +107,7 @@ private class ChiakiNative
  		// P5M: recebidos nos 32 bits altos, perdidos nos baixos.
  		@JvmStatic external fun sessionPacketStats(ptr: Long): Long
  		@JvmStatic external fun sessionSetVideoRenderToSurface(ptr: Long, render: Boolean)
@@ -306,7 +320,7 @@
  		@JvmStatic external fun sessionSetControllerState(ptr: Long, controllerState: ControllerState)
  		@JvmStatic external fun sessionSetLoginPin(ptr: Long, pin: String)
  		@JvmStatic external fun discoveryServiceCreate(result: CreateResult, options: DiscoveryServiceOptions, javaService: DiscoveryService)
-@@ -514,6 +516,14 @@
+@@ -514,6 +516,14 @@ class Session(connectInfo: ConnectInfo, logFile: String?, logVerbose: Boolean)
  			ChiakiNative.sessionSetVideoRenderToSurface(nativePtr, render)
  	}
  

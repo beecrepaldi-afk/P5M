@@ -29,6 +29,20 @@ was read from
 by TechAntohere, also under AGPL-3.0. The code here is our own and much smaller,
 but the hardware knowledge it encodes is theirs.
 
+## Neural depth for emulated 3D
+
+The depth model is **ZipDepth** by Fabio Tosi, MIT License
+(<https://github.com/fabiotosi92/ZipDepth>, full text in
+`app/src/main/assets/licenses/zipdepth_LICENSE.txt`). Its README says the
+weights were distilled from Depth Anything V2 Large pseudo-labels.
+
+The file `zipdepth_512x288_fp16.tflite` is the LiteRT export made by
+[Moonlight XR](https://github.com/Gilleece/moonlight-android-xr) (GPL-3.0, by
+Sean Gilleece), which restated a few layers so the whole graph runs on the GPU
+delegate. Their numbers and their pipeline (rate, readback through a PBO,
+inference on its own thread) guided ours; the code here is our own. It runs on
+LiteRT (`com.google.ai.edge.litert`), Apache 2.0.
+
 ## Not affiliated with anyone
 
 This project has nothing to do with Sony Interactive Entertainment or Meta

@@ -46,18 +46,12 @@ import java.util.zip.CRC32
  * Quem monta haptica e o `DualSenseHaptics`; quem varre cores e a sonda aqui
  * embaixo, que existe para diagnostico dentro do headset.
  */
-class DualSenseHid(private val context: Context)
+class DualSenseHid(private val context: Context, private val nomeAlvo: String? = null)
 {
 	companion object
 	{
 		// BluetoothProfile.HID_HOST, que e @SystemApi e nao esta no SDK.
 		private const val HID_HOST = 4
-		private const val REPORT_TYPE_FEATURE: Byte = 3
-
-		// Relatorio de calibragem. Le-lo e o gesto que poe o DualSense em modo
-		// estendido; antes disso ele fala e escuta o relatorio simples, e ignora
-		// o 0x31 e o 0x32 sem reclamar de nada.
-		private const val FEATURE_CALIBRAGEM = 0x05
 
 		private const val REPORT_SIZE = 78
 		private const val CRC_OFFSET = 74
@@ -83,6 +77,15 @@ class DualSenseHid(private val context: Context)
 		// lightbar. Duas descricoes independentes que fecham nao costumam estar
 		// as duas erradas.
 		private const val SILENCIAMENTO = 12      // power save e mute, por bloco
+		// Os dois gatilhos, onze bytes cada (modo e dez de parametro), direito
+		// primeiro: 10 e 21 da struct comum, mais os tres do cabecalho BT.
+		private const val GATILHOS = 13
+		private const val V0_GATILHO_DIREITO = 0x04
+		private const val V0_GATILHO_ESQUERDO = 0x08
+		private const val V0_SELECAO_HAPTICA = 0x02
+		private const val V2_VIBRACAO_COMPATIVEL = 0x04
+		private const val MOTOR_DIREITO = 5
+		private const val MOTOR_ESQUERDO = 6
 		private const val POTENCIA_MOTORES = 39   // reducao em passos de 12,5%
 		private const val FILTRO_HAPTICO = 42     // passa-baixa na bobina
 
@@ -100,7 +103,14 @@ class DualSenseHid(private val context: Context)
 		private const val V1_LIGHTBAR = 0x04
 		private const val V1_JOGADOR = 0x10
 		private const val V2_LIGHTBAR_SETUP = 0x02
-		private const val SETUP_ACENDER = 0x01
+		private const val V2_BRILHO_LEDS = 0x01
+		// O que o driver do kernel manda ao conectar para a barra deixar de ser
+		// do firmware: "light out", o bit 1 do lightbar_setup.
+		private const val SETUP_APAGAR_FIRMWARE = 0x02
+		// valid_flag1 bit 3: "release LEDs", tambem do driver do kernel.
+		private const val V1_LIBERAR_LEDS = 0x08
+		private const val MODO_SIMPLES = 0
+		private const val MODO_LIBERAR = 1
 
 		private const val CADENCIA_MS = 50L
 
@@ -112,21 +122,32 @@ class DualSenseHid(private val context: Context)
 
 		private val HEX = "0123456789ABCDEF".toCharArray()
 
+		/**
+		 * A lista inteira de isencoes do app. Inteira porque a chamada
+		 * SUBSTITUI a lista, e nao soma: o P5MApp poe a mesma na abertura, e
+		 * esta ponte a repete sem apagar as tres de entrada que o menu usa para
+		 * saber em que tela chega cada evento (MenuController.displayOf).
+		 */
+		val ISENCOES = arrayOf(
+			"Landroid/bluetooth/BluetoothHidHost;",
+			"Landroid/bluetooth/BluetoothAdapter;",
+			"Landroid/bluetooth/BluetoothDevice;")
+
 		fun disponivel(context: Context): Boolean =
 			context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) ==
 				PackageManager.PERMISSION_GRANTED
 	}
 
 	private val linhas = StringBuilder()
-	private var proxy: BluetoothProfile? = null
-	// Volatil porque o listener do perfil o reescreve na thread principal
-	// enquanto a thread da haptica o le.
+	// Os dois volateis porque o listener do perfil os reescreve na thread
+	// principal enquanto a thread da haptica ou do keepalive os le: sem isso a
+	// queda do perfil podia nao ser vista, e o envio seguia no proxy morto.
+	@Volatile private var proxy: BluetoothProfile? = null
 	@Volatile private var alvo: BluetoothDevice? = null
 	private var ultimaProcura = 0L
 	private var procurasVazias = 0
 	private var sendDataHex: Method? = null
 	private var setReportHex: Method? = null
-	private var getReport: Method? = null
 	@Volatile private var pronto = false
 
 	private fun anotar(linha: String)
@@ -167,15 +188,37 @@ class DualSenseHid(private val context: Context)
 		}
 
 		val chegou = CountDownLatch(1)
+		// Quem desistiu de esperar (prazo ou interrupt) nao quer mais este
+		// proxy: chegando tarde, ele e fechado ali mesmo, em vez de se gravar
+		// por cima de um fechar() ja feito ou de uma segunda tentativa.
+		val abandonado = java.util.concurrent.atomic.AtomicBoolean(false)
 		val listener = object: BluetoothProfile.ServiceListener
 		{
 			override fun onServiceConnected(profile: Int, p: BluetoothProfile)
 			{
-				proxy = p
-				anotar("HID host proxy: ${p.javaClass.name}")
-				resolverMetodos(p)
-				alvo = escolherControle(p)
-				chegou.countDown()
+				try
+				{
+					if(abandonado.get())
+					{
+						anotar("HID host proxy arrived after the wait was given up; closing it")
+						runCatching { BluetoothAdapter.getDefaultAdapter()?.closeProfileProxy(profile, p) }
+						return
+					}
+					proxy = p
+					anotar("HID host proxy: ${p.javaClass.name}")
+					resolverMetodos(p)
+					alvo = escolherControle(p)
+				}
+				catch(e: Throwable)
+				{
+					// Na thread principal: uma exceção aqui derrubava o app, e sem
+					// o countDown a ponte esperava o prazo inteiro por nada.
+					anotar("HID host proxy setup threw: ${e.javaClass.simpleName}: ${e.message}")
+				}
+				finally
+				{
+					chegou.countDown()
+				}
 			}
 
 			override fun onServiceDisconnected(profile: Int)
@@ -200,8 +243,18 @@ class DualSenseHid(private val context: Context)
 			return false
 		}
 
-		if(!chegou.await(4, TimeUnit.SECONDS))
+		val aTempo = try
 		{
+			chegou.await(4, TimeUnit.SECONDS)
+		}
+		catch(e: InterruptedException)
+		{
+			abandonado.set(true)
+			throw e
+		}
+		if(!aTempo)
+		{
+			abandonado.set(true)
 			anotar("HID host proxy never arrived")
 			return false
 		}
@@ -210,7 +263,8 @@ class DualSenseHid(private val context: Context)
 		val a = alvo
 		if(p == null || a == null)
 		{
-			anotar("No DualSense among the connected HID devices")
+			anotar(if(nomeAlvo == null) "No DualSense among the connected HID devices"
+				else "'$nomeAlvo' is not among the connected HID devices")
 			return false
 		}
 		if(sendDataHex == null && setReportHex == null)
@@ -223,8 +277,9 @@ class DualSenseHid(private val context: Context)
 		// o atraso da vibracao existia quando esta leitura acontecia (controle
 		// ligado antes da sessao) e sumia quando nao acontecia (controle
 		// religado no meio dela, com a vibracao perfeita ate o fim). O driver
-		// do kernel ja le a calibragem ao conectar. Se a vibracao sumir sem
-		// ela, a leitura volta; `acordarModoEstendido` fica para isso.
+		// do kernel ja le a calibragem ao conectar, e le-la de novo por aqui
+		// deixa o enlace lento e a vibracao atrasada ate o controle ser
+		// religado (dev.179, dev.202-206). Nunca ler.
 		pronto = true
 		return true
 	}
@@ -275,6 +330,13 @@ class DualSenseHid(private val context: Context)
 	 * Nao rele a calibragem: o controle religado no meio da sessao da dev.178
 	 * tocou perfeito sem ela.
 	 */
+	/**
+	 * Se o proxy do perfil ainda existe. Quando o sistema o derruba
+	 * (`onServiceDisconnected`), `recuperar` nao tem com o que procurar, e so
+	 * `fechar` seguido de `conectar` reabre a ponte.
+	 */
+	val ponteAberta: Boolean get() = proxy != null
+
 	fun recuperar(): Boolean
 	{
 		val p = proxy ?: return false
@@ -295,7 +357,7 @@ class DualSenseHid(private val context: Context)
 		}
 		val a = escolherControle(p) ?: return false
 		alvo = a
-		anotar("DualSense found again after $procurasVazias empty look(s)")
+		anotar("${nomeAlvo ?: "DualSense"} found again after $procurasVazias empty look(s)")
 		procurasVazias = 0
 		return true
 	}
@@ -326,10 +388,7 @@ class DualSenseHid(private val context: Context)
 	 */
 	private fun furarListaDeBloqueio(): Boolean = try
 	{
-		HiddenApiBypass.addHiddenApiExemptions(
-			"Landroid/bluetooth/BluetoothHidHost;",
-			"Landroid/bluetooth/BluetoothAdapter;",
-			"Landroid/bluetooth/BluetoothDevice;")
+		HiddenApiBypass.addHiddenApiExemptions(*ISENCOES)
 		anotar("Hidden API exemptions installed")
 		true
 	}
@@ -367,13 +426,8 @@ class DualSenseHid(private val context: Context)
 			t.size == 3 && BluetoothDevice::class.java.isAssignableFrom(t[0]) &&
 				t[2] == String::class.java
 		}
-		getReport = procurar(classes, "getReport") { t ->
-			t.size == 4 && BluetoothDevice::class.java.isAssignableFrom(t[0]) &&
-				(t[3] == Int::class.javaPrimitiveType || t[3] == Int::class.javaObjectType)
-		}
 
-		anotar("sendData(hex)=${sendDataHex != null} setReport(hex)=${setReportHex != null} " +
-			"getReport=${getReport != null}")
+		anotar("sendData(hex)=${sendDataHex != null} setReport(hex)=${setReportHex != null}")
 	}
 
 	private fun procurar(classes: List<Class<*>>, nome: String,
@@ -425,47 +479,25 @@ class DualSenseHid(private val context: Context)
 		for(d in conectados)
 			anotar("  device: ${nomeMinusculo(d).ifEmpty { "?" }}")
 
+		// Com um nome pedido, so ele serve: quem pede nome e a vibracao de um
+		// controle que nao e DualSense, e cair no primeiro da lista mandaria o
+		// relatorio de um fabricante ao controle de outro.
+		if(nomeAlvo != null)
+			return conectados.firstOrNull { nomeMinusculo(it) == nomeAlvo.lowercase() }
 		return conectados.firstOrNull {
 			val nome = nomeMinusculo(it)
-			nome.contains("dualsense") || nome.contains("wireless controller")
+			ehNomeDeDualSense(nome)
 		} ?: conectados.firstOrNull()
 	}
 
+	// "Wireless Controller" por inteiro, e nao contido: o controle do Xbox se
+	// anuncia como "Xbox Wireless Controller", e casar com ele mandaria
+	// relatorio de DualSense a um controle que nao e.
+	private fun ehNomeDeDualSense(nome: String): Boolean =
+		nome.contains("dualsense") || nome == "wireless controller"
+
 	private fun nomeMinusculo(device: BluetoothDevice): String =
 		(try { device.name } catch(e: Throwable) { null } ?: "").lowercase()
-
-	/**
-	 * Le o relatorio de calibragem so para o controle sair do modo simples.
-	 *
-	 * A resposta chega por transmissao, e nao por retorno, e nao e escutada de
-	 * proposito: se a leitura funcionar, o efeito ja aconteceu no controle; se
-	 * nao funcionar, esperar por ela nao muda nada.
-	 */
-	private fun acordarModoEstendido(p: BluetoothProfile, a: BluetoothDevice)
-	{
-		val metodo = getReport
-		if(metodo == null)
-		{
-			anotar("getReport absent; cannot ask for the calibration report")
-			return
-		}
-
-		try
-		{
-			val resposta = metodo.invoke(p, a, REPORT_TYPE_FEATURE,
-				FEATURE_CALIBRAGEM.toByte(), 64)
-			anotar("calibration feature report requested -> $resposta")
-		}
-		catch(e: Throwable)
-		{
-			val causa = e.cause ?: e
-			anotar("calibration feature report -> ${causa.javaClass.simpleName}: ${causa.message}")
-		}
-
-		// O controle leva um instante para trocar de modo, e o primeiro
-		// relatorio mandado durante a troca se perde.
-		dormir(500)
-	}
 
 	/**
 	 * Arma a rota de audio do controle, que e o que a haptica crua precisa.
@@ -537,7 +569,104 @@ class DualSenseHid(private val context: Context)
 		r[VALID1] = (V1_AUDIO_MUTE or V1_FILTRO_HAPTICO or V1_POTENCIA_MOTORES).toByte()
 		r[SILENCIAMENTO] = 0x00     // nem economia de energia nem mudo
 		r[POTENCIA_MOTORES] = 0x00  // zero passos de reducao nos dois motores
-		r[FILTRO_HAPTICO] = 0x00    // passa-baixa desligado
+		// dev.208: passa-baixa LIGADO. Desligado ele deixava passar o degrau de
+		// cada amostra de 8 bits e os saltos da onda -- a vibracao "aspera,
+		// ruidosa" que o dono comparou com a do console, que e arredondada.
+		r[FILTRO_HAPTICO] = 0x01
+		assinar(r)
+		return mandar(r)
+	}
+
+	/**
+	 * Se o controle escolhido e mesmo um DualSense, e nao o primeiro HID que
+	 * sobrou. `escolherControle` cai no primeiro da lista quando nenhum nome
+	 * casa, o que serve a sonda e nao serve a quem vai mandar relatorio sem
+	 * ninguem olhando: um 0x31 num 8BitDo nao e inocuo, e so desconhecido.
+	 */
+	fun alvoEDualSense(): Boolean
+	{
+		val a = alvo ?: return false
+		val nome = nomeMinusculo(a)
+		return ehNomeDeDualSense(nome)
+	}
+
+	/**
+	 * Um 0x31 com o estado que o console pediu para o controle.
+	 *
+	 * Cada parte so entra com a sua licenca, e as que ficam de fora nao mudam
+	 * no controle: `gatilhos` nulo nao toca nos gatilhos, `cor` negativa nao
+	 * toca na barra, e assim por diante. E essa regra que deixa o espelho
+	 * reescrever a barra periodicamente sem reiniciar o efeito do gatilho.
+	 *
+	 * `gatilhos` sao 22 bytes, direito e depois esquerdo; `cor` e 0xRRGGBB;
+	 * `ledsJogador` e o padrao dos cinco LEDs; `reducao` e o byte 39;
+	 * `brilho` e o dos LEDs de jogador, 0 claro, 1 medio, 2 escuro.
+	 */
+	fun espelhar(gatilhos: ByteArray?, cor: Int, ledsJogador: Int, reducao: Int,
+		brilho: Int = -1, motores: Int = -1): Boolean
+	{
+		val r = ByteArray(REPORT_SIZE)
+		r[0] = 0x31
+		r[TAG] = ROTULO_SAIDA
+		var v0 = 0
+		var v1 = 0
+		var v2 = 0
+		// Vibracao classica (os dois motores emulados pelas bobinas), no mesmo
+		// relatorio que barra e gatilhos. `motores` e (esquerdo shl 8) or
+		// direito, 0-255 cada. HAPTICS_SELECT em valid0 e a vibracao
+		// compativel v2 em valid2, como o SDL e o kernel fazem com firmware
+		// novo. Um escritor so: com o driver do Android mandando a vibracao e
+		// o espelho mandando a barra, um desfazia o outro (dev.207).
+		if(motores >= 0)
+		{
+			v0 = v0 or V0_SELECAO_HAPTICA
+			v2 = v2 or V2_VIBRACAO_COMPATIVEL
+			r[MOTOR_DIREITO] = (motores and 0xFF).toByte()
+			r[MOTOR_ESQUERDO] = ((motores shr 8) and 0xFF).toByte()
+		}
+		if(gatilhos != null && gatilhos.size == 22)
+		{
+			v0 = v0 or V0_GATILHO_DIREITO or V0_GATILHO_ESQUERDO
+			System.arraycopy(gatilhos, 0, r, GATILHOS, 22)
+		}
+		if(cor >= 0)
+		{
+			v1 = v1 or V1_LIGHTBAR
+			r[COR] = ((cor shr 16) and 0xFF).toByte()
+			r[COR + 1] = ((cor shr 8) and 0xFF).toByte()
+			r[COR + 2] = (cor and 0xFF).toByte()
+		}
+		if(ledsJogador >= 0)
+		{
+			v1 = v1 or V1_JOGADOR
+			r[LEDS_JOGADOR] = ledsJogador.toByte()
+		}
+		if(reducao >= 0)
+		{
+			v1 = v1 or V1_POTENCIA_MOTORES
+			r[POTENCIA_MOTORES] = reducao.toByte()
+		}
+		if(brilho >= 0)
+		{
+			v2 = v2 or V2_BRILHO_LEDS
+			r[LED_BRILHO] = brilho.coerceIn(0, 2).toByte()
+		}
+		r[VALID0] = v0.toByte()
+		r[VALID1] = v1.toByte()
+		r[VALID2] = v2.toByte()
+		assinar(r)
+		return mandar(r)
+	}
+
+	/**
+	 * Um 0x31 que nao muda nada no controle (as tres valid_flag zeradas). Serve
+	 * so para haver trafego no enlace: ver [EnlaceAtivo].
+	 */
+	fun manterAcordado(): Boolean
+	{
+		val r = ByteArray(REPORT_SIZE)
+		r[0] = 0x31
+		r[TAG] = ROTULO_SAIDA
 		assinar(r)
 		return mandar(r)
 	}
@@ -556,22 +685,65 @@ class DualSenseHid(private val context: Context)
 	{
 		if(!conectar())
 			return texto()
-
-		val p = proxy ?: return texto()
-		val a = alvo ?: return texto()
-		val cores = listOf(
-			Triple(255, 0, 0) to "red",
-			Triple(0, 255, 0) to "green",
-			Triple(0, 0, 255) to "blue")
-
-		for(forcar in listOf(false, true))
+		if(!alvoEDualSense())
 		{
-			val passada = if(forcar) "with setup" else "plain"
-			for((cor, nome) in cores)
-				sustentar("$passada $nome", cor.first, cor.second, cor.third, forcar)
-			dormir(1200)
+			fechar()
+			return "The controller on the HID bridge is not a DualSense; nothing was sent.\n" + texto()
 		}
+
+		// Quatro passadas, uma por hipotese, na ordem em que nao se atrapalham:
+		// a leitura da calibragem fica por ultimo porque muda o estado do
+		// controle para as seguintes. O dono conta qual passada acendeu.
+		//
+		// A dev.201 mostrou o console mandando cor, o app mandando 190 relatorios
+		// por 10 s sem recusa, e a barra parada -- e esta mesma sonda, que
+		// acendeu na dev.141, tambem parada. O que mudou desde la foi a leitura
+		// da calibragem, que saiu na dev.179 por atrasar a haptica.
+		anotar("Pass 1: plain (what the session sends)")
+		passada("plain", MODO_SIMPLES)
+		anotar("Pass 2: lightbar setup 'light out' first (what the kernel driver sends at connect)")
+		mandar(relatorioDeSetup(SETUP_APAGAR_FIRMWARE))
+		dormir(300)
+		passada("after light-out", MODO_SIMPLES)
+		// A passada com a licenca "release LEDs" (valid_flag1 0x08) saiu na
+		// dev.206: na dev.202 ela foi a unica que deixou a barra apagada --
+		// a licenca devolve os LEDs, e nao os acende. A sessao nunca a manda.
+		// A quarta passada, depois de ler a calibragem, saiu na dev.206: a
+		// leitura deixa o enlace do controle no ritmo lento (~11 ms) ate ele
+		// ser desligado, e a haptica atrasa em todas as sessoes seguintes. Foi
+		// o que as dev.202-204 herdaram desta sonda.
 		return texto()
+	}
+
+	private fun passada(nome: String, modo: Int)
+	{
+		for((cor, nomeCor) in listOf(Triple(255, 0, 0) to "red",
+				Triple(0, 255, 0) to "green", Triple(0, 0, 255) to "blue"))
+			sustentar("$nome $nomeCor", cor.first, cor.second, cor.third, modo)
+		dormir(1200)
+	}
+
+	/**
+	 * Tira a barra de luz do firmware, como o driver do kernel faz ao conectar.
+	 *
+	 * Na dev.201 os LEDs de jogador e o brilho obedeceram e a barra nao, no
+	 * mesmo relatorio: o controle aceita o 0x31, e o que recusa e so a barra.
+	 * O suspeito e o firmware ainda ser o dono dela -- a animacao azul do
+	 * pareamento --, e "light out" e o gesto que passa o controle para quem
+	 * manda. Uma vez por sessao, antes da primeira cor.
+	 */
+	fun soltarBarraDoFirmware(): Boolean = mandar(relatorioDeSetup(SETUP_APAGAR_FIRMWARE))
+
+	/** So o lightbar_setup, com a licenca em valid_flag2. */
+	private fun relatorioDeSetup(setup: Int): ByteArray
+	{
+		val r = ByteArray(REPORT_SIZE)
+		r[0] = 0x31
+		r[TAG] = ROTULO_SAIDA
+		r[VALID2] = V2_LIGHTBAR_SETUP.toByte()
+		r[LIGHTBAR_SETUP] = setup.toByte()
+		assinar(r)
+		return r
 	}
 
 	/**
@@ -582,14 +754,14 @@ class DualSenseHid(private val context: Context)
 	 * cair.
 	 */
 	private fun sustentar(nome: String, vermelho: Int, verde: Int, azul: Int,
-		forcarAcender: Boolean)
+		modo: Int)
 	{
 		var passaram = 0
 		var falharam = 0
 		val fim = System.currentTimeMillis() + COR_MS
 		while(System.currentTimeMillis() < fim)
 		{
-			if(mandar(relatorioDeCor(vermelho, verde, azul, forcarAcender)))
+			if(mandar(relatorioDeCor(vermelho, verde, azul, modo)))
 				passaram++
 			else
 				falharam++
@@ -612,21 +784,13 @@ class DualSenseHid(private val context: Context)
 	 * defeito dificil de ler depois.
 	 */
 	private fun relatorioDeCor(vermelho: Int, verde: Int, azul: Int,
-		forcarAcender: Boolean): ByteArray
+		modo: Int): ByteArray
 	{
 		val r = ByteArray(REPORT_SIZE)
 		r[0] = 0x31
 		r[TAG] = ROTULO_SAIDA
-		r[VALID1] = (V1_LIGHTBAR or V1_JOGADOR).toByte()
-
-		// `lightbar_setup` so existe para APAGAR a barra, e por isso fica de fora
-		// do caminho normal: mexer nele pede a licenca em `valid_flag2`, e a
-		// unica coisa que o driver do kernel nomeia ali e Light_Out.
-		if(forcarAcender)
-		{
-			r[VALID2] = V2_LIGHTBAR_SETUP.toByte()
-			r[LIGHTBAR_SETUP] = SETUP_ACENDER.toByte()
-		}
+		r[VALID1] = (V1_LIGHTBAR or V1_JOGADOR or
+				(if(modo == MODO_LIBERAR) V1_LIBERAR_LEDS else 0)).toByte()
 
 		r[LED_BRILHO] = 0x00
 		r[LEDS_JOGADOR] = 0x04

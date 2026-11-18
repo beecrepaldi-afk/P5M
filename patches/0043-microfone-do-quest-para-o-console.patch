@@ -1,0 +1,189 @@
+diff --git a/android/app/src/main/cpp/chiaki-jni.c b/android/app/src/main/cpp/chiaki-jni.c
+index 8a4be0e..00e585a 100644
+--- a/android/app/src/main/cpp/chiaki-jni.c
++++ b/android/app/src/main/cpp/chiaki-jni.c
+@@ -10,6 +10,7 @@
+ #include <chiaki/discoveryservice.h>
+ #include <chiaki/regist.h>
+ #include <chiaki/remote/holepunch.h>
++#include <chiaki/opusencoder.h>
+ 
+ #include <string.h>
+ #include <errno.h>
+@@ -267,6 +268,11 @@ typedef struct android_chiaki_session_t
+ 	// As amostras entram ja convertidas para 8 bits com sinal, que e o formato
+ 	// do relatorio 0x32 -- converter na escrita evita guardar o dobro e
+ 	// reconverter na leitura.
++	// P5M: microfone do Quest para o console. O codificador e o da lib; quem
++	// captura e o Kotlin, que entrega blocos de 10 ms.
++	ChiakiOpusEncoder mic_encoder;
++	bool mic_started;
++
+ 	uint8_t haptics_ring[P5M_HAPTICS_RING_BYTES];
+ 	_Atomic size_t haptics_ring_w;
+ 	_Atomic size_t haptics_ring_r;
+@@ -950,6 +956,9 @@ JNIEXPORT void JNICALL JNI_FCN(sessionFree)(JNIEnv *env, jobject obj, jlong ptr)
+ 	if(!session)
+ 		return;
+ 	CHIAKI_LOGI(session->log, "Shutting down JNI Session");
++	// O remetente do microfone aponta para o takion da sessao: sai antes dela.
++	if(session->mic_started)
++		chiaki_opus_encoder_fini(&session->mic_encoder);
+ 	chiaki_session_fini(&session->session);
+ 	android_chiaki_video_decoder_fini(&session->video_decoder);
+ 	android_chiaki_audio_decoder_fini(&session->audio_decoder);
+@@ -962,6 +971,71 @@ JNIEXPORT void JNICALL JNI_FCN(sessionFree)(JNIEnv *env, jobject obj, jlong ptr)
+ 	free(session);
+ }
+ 
++/*
++ * P5M: microfone.
++ *
++ * O formato e o do cliente de desktop do chiaki: estereo, 48 kHz, blocos de
++ * 480 amostras (10 ms). O remetente da lib so aceita pacotes de exatamente 40
++ * bytes e descarta o resto como violacao de protocolo; 40 bytes a cada 10 ms
++ * sao 32 kbps, entao o Opus vai em taxa fixa nesse valor -- em taxa variavel,
++ * todo pacote menor (silencio, fala baixa) sumiria. O ctl vai pelo prototipo
++ * publico da libopus, que esta ligada nesta mesma biblioteca; o include dela e
++ * privado da lib.
++ */
++extern int opus_encoder_ctl(struct OpusEncoder *st, int request, ...);
++#define P5M_OPUS_SET_BITRATE_REQUEST 4002
++#define P5M_OPUS_SET_VBR_REQUEST 4006
++#define P5M_MIC_FRAME_SAMPLES 480
++#define P5M_MIC_CHANNELS 2
++
++JNIEXPORT jboolean JNICALL JNI_FCN(sessionMicStart)(JNIEnv *env, jobject obj, jlong ptr)
++{
++	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
++	if(!session)
++		return JNI_FALSE;
++	if(session->mic_started)
++		return JNI_TRUE;
++	chiaki_opus_encoder_init(&session->mic_encoder, session->log);
++	ChiakiAudioHeader header;
++	chiaki_audio_header_set(&header, P5M_MIC_CHANNELS, 16, 48000, P5M_MIC_FRAME_SAMPLES);
++	chiaki_opus_encoder_header(&header, &session->mic_encoder, &session->session);
++	if(!session->mic_encoder.opus_encoder)
++	{
++		chiaki_opus_encoder_fini(&session->mic_encoder);
++		__android_log_print(ANDROID_LOG_WARN, "P5MVR", "Microphone: the Opus encoder did not start");
++		return JNI_FALSE;
++	}
++	opus_encoder_ctl(session->mic_encoder.opus_encoder, P5M_OPUS_SET_VBR_REQUEST, 0);
++	opus_encoder_ctl(session->mic_encoder.opus_encoder, P5M_OPUS_SET_BITRATE_REQUEST, 32000);
++	session->mic_started = true;
++	ChiakiErrorCode err = chiaki_session_connect_microphone(&session->session);
++	if(err == CHIAKI_ERR_SUCCESS)
++		err = chiaki_session_toggle_microphone(&session->session, false);
++	__android_log_print(ANDROID_LOG_INFO, "P5MVR", "Microphone: connected to the console (%s)",
++			chiaki_error_string(err));
++	return err == CHIAKI_ERR_SUCCESS ? JNI_TRUE : JNI_FALSE;
++}
++
++JNIEXPORT void JNICALL JNI_FCN(sessionMicFrame)(JNIEnv *env, jobject obj, jlong ptr, jshortArray pcm)
++{
++	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
++	if(!session || !session->mic_started)
++		return;
++	if(E->GetArrayLength(env, pcm) != P5M_MIC_FRAME_SAMPLES * P5M_MIC_CHANNELS)
++		return;
++	int16_t buf[P5M_MIC_FRAME_SAMPLES * P5M_MIC_CHANNELS];
++	E->GetShortArrayRegion(env, pcm, 0, P5M_MIC_FRAME_SAMPLES * P5M_MIC_CHANNELS, buf);
++	chiaki_opus_encoder_frame(buf, &session->mic_encoder);
++}
++
++JNIEXPORT void JNICALL JNI_FCN(sessionMicMute)(JNIEnv *env, jobject obj, jlong ptr, jboolean muted)
++{
++	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
++	if(!session || !session->mic_started)
++		return;
++	chiaki_session_toggle_microphone(&session->session, muted == JNI_TRUE);
++}
++
+ JNIEXPORT jint JNICALL JNI_FCN(sessionStart)(JNIEnv *env, jobject obj, jlong ptr)
+ {
+ 	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
+diff --git a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+index 199644a..8cb33d8 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+@@ -108,6 +108,9 @@ private class ChiakiNative
+ 		@JvmStatic external fun sessionPacketStats(ptr: Long): Long
+ 		@JvmStatic external fun sessionSetVideoRenderToSurface(ptr: Long, render: Boolean)
+ 		@JvmStatic external fun sessionHapticsRead(ptr: Long, out: ByteArray): Int
++		@JvmStatic external fun sessionMicStart(ptr: Long): Boolean
++		@JvmStatic external fun sessionMicFrame(ptr: Long, pcm: ShortArray)
++		@JvmStatic external fun sessionMicMute(ptr: Long, muted: Boolean)
+ 		@JvmStatic external fun sessionSetControllerState(ptr: Long, controllerState: ControllerState)
+ 		@JvmStatic external fun sessionSetLoginPin(ptr: Long, pin: String)
+ 		@JvmStatic external fun discoveryServiceCreate(result: CreateResult, options: DiscoveryServiceOptions, javaService: DiscoveryService)
+@@ -574,6 +577,14 @@ class Session(connectInfo: ConnectInfo, logFile: String?, logVerbose: Boolean)
+ 	 */
+ 	fun hapticsRead(out: ByteArray): Int = ChiakiNative.sessionHapticsRead(nativePtr, out)
+ 
++	/** P5M: liga o microfone ao console. So depois do ConnectedEvent. */
++	fun micStart(): Boolean = ChiakiNative.sessionMicStart(nativePtr)
++
++	/** P5M: 10 ms de audio, estereo intercalado, 48 kHz: 960 amostras. */
++	fun micFrame(pcm: ShortArray) = ChiakiNative.sessionMicFrame(nativePtr, pcm)
++
++	fun micMute(muted: Boolean) = ChiakiNative.sessionMicMute(nativePtr, muted)
++
+ 	fun setControllerState(controllerState: ControllerState)
+ 	{
+ 		ChiakiNative.sessionSetControllerState(nativePtr, controllerState)
+diff --git a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
+index c433a9f..4e76929 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
+@@ -156,6 +156,9 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
+ 	// mostrava isso como "ring full, dropping frames" com a nossa fila em zero
+ 	// byte de pico, e a sessao inteira saia muda.
+ 	private var hapticsSession: com.metallic.chiaki.lib.Session? = null
++	// P5M: microfone para o console; vive e morre junto com a haptica, pelo
++	// mesmo motivo -- a thread dele entrega a sessao nativa.
++	private var microfone: io.github.gblandro.p5m.Microfone? = null
+ 
+ 	// P5M: o Rumble de verdade, para quando a haptica crua nao puder ser
+ 	// entregue. Fica aqui, e nao numa variavel local, porque quem descobre isso
+@@ -196,6 +199,8 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
+ 		haptics?.stop()
+ 		haptics = null
+ 		hapticsSession = null
++		microfone?.stop()
++		microfone = null
+ 	}
+ 
+ 	override fun onPause()
+@@ -226,6 +231,8 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
+ 		haptics?.stop()
+ 		haptics = null
+ 		hapticsSession = null
++		microfone?.stop()
++		microfone = null
+ 
+ 		super.onDestroy()
+ 		rumble?.stop()
+@@ -328,6 +335,8 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
+ 			haptics?.stop()
+ 			haptics = null
+ 			hapticsSession = null
++			microfone?.stop()
++			microfone = null
+ 		}
+ 
+ 		// Um objeto nativo tambem existe quando a conexao falha. O diario
+@@ -340,6 +349,12 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
+ 					this, io.github.gblandro.p5m.DualSenseHid(this))
+ 				.also { h -> h.start(sessaoNativa) { runOnUiThread { ligarRumble() } } }
+ 				.also { hapticsSession = sessaoNativa }
++		if(state == StreamStateConnected && !isFinishing && microfone == null && sessaoNativa != null &&
++				io.github.gblandro.p5m.StreamQualityPrefs(this).microphone)
++		{
++			microfone = io.github.gblandro.p5m.Microfone(this).also { it.start(sessaoNativa) }
++			hapticsSession = sessaoNativa
++		}
+ 
+ 		when(state)
+ 		{

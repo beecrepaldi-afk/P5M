@@ -1,0 +1,49 @@
+diff --git a/android/app/src/main/cpp/video-decoder.c b/android/app/src/main/cpp/video-decoder.c
+index 0e6433f..5302260 100644
+--- a/android/app/src/main/cpp/video-decoder.c
++++ b/android/app/src/main/cpp/video-decoder.c
+@@ -14,6 +14,7 @@
+ 
+ #include <time.h>
+ #include <stdio.h>
++#include <dlfcn.h>
+ 
+ #define INPUT_BUFFER_TIMEOUT_MS 10
+ 
+@@ -599,6 +600,36 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
+ 							"10-bit colors will be wrong", transfer);
+ 				if(name)
+ 					AMediaCodec_releaseName(decoder->codec, name);
++				// P5M: tamanho do buffer e recorte. O HEVC codifica 1080 linhas
++				// como 1088; quem mostra o buffer sem aplicar o recorte ganha 8
++				// linhas de lixo embaixo e a imagem espremida -- a faixa
++				// deformada que o dono viu so no imersivo direto (dev.207).
++				{
++					int32_t w = -1, h = -1, cl = -1, ct = -1, cr = -1, cb = -1, stride = -1, slice = -1;
++					AMediaFormat_getInt32(out, "width", &w);
++					AMediaFormat_getInt32(out, "height", &h);
++					AMediaFormat_getInt32(out, "crop-left", &cl);
++					AMediaFormat_getInt32(out, "crop-top", &ct);
++					AMediaFormat_getInt32(out, "crop-right", &cr);
++					AMediaFormat_getInt32(out, "crop-bottom", &cb);
++					AMediaFormat_getInt32(out, "stride", &stride);
++					AMediaFormat_getInt32(out, "slice-height", &slice);
++					__android_log_print(ANDROID_LOG_INFO, "P5MVR",
++							"Decoder output size %dx%d, crop %d,%d..%d,%d, stride %d, slice height %d",
++							w, h, cl, ct, cr, cb, stride, slice);
++					// P5M: o mesmo tamanho vai para a camada de video, que no
++					// caminho direto precisa dele para mostrar so as linhas de
++					// imagem (dev.210). Pelo mesmo caminho do filtro de audio:
++					// dlopen na biblioteca ja carregada e dlsym do simbolo.
++					void *p5m = dlopen("libp5m-vr.so", RTLD_NOW);
++					if(p5m)
++					{
++						void (*tamanho)(int32_t, int32_t, int32_t, int32_t) =
++								(void (*)(int32_t, int32_t, int32_t, int32_t))dlsym(p5m, "p5m_video_decoder_size");
++						if(tamanho)
++							tamanho(w, h, ct, cb);
++					}
++				}
+ 				AMediaFormat_delete(out);
+ 			}
+ 			else

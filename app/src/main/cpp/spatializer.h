@@ -44,7 +44,11 @@ class Spatializer
 public:
 	static Spatializer &Instance();
 
-	/** 0 desliga (passagem exata), 1 e o efeito cheio. */
+	/**
+	 * 0 desliga (passagem exata), 1 e o efeito cheio. Acima de 1 liga o modo
+	 * sala ([ProcessRoom]) com o efeito cheio -- assim o nivel novo do menu
+	 * passa pela mesma chamada JNI.
+	 */
 	void SetStrength(float strength);
 
 	/**
@@ -66,8 +70,24 @@ public:
 private:
 	Spatializer() = default;
 
+	/**
+	 * Modo sala: alto-falantes virtuais de verdade, e nao so ancorados.
+	 *
+	 * Cada alto-falante chega as duas orelhas (com o modo normal, de frente
+	 * para a tela, o canal esquerdo so chega a orelha esquerda -- e o que deixa
+	 * o som dentro da cabeca), com o atraso interaural de Woodworth e a sombra
+	 * da cabeca do modelo estrutural de Brown e Duda (1998): um polo e um zero
+	 * que viram prateleira de agudos conforme o angulo entre a fonte e a
+	 * orelha. Mais seis reflexoes de uma sala pequena presa ao mundo (chao,
+	 * teto, paredes, fundo, atras da tela) e uma cauda curta de quatro linhas.
+	 * Tudo por amostra: nenhuma latencia de bloco.
+	 */
+	void ProcessRoom(int16_t *frames, size_t frameCount, uint32_t rate);
+
 	// Estado da thread de audio. Nada aqui e tocado de fora.
-	static constexpr size_t kLineSize = 256;   // potencia de dois: mascara em vez de resto
+	// Potencia de dois: mascara em vez de resto. 2048 cabe a reflexao mais
+	// distante do modo sala (~16 ms) com o atraso interaural e a folga.
+	static constexpr size_t kLineSize = 2048;
 	static constexpr size_t kLineMask = kLineSize - 1;
 	float line_[2][kLineSize] = {};
 	size_t write_ = 0;
@@ -80,6 +100,22 @@ private:
 	float damp_[2][2] = {};
 	bool primed_ = false;
 
+	// Modo sala. Sombra da cabeca por fonte direta e orelha (estado do filtro).
+	float shadowX_[2][2] = {};
+	float shadowY_[2][2] = {};
+	static constexpr int kReflections = 6;
+	float reflDelay_[2][kReflections][2] = {};
+	float reflGain_[2][kReflections][2] = {};
+	float reflLowpass_[2] = {};
+	// Cauda: quatro linhas de realimentacao com amortecimento.
+	static constexpr int kTailLines = 4;
+	static constexpr size_t kTailSize = 2048;
+	float tail_[kTailLines][kTailSize] = {};
+	float tailDamp_[kTailLines] = {};
+	size_t tailWrite_ = 0;
+	bool roomPrimed_ = false;
+
+	std::atomic<bool> room_{false};
 	std::atomic<float> strength_{0.0f};
 	std::atomic<float> yaw_{0.0f};
 	std::atomic<float> halfAngle_{0.35f};

@@ -1,0 +1,225 @@
+--- a/lib/src/remote/holepunch.c
++++ b/lib/src/remote/holepunch.c
+@@ -450,6 +450,7 @@
+     Session *session, SessionMessage *message, char **out, size_t *out_len);
+ static ChiakiErrorCode session_message_free(SessionMessage *message);
+ static ChiakiErrorCode deleteSession(Session *session);
++static bool notificacao_de_outra_sessao(Session *session, Notification *notif);
+ static void print_session_request(ChiakiLog *log, ConnectionRequest *req);
+ static void print_candidate(ChiakiLog *log, Candidate *candidate);
+ static ChiakiErrorCode receive_request_send_response_ps(Session *session, chiaki_socket_t *sock,
+@@ -1048,21 +1049,22 @@
+                 const char *json_str = json_object_to_json_string_ext(notif->json, JSON_C_TO_STRING_PRETTY);
+                 CHIAKI_LOGV(session->log, "chiaki_holepunch_session_create: JSON was:\n%s", json_str);
+                 err = CHIAKI_ERR_UNKNOWN;
+-                break;
++                goto falha_com_estado;
+             }
+             const char *online_id = json_object_get_string(online_id_json);
+-            if (!online_id_json)
++            if (!online_id)
+             {
+                 CHIAKI_LOGE(session->log, "chiaki_holepunch_session_create: could not extra PSN online id string.");
+                 err = CHIAKI_ERR_UNKNOWN;
+-                return err;
++                goto falha_com_estado;
+             }
++            free(session->online_id);
+             session->online_id = malloc((strlen(online_id) + 1) * sizeof(char));
+             if(!session->online_id)
+             {
+                 CHIAKI_LOGE(session->log, "chiaki_holepunch_session_create: could not allocate space for PSN online id string.");
+                 err = CHIAKI_ERR_MEMORY;
+-                return err;
++                goto falha_com_estado;
+             }
+             strcpy(session->online_id, online_id);
+         }
+@@ -1075,7 +1077,7 @@
+         {
+             CHIAKI_LOGE(session->log, "chiaki_holepunch_session_create: Got unexpected notification of type %d", notif->type);
+             err = CHIAKI_ERR_UNKNOWN;
+-            return err;
++            goto falha_com_estado;
+         }
+         chiaki_mutex_lock(&session->stop_mutex);
+         if(session->main_should_stop)
+@@ -1084,7 +1086,7 @@
+             chiaki_mutex_unlock(&session->stop_mutex);
+             CHIAKI_LOGI(session->log, "chiaki_holepunch_session_create: canceled");
+             err = CHIAKI_ERR_CANCELED;
+-            return err;
++            goto falha_com_estado;
+         }
+         chiaki_mutex_unlock(&session->stop_mutex);
+         http_check_session(session, true);
+@@ -1095,6 +1097,15 @@
+         clear_notification(session, notif);
+     }
+     return err;
++
++    // P5M: os erros e o cancelamento dentro do laco saiam com o state_mutex
++    // preso -- e ele nao e recursivo. O chiaki_holepunch_session_fini o pede
++    // na primeira linha, entao cancelar a conexao nessa janela travava o
++    // encerramento para sempre, sem apagar a sessao na PSN.
++falha_com_estado:
++    chiaki_mutex_unlock(&session->state_mutex);
++    clear_notification(session, notif);
++    return err;
+ }
+ 
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_holepunch_session_start(
+@@ -1202,7 +1213,9 @@
+             }
+ 
+             uint8_t duid_bytes[32];
+-            ChiakiErrorCode err = hex_to_bytes(member_duid, duid_bytes, sizeof(duid_bytes));
++            // P5M: sem redeclarar -- a variavel de dentro escondia a de fora, e
++            // esta falha voltava como sucesso.
++            err = hex_to_bytes(member_duid, duid_bytes, sizeof(duid_bytes));
+             if(err != CHIAKI_ERR_SUCCESS)
+             {
+                 CHIAKI_LOGE(session->log, "chiaki_holepunch_session_start: Could not convert member duid to bytes");
+@@ -1260,6 +1273,7 @@
+             session->main_should_stop = false;
+             chiaki_mutex_unlock(&session->stop_mutex);
+             CHIAKI_LOGI(session->log, "chiaki_holepunch_session_start: canceled");
++            chiaki_mutex_unlock(&session->state_mutex);
+             err = CHIAKI_ERR_CANCELED;
+             return err;
+         }
+@@ -1270,7 +1284,14 @@
+         log_session_state(session);
+         chiaki_mutex_unlock(&session->state_mutex);
+     }
+-    chiaki_mutex_unlock(&session->state_mutex);
++    // P5M: so os `break` saem do laco com o mutex preso (e com a notificacao
++    // na fila). Saindo por `finished`, ele ja foi solto no fim da volta, e o
++    // segundo unlock abria a exclusao enquanto a thread do websocket o usava.
++    if(!finished)
++    {
++        chiaki_mutex_unlock(&session->state_mutex);
++        clear_notification(session, notif);
++    }
+     return err;
+ }
+ 
+@@ -1808,11 +1829,31 @@
+     chiaki_mutex_lock(&session->state_mutex);
+     bool ws_open = session->ws_open;
+     chiaki_mutex_unlock(&session->state_mutex);
+-    if(ws_open && session->ws_thread_created)
++    // P5M: quem decide se ha o que apagar e a sessao ter sido criada, nao o
++    // websocket estar aberto. Cancelar a conexao fecha o websocket (e ele cai
++    // sozinho num PONG perdido), e ai nenhum DELETE saia: a sessao ficava
++    // viva na PSN, e a conexao seguinte esbarrava nela ("session_create:
++    // Timed out"). O DELETE e HTTP e nao precisa do websocket; so a
++    // confirmacao vem por ele. E sem sessao criada nao ha o que apagar: antes
++    // saia um DELETE para um endereco sem id, seguido de 3 s de espera por
++    // uma notificacao que nunca viria.
++    const bool sessao_criada = session->session_id[0] != '\0';
++    if(sessao_criada)
+     {
+         ChiakiErrorCode err = deleteSession(session);
+         if(err != CHIAKI_ERR_SUCCESS)
+             CHIAKI_LOGE(session->log, "Couldn't remove our holepunch session gracefully from PlayStation servers.");
++        else
++            CHIAKI_LOGI(session->log, "chiaki_holepunch_session_fini: asked PSN to delete our session");
++    }
++    if(sessao_criada && ws_open && session->ws_thread_created)
++    {
++        ChiakiErrorCode err;
++        // Um cancelamento anterior deixa este aviso armado, e a espera abaixo
++        // voltaria na hora como "cancelada" sem esperar nada.
++        chiaki_mutex_lock(&session->stop_mutex);
++        session->main_should_stop = false;
++        chiaki_mutex_unlock(&session->stop_mutex);
+         bool finished = false;
+         Notification *notif = NULL;
+         int notif_query = NOTIFICATION_TYPE_MEMBER_DELETED | NOTIFICATION_TYPE_SESSION_DELETED;
+@@ -1830,6 +1871,14 @@
+                 break;
+             }
+ 
++            if (notificacao_de_outra_sessao(session, notif))
++            {
++                // A PSN avisa todas as sessoes da conta pelo mesmo canal; a
++                // de uma conexao anterior nao confirma a nossa.
++                CHIAKI_LOGI(session->log, "chiaki_holepunch_session_fini: ignoring the deletion of another session");
++                clear_notification(session, notif);
++                continue;
++            }
+             if (notif->type == NOTIFICATION_TYPE_MEMBER_DELETED || notif->type == NOTIFICATION_TYPE_SESSION_DELETED)
+             {
+                 chiaki_mutex_lock(&session->state_mutex);
+@@ -1848,6 +1897,8 @@
+             clear_notification(session, notif);
+         }
+     }
++    else if(ws_open && !sessao_criada)
++        CHIAKI_LOGI(session->log, "chiaki_holepunch_session_fini: no session was created on PSN, nothing to delete");
+     stop_websocket_thread(session);
+     if(session->upnp_thread_running)
+     {
+@@ -2545,14 +2596,22 @@
+                     deleted_id = json_object_get_string(sid_json);
+                 }
+ 
+-                if(deleted_id && session->session_id[0]
+-                    && strcmp(deleted_id, session->session_id) != 0)
++                // P5M: sem sessao nossa ainda (o id so chega na resposta do
++                // create), nenhuma delecao pode ser dela. Antes, a de uma
++                // conexao anterior -- que o encerramento dela ainda estava
++                // apagando -- chegava nesse intervalo, derrubava este
++                // websocket e o session_create esperava 30 s por nada.
++                if(!session->session_id[0]
++                    || (deleted_id && strcmp(deleted_id, session->session_id) != 0))
+                 {
+                     CHIAKI_LOGI(session->log, "websocket_thread_func: ignoring deletion of unrelated session %s (ours is %s)",
+-                        deleted_id, session->session_id);
++                        deleted_id ? deleted_id : "?", session->session_id[0] ? session->session_id : "not created yet");
++                    json_object_put(notif->json);
++                    free(notif->json_buf);
++                    free(notif);
++                    continue;
+                 }
+-                else
+-                    session_deleted = true;
++                session_deleted = true;
+             }
+             // Publishing transfers ownership to consumers, which may free notif immediately.
+             ChiakiErrorCode mutex_err = chiaki_mutex_lock(&session->notif_mutex);
+@@ -3671,10 +3730,10 @@
+         {
+             long http_code = 0;
+             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+-            CHIAKI_LOGE(session->log, "http_send_session_message: Sending holepunch session message failed with HTTP code %ld.", http_code);
++            CHIAKI_LOGE(session->log, "delete_session: Deleting the holepunch session failed with HTTP code %ld.", http_code);
+             err = CHIAKI_ERR_HTTP_NONOK;
+         } else {
+-            CHIAKI_LOGE(session->log, "http_send_session_message: Sending holepunch session message failed with CURL error %s.", curl_easy_strerror(res));
++            CHIAKI_LOGE(session->log, "delete_session: Deleting the holepunch session failed with CURL error %s.", curl_easy_strerror(res));
+             err = CHIAKI_ERR_NETWORK;
+         }
+         goto cleanup;
+@@ -3686,6 +3745,20 @@
+     return err;
+ }
+ 
++// P5M: a notificacao traz o id de uma sessao que nao e a nossa? Sem id no
++// corpo, fica valendo como nossa, que e o que o codigo original assumia.
++static bool notificacao_de_outra_sessao(Session *session, Notification *notif)
++{
++    json_object *body_json = NULL, *data_json = NULL, *sid_json = NULL;
++    if(!notif->json
++        || !json_object_object_get_ex(notif->json, "body", &body_json)
++        || !json_object_object_get_ex(body_json, "data", &data_json)
++        || !json_object_object_get_ex(data_json, "sessionId", &sid_json)
++        || !json_object_is_type(sid_json, json_type_string))
++        return false;
++    return strcmp(json_object_get_string(sid_json), session->session_id) != 0;
++}
++
+ /**
+  * Retrieves the IP address on the local network of the client.
+  *

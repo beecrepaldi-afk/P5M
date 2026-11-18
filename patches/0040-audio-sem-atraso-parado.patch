@@ -1,0 +1,133 @@
+diff --git a/android/app/src/main/cpp/audio-output.cpp b/android/app/src/main/cpp/audio-output.cpp
+index c5fcafe..9e13dbd 100644
+--- a/android/app/src/main/cpp/audio-output.cpp
++++ b/android/app/src/main/cpp/audio-output.cpp
+@@ -13,6 +13,8 @@
+ #include <dlfcn.h>
+ #include <time.h>
+ 
++#include <atomic>
++
+ // P5M: relogio monotonico, o mesmo do resumo de video.
+ static uint64_t p5m_now_ns()
+ {
+@@ -83,6 +85,25 @@ struct AudioOutput
+ 	uint32_t p5m_overflows = 0;
+ 	uint64_t p5m_window_ns = 0;
+ 
++	// P5M: quanto audio espera no buffer, e o corte do que sobra.
++	//
++	// O buffer comporta ~170 ms. Quando o Wi-Fi engasga, a saida toca
++	// silencio; depois o atrasado chega de uma vez e fica guardado. Como o
++	// console manda no mesmo ritmo em que o Quest toca, esse atraso nunca
++	// mais saia -- o som ficava atras da imagem ate o fim da sessao. O que se
++	// mede e o *minimo* que sobra depois de cada leitura, numa janela de meio
++	// segundo: o que nunca foi preciso nesse tempo e atraso parado, e nao
++	// folga contra o jitter. Passando do teto, o excesso e descartado de uma
++	// vez, ate o alvo.
++	std::atomic<uint64_t> p5m_pushed{0};
++	std::atomic<uint64_t> p5m_popped{0};
++	uint64_t p5m_residual_min = UINT64_MAX; // so no callback
++	uint64_t p5m_residual_window_ns = 0;    // so no callback
++	std::atomic<uint32_t> p5m_level_min_us{UINT32_MAX};
++	std::atomic<uint32_t> p5m_level_max_us{0};
++	std::atomic<uint32_t> p5m_trimmed_ms{0};
++	std::atomic<uint32_t> p5m_underruns{0};
++
+ 	AudioOutput() : stream_callback(this) {}
+ };
+ 
+@@ -166,6 +187,7 @@ extern "C" void android_chiaki_audio_output_frame(int16_t *buf, size_t samples_c
+ 
+ 	size_t buf_size = samples_count * sizeof(int16_t);
+ 	size_t pushed = ao->buf.Push(reinterpret_cast<uint8_t *>(buf), buf_size);
++	ao->p5m_pushed.fetch_add(pushed, std::memory_order_relaxed);
+ 	if(pushed < buf_size)
+ 	{
+ 		CHIAKI_LOGW(ao->log, "Audio Output Buffer Overflow!");
+@@ -180,13 +202,72 @@ extern "C" void android_chiaki_audio_output_frame(int16_t *buf, size_t samples_c
+ 		// Sempre, inclusive com zero. Uma janela silenciosa e o que da sentido
+ 		// as outras: sem ela nao da para saber se o audio ficou bom ou se o
+ 		// resumo parou de sair.
++		const uint32_t nivel_min = ao->p5m_level_min_us.exchange(UINT32_MAX);
++		const uint32_t nivel_max = ao->p5m_level_max_us.exchange(0);
+ 		__android_log_print(ANDROID_LOG_INFO, "P5MVR",
+-				"Audio 10s: %u buffer overruns", ao->p5m_overflows);
++				"Audio 10s: %u buffer overruns, %u underruns | waiting in the buffer %.1f..%.1f ms | trimmed %u ms",
++				ao->p5m_overflows, ao->p5m_underruns.exchange(0),
++				nivel_min == UINT32_MAX ? 0.0 : nivel_min / 1000.0, nivel_max / 1000.0,
++				ao->p5m_trimmed_ms.exchange(0));
+ 		ao->p5m_overflows = 0;
+ 		ao->p5m_window_ns = agora;
+ 	}
+ }
+ 
++// P5M: alvo e teto do atraso parado, em milissegundos. O teto deixa passar o
++// jitter comum do Wi-Fi sem cortar nada; o alvo guarda uma folga de um pacote
++// e meio de audio (10 ms cada) contra o proximo engasgo.
++#define P5M_AUDIO_STANDING_MAX_MS 40
++#define P5M_AUDIO_STANDING_TARGET_MS 15
++#define P5M_AUDIO_WINDOW_NS 500000000ULL
++
++static void p5m_trim_audio(AudioOutput *ao, oboe::AudioStream *stream, size_t delivered)
++{
++	const uint64_t popped = ao->p5m_popped.fetch_add(delivered, std::memory_order_relaxed) + delivered;
++	const uint64_t pushed = ao->p5m_pushed.load(std::memory_order_relaxed);
++	const uint64_t residual = pushed > popped ? pushed - popped : 0;
++	const uint64_t bytes_por_ms = (uint64_t)stream->getBytesPerFrame() * stream->getSampleRate() / 1000;
++	if(bytes_por_ms == 0)
++		return;
++
++	const uint32_t nivel_us = (uint32_t)(residual * 1000 / bytes_por_ms);
++	if(nivel_us < ao->p5m_level_min_us.load(std::memory_order_relaxed))
++		ao->p5m_level_min_us.store(nivel_us, std::memory_order_relaxed);
++	if(nivel_us > ao->p5m_level_max_us.load(std::memory_order_relaxed))
++		ao->p5m_level_max_us.store(nivel_us, std::memory_order_relaxed);
++
++	if(residual < ao->p5m_residual_min)
++		ao->p5m_residual_min = residual;
++	const uint64_t agora = p5m_now_ns();
++	if(ao->p5m_residual_window_ns == 0)
++		ao->p5m_residual_window_ns = agora;
++	if(agora - ao->p5m_residual_window_ns < P5M_AUDIO_WINDOW_NS)
++		return;
++
++	const uint64_t parado = ao->p5m_residual_min;
++	ao->p5m_residual_min = UINT64_MAX;
++	ao->p5m_residual_window_ns = agora;
++	if(parado == UINT64_MAX || parado <= P5M_AUDIO_STANDING_MAX_MS * bytes_por_ms)
++		return;
++
++	// Descarta em quadros inteiros, para nao trocar os canais de lugar.
++	const size_t quadro = (size_t)stream->getBytesPerFrame();
++	size_t sobra = (size_t)(parado - P5M_AUDIO_STANDING_TARGET_MS * bytes_por_ms);
++	sobra -= sobra % quadro;
++	uint8_t lixo[1024];
++	size_t descartado = 0;
++	while(descartado < sobra)
++	{
++		size_t pedaco = sobra - descartado < sizeof(lixo) ? sobra - descartado : sizeof(lixo);
++		size_t saiu = ao->buf.Pop(lixo, pedaco);
++		descartado += saiu;
++		if(saiu < pedaco)
++			break;
++	}
++	ao->p5m_popped.fetch_add(descartado, std::memory_order_relaxed);
++	ao->p5m_trimmed_ms.fetch_add((uint32_t)(descartado / bytes_por_ms), std::memory_order_relaxed);
++}
++
+ oboe::DataCallbackResult AudioOutputCallback::onAudioReady(oboe::AudioStream *stream, void *audio_data, int32_t num_frames)
+ {
+ 	if(stream->getFormat() != oboe::AudioFormat::I16)
+@@ -201,9 +282,11 @@ oboe::DataCallbackResult AudioOutputCallback::onAudioReady(oboe::AudioStream *st
+ 
+ 	size_t buf_size_delivered = audio_output->buf.Pop(buf, buf_size_requested);
+ 	//CHIAKI_LOGW(audio_output->log, "Delivered %llu", (unsigned long long)buf_size_delivered);
++	p5m_trim_audio(audio_output, stream, buf_size_delivered);
+ 
+ 	if(buf_size_delivered < buf_size_requested)
+ 	{
++		audio_output->p5m_underruns.fetch_add(1, std::memory_order_relaxed);
+ 		CHIAKI_LOGV(audio_output->log, "Audio Output Buffer Underflow!");
+ 		memset(buf + buf_size_delivered, 0, buf_size_requested - buf_size_delivered);
+ 	}

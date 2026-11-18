@@ -1552,3 +1552,27 @@ Audio Output Buffer Overflow!  (x14)
 Vídeo e áudio quebrando **no mesmo segundo**. Não é o áudio transbordando
 *porque* o vídeo atrasou: é um estouro de perda na rede atingindo os dois ao
 mesmo tempo. Uma ocorrência em sete minutos, com rede de casa.
+
+## 12/09/2026 — instalar o P5M exigia desinstalar o Chiaki
+
+Retorno do beta: quem já tinha o Chiaki carregado por fora não conseguia
+instalar o P5M. O sistema recusava falando em nome de pacote já existente, e a
+saída foi desinstalar o Chiaki antes.
+
+Não era o `applicationId` — esse é `io.github.gblandro.p5m` desde sempre e não
+colide com nada. Era a **autoridade do `FileProvider`**, que ficou
+`com.metallic.chiaki.fileprovider` porque veio junto com o código do submódulo.
+Autoridade de provider é única no **aparelho inteiro**, não por pacote: dois
+apps que declarem a mesma não coexistem, e o segundo é recusado na instalação
+com `INSTALL_FAILED_CONFLICTING_PROVIDER`. A mensagem que o Horizon OS mostra
+fala em pacote, o que manda procurar no lugar errado.
+
+A autoridade agora sai do `applicationId` nos dois lugares que precisavam
+concordar: o `<provider>` do nosso manifesto e a constante
+`fileProviderAuthority` da `LogManager.kt` do submódulo (patch 0028). Ela é o
+que a exportação de ajustes e o compartilhamento de log de sessão usam — se a
+constante e o manifesto divergirem, esses dois botões quebram com
+`IllegalArgumentException` na hora de gerar a URI, e não antes.
+
+Isso conserta a instalação **nova**. Quem já tem os dois apps convivendo por
+ter desinstalado e reinstalado não precisa fazer nada.

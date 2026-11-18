@@ -1,0 +1,31 @@
+diff --git a/android/app/src/main/cpp/chiaki-jni.c b/android/app/src/main/cpp/chiaki-jni.c
+index 00e585a..8b94c11 100644
+--- a/android/app/src/main/cpp/chiaki-jni.c
++++ b/android/app/src/main/cpp/chiaki-jni.c
+@@ -956,13 +956,26 @@ JNIEXPORT void JNICALL JNI_FCN(sessionFree)(JNIEnv *env, jobject obj, jlong ptr)
+ 	if(!session)
+ 		return;
+ 	CHIAKI_LOGI(session->log, "Shutting down JNI Session");
++	// P5M: uma marca por passo. A liberacao travou duas vezes aqui dentro
++	// (dev.224, dev.225) e o lado Java so via "sessionFree"; a ultima marca
++	// no diario diz qual dos passos prendeu.
++#define P5M_PASSO(nome) __android_log_print(ANDROID_LOG_INFO, "P5MVR", "Session release: %s", nome)
+ 	// O remetente do microfone aponta para o takion da sessao: sai antes dela.
+ 	if(session->mic_started)
++	{
++		P5M_PASSO("microphone");
+ 		chiaki_opus_encoder_fini(&session->mic_encoder);
++	}
++	P5M_PASSO("chiaki session");
+ 	chiaki_session_fini(&session->session);
++	P5M_PASSO("video decoder");
+ 	android_chiaki_video_decoder_fini(&session->video_decoder);
++	P5M_PASSO("audio decoder");
+ 	android_chiaki_audio_decoder_fini(&session->audio_decoder);
++	P5M_PASSO("audio output");
+ 	android_chiaki_audio_output_free(session->audio_output);
++	P5M_PASSO("done");
++#undef P5M_PASSO
+ 	E->DeleteGlobalRef(env, session->java_session);
+ 	E->DeleteGlobalRef(env, session->java_session_class);
+ 	CHIAKI_LOGI(session->log, "JNI Session has quit");

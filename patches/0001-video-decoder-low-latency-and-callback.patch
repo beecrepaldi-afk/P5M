@@ -1,5 +1,5 @@
 diff --git a/android/app/src/main/cpp/video-decoder.c b/android/app/src/main/cpp/video-decoder.c
-index 1146ad8f..8ac08552 100644
+index 1146ad8f..7836c702 100644
 --- a/android/app/src/main/cpp/video-decoder.c
 +++ b/android/app/src/main/cpp/video-decoder.c
 @@ -9,6 +9,8 @@
@@ -11,7 +11,7 @@ index 1146ad8f..8ac08552 100644
  
  #define INPUT_BUFFER_TIMEOUT_MS 10
  
-@@ -102,6 +104,52 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
+@@ -102,6 +104,42 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
  	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, decoder->target_width);
  	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, decoder->target_height);
  
@@ -31,22 +31,12 @@ index 1146ad8f..8ac08552 100644
 +	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_OPERATING_RATE, INT32_MAX);
 +#endif
 +
-+	// P5M: pede ao decodificador que entregue SDR mesmo quando a fonte e HDR.
-+	//
-+	// No Remote Play, 10 bits por canal nao existem separados do HDR: o unico
-+	// jeito de pedir Main10 ao PS5 e o perfil HDR, que vem com curva PQ e gamut
-+	// BT.2020 juntos. Entregar isso cru a um painel SDR da imagem lavada e
-+	// escura -- pior que os 8 bits que se queria melhorar.
-+	//
-+	// Esta chave move o mapeamento de tons para dentro do decodificador, em
-+	// hardware: o video chega em 10 bits, a conversao acontece antes de virar
-+	// frame, e o que sobra e o ganho que interessa -- gradiente sem faixas, por
-+	// haver 1024 niveis por canal na origem em vez de 256.
-+	//
-+	// A chave vai como literal porque o #define so existe em NDK recente. O
-+	// valor 3 e COLOR_TRANSFER_SDR_VIDEO. Decodificador que nao a reconheca
-+	// simplesmente ignora.
-+	AMediaFormat_setInt32(format, "color-transfer-request", 3);
++	// P5M: sem "color-transfer-request". Ele pedia ao decodificador que
++	// mapeasse o HDR para SDR em hardware, e o do Quest 3 ignora (devolve
++	// color-transfer=6, PQ): quem mapeia e o shader do app, que supoe PQ.
++	// Deixar o pedido era deixar uma armadilha -- no dia em que uma
++	// atualizacao o honrasse, o shader aplicaria a curva PQ sobre SDR e a
++	// imagem sairia quase preta.
 +
 +	// P5M: chave privada do decodificador da Qualcomm.
 +	//
@@ -64,7 +54,7 @@ index 1146ad8f..8ac08552 100644
  	media_status_t r = AMediaCodec_configure(decoder->codec, format, decoder->window, NULL, 0);
  	if(r != AMEDIA_OK)
  	{
-@@ -139,8 +187,18 @@ beach:
+@@ -139,8 +177,18 @@ beach:
  	chiaki_mutex_unlock(&decoder->codec_mutex);
  }
  
@@ -84,7 +74,7 @@ index 1146ad8f..8ac08552 100644
  	bool r = true;
  	AndroidChiakiVideoDecoder *decoder = user;
  	chiaki_mutex_lock(&decoder->codec_mutex);
-@@ -189,10 +247,63 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
+@@ -189,10 +237,66 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
  {
  	AndroidChiakiVideoDecoder *decoder = user;
  
@@ -131,10 +121,13 @@ index 1146ad8f..8ac08552 100644
 +						"Decoder output format '%s': color-standard=%d "
 +						"color-transfer=%d color-range=%d color-format=0x%x",
 +						name ? name : "?", cstd, transfer, range, fmt);
-+				if(transfer == 6)
++				// O shader do app supoe PQ quando a sessao e de 10 bits. Um
++				// decodificador que devolvesse outra curva faria a imagem sair
++				// errada, e e isso que merece aviso -- nao o PQ, que e o normal.
++				if(transfer != 6 && cstd == 6)
 +					__android_log_print(ANDROID_LOG_WARN, "P5MVR",
-+							"color-transfer=6 (PQ): the tone mapping request was "
-+							"ignored, whites will come out blown");
++							"color-transfer=%d with BT.2020: the app expects PQ (6), "
++							"10-bit colors will be wrong", transfer);
 +				if(name)
 +					AMediaCodec_releaseName(decoder->codec, name);
 +				AMediaFormat_delete(out);

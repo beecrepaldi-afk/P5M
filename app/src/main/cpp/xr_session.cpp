@@ -15,6 +15,20 @@
 namespace p5m {
 namespace {
 
+// Tamanho do buffer que o decodificador entrega, contado pelo lado do chiaki
+// (video-decoder.c) quando o formato de saida muda. Global porque quem conta
+// nao conhece a sessao; so ha uma por processo.
+//
+// Existe por causa da faixa deformada no pe da tela no caminho direto: o HEVC
+// de 1080 linhas sai como buffer de 1088, e o swapchain de Surface do runtime
+// mostra o buffer inteiro esticado nas 1080 da camada, sem o recorte. A
+// SurfaceTexture do caminho com shader aplica o recorte sozinha, e la a faixa
+// nunca apareceu.
+std::atomic<int32_t> g_decoder_width{0};
+std::atomic<int32_t> g_decoder_height{0};
+std::atomic<int32_t> g_decoder_crop_top{-1};
+std::atomic<int32_t> g_decoder_crop_bottom{-1};
+
 const char *XrResultStr(XrInstance instance, XrResult res)
 {
 	static thread_local char buf[XR_MAX_RESULT_STRING_SIZE];
@@ -33,26 +47,65 @@ const char *XrResultStr(XrInstance instance, XrResult res)
 		}                                                                           \
 	} while(0)
 
-// Tamanho do painel de ajuda, em pixels de textura. Largo o bastante para uma
-// linha de comando por vez sem quebrar, e pequeno o bastante para o envio por
-// frame nao pesar.
-constexpr int32_t kHudWidth = 1024;
-// 768 e nao 512: com dez linhas de legenda a 40 px, a ultima caia em y=538 --
-// fora do painel. As linhas de "Share" e "Circulo" estavam sendo desenhadas
-// para fora do bitmap desde que a lista cresceu, e nenhuma delas jamais
-// apareceu. A secao de medidores nao caberia de jeito nenhum no tamanho velho.
-constexpr int32_t kHudHeight = 768;
+// Tamanho do painel de ajuda, em pixels de textura.
+//
+// Largo e baixo (dev.210), e nao mais 1024x768: o painel fica logo abaixo da
+// tela do jogo, e uma faixa comprida cobre menos imagem que um quadro. O dono
+// pediu algo perto de 32:9; 2048x464 tem cinco colunas de tres linhas e mais
+// nada -- cada linha a mais seria painel por cima do jogo.
+constexpr int32_t kHudWidth = 2048;
+constexpr int32_t kHudHeight = 464;
 
-// Posicao fixa do painel, em metros. 1,5 m e distancia de leitura confortavel,
-// e 0,95 m de largura da cerca de 35 graus -- grande o bastante para ler as
-// linhas sem cobrir a tela do jogo atras.
+// Distancia de leitura e largura fisica. A dev.210 usou 1,9 m, a densidade
+// do painel antigo (0,95 m para 1024 px); o dono achou grande e pediu uns 25%
+// a menos. Mesma textura, so menor no espaco: o texto encolhe junto.
 constexpr float kHudDistance = 1.5f;
-constexpr float kHudWidth1M = 0.95f;
-constexpr float kHudHeightOffset = -0.3f;
+constexpr float kHudWidth1M = 1.425f;
+// Entre a borda de baixo da tela e o topo do painel.
+constexpr float kHudGapRadians = 0.03f;
+// Sem tela visivel (teclado do PIN, antes do video), o centro fica um pouco
+// abaixo da linha dos olhos, como sempre foi.
+constexpr float kHudCenterPitch = -0.2f;
+// Tela enorme ou muito baixa empurraria o painel para o colo; daqui nao passa.
+constexpr float kHudMinPitch = -0.75f;
+// Ate dez graus acima dos olhos a tela fica reta (dev.217): ~0,7 m a 4 m.
+constexpr float kScreenStraightBand = 10.0f * 3.14159265f / 180.0f;
 
 XrQuaternionf QuatFromYaw(float yaw)
 {
 	return XrQuaternionf{0.0f, std::sin(yaw * 0.5f), 0.0f, std::cos(yaw * 0.5f)};
+}
+
+/**
+ * Inclinacao da tela para ficar de frente para os olhos (dev.215).
+ *
+ * Tela reta acima da cabeca e vista de baixo, em trapezio, como TV presa
+ * alta na parede sem suporte inclinado. O espaco LOCAL tem a origem nos olhos
+ * da recentragem, entao o angulo ate o centro da tela e so a altura sobre a
+ * distancia; girar a tela por ele a deixa perpendicular a linha de visao. O
+ * mesmo vale para baixo, como a tela de um notebook no colo.
+ */
+float ScreenTilt(const ScreenParams &params)
+{
+	if(params.radius <= 0.0f)
+		return 0.0f;
+	// Faixa reta logo acima dos olhos (dev.217): o dono gosta da tela um
+	// pouco alta e reta, e so a queria inclinada quando sobe de verdade. Acima
+	// da faixa conta so o excesso, para a inclinacao nascer do zero e nao
+	// pular de uma vez. Abaixo dos olhos continua inteira.
+	const float elevacao = std::atan2(params.heightOffset, params.radius);
+	if(elevacao < 0.0f)
+		return elevacao;
+	return std::max(elevacao - kScreenStraightBand, 0.0f);
+}
+
+/** Yaw seguido de pitch: o painel de frente para quem olha para baixo. */
+XrQuaternionf QuatFromYawPitch(float yaw, float pitch)
+{
+	const float cy = std::cos(yaw * 0.5f), sy = std::sin(yaw * 0.5f);
+	const float cp = std::cos(pitch * 0.5f), sp = std::sin(pitch * 0.5f);
+	// q = qYaw * qPitch, com qYaw em torno de Y e qPitch em torno de X.
+	return XrQuaternionf{cy * sp, sy * cp, -sy * sp, cy * cp};
 }
 
 /** Gira um vetor pelo inverso de um quaternion unitario. */
@@ -824,17 +877,25 @@ bool XrVideoSession::InitHudSwapchain()
 	return true;
 }
 
-void XrVideoSession::SetHudBitmap(const uint8_t *pixels, int32_t width, int32_t height)
+void XrVideoSession::SetHudBitmap(const uint8_t *pixels, int32_t width, int32_t height,
+		int32_t stride)
 {
-	if(!pixels || width <= 0 || height <= 0)
+	if(!pixels || width <= 0 || height <= 0 || stride < width * 4)
 		return;
 	std::lock_guard<std::mutex> lock(hud_mutex_);
 	hud_width_ = width;
 	hud_height_ = height;
-	hud_pixels_.assign(pixels, pixels + (size_t)width * height * 4);
+	// Linha a linha: o Bitmap pode ter enchimento no fim de cada linha, e a
+	// copia corrida o arrastaria para dentro da imagem.
+	const size_t linha = (size_t)width * 4;
+	hud_pixels_.resize(linha * height);
+	for(int32_t y = 0; y < height; y++)
+		std::memcpy(hud_pixels_.data() + linha * y, pixels + (size_t)stride * y, linha);
+	hud_uploads_pending_ = (uint32_t)std::max<size_t>(hud_images_.size(), 1);
 }
 
-bool XrVideoSession::UpdateHudLayer(XrCompositionLayerQuad &layer, float yaw)
+bool XrVideoSession::UpdateHudLayer(XrCompositionLayerQuad &layer, float yaw,
+		const ScreenParams &screen, bool below_screen)
 {
 	if(hud_swapchain_ == XR_NULL_HANDLE || hud_images_.empty())
 		return false;
@@ -846,26 +907,29 @@ bool XrVideoSession::UpdateHudLayer(XrCompositionLayerQuad &layer, float yaw)
 
 	XrSwapchainImageWaitInfo wait{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
 	wait.timeout = XR_INFINITE_DURATION;
-	bool uploaded = false;
 	if(XR_SUCCEEDED(xrWaitSwapchainImage(hud_swapchain_, &wait)))
 	{
 		std::lock_guard<std::mutex> lock(hud_mutex_);
-		if(!hud_pixels_.empty() && hud_width_ == kHudWidth && hud_height_ == kHudHeight)
+		// O swapchain tem varias imagens em rodizio, entao cada painel novo vai
+		// para todas -- um bit de "sujo" so acertaria uma delas e o painel
+		// piscaria entre o novo e o antigo. Mas so enquanto houver imagem sem
+		// ele: antes eram 3,8 MB subindo a cada quadro, 120 vezes por segundo,
+		// com o painel parado.
+		if(hud_uploads_pending_ > 0 && !hud_pixels_.empty()
+				&& hud_width_ == kHudWidth && hud_height_ == kHudHeight)
 		{
-			// O swapchain tem varias imagens em rodizio, entao a atualizacao
-			// vai em todas -- guardar um bit de "sujo" so acertaria uma delas e
-			// o painel piscaria entre o novo e o antigo.
 			glBindTexture(GL_TEXTURE_2D, hud_images_[index].image);
 			glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, kHudWidth, kHudHeight,
 					GL_RGBA, GL_UNSIGNED_BYTE, hud_pixels_.data());
 			glBindTexture(GL_TEXTURE_2D, 0);
-			uploaded = true;
+			hud_uploads_pending_--;
+			hud_has_content_ = true;
 		}
 	}
 
 	XrSwapchainImageReleaseInfo release{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 	xrReleaseSwapchainImage(hud_swapchain_, &release);
-	if(!uploaded)
+	if(!hud_has_content_)
 		return false;
 
 	layer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
@@ -879,22 +943,34 @@ bool XrVideoSession::UpdateHudLayer(XrCompositionLayerQuad &layer, float yaw)
 	layer.subImage.imageRect.extent = XrExtent2Di{kHudWidth, kHudHeight};
 	layer.subImage.imageArrayIndex = 0;
 
-	// Ancorado no espaco, nao na tela.
+	// Ancorado no espaco, logo abaixo da tela do jogo.
 	//
-	// Antes o painel seguia a distancia e a altura da tela, e mexer na distancia
-	// fazia a legenda andar junto com o que ela esta explicando -- desconfortavel
-	// e sem utilidade: uma referencia que se move enquanto se lê deixa de ser
-	// referencia. Fica sempre no mesmo lugar, a uma distancia de leitura, um
-	// pouco abaixo da linha dos olhos para nao tapar o jogo.
-	//
-	// So o yaw acompanha a recentragem, para o painel aparecer a frente de quem
-	// abriu o modo em vez de ficar perdido nas costas.
-	layer.size = XrExtent2Df{kHudWidth1M, kHudWidth1M * (float)kHudHeight / (float)kHudWidth};
-	layer.pose.orientation = QuatFromYaw(yaw);
+	// Nao segue a cabeca: uma referencia que se move enquanto se le deixa de
+	// ser referencia. Segue a tela so no angulo -- o topo do painel fica um
+	// pouco abaixo da borda de baixo dela, na distancia de leitura, inclinado
+	// para ficar de frente para o olho. Assim ele tapa o menos possivel do jogo,
+	// que era a queixa com o quadro antigo no meio da vista (dev.210).
+	const float width = kHudWidth1M;
+	const float height = kHudWidth1M * (float)kHudHeight / (float)kHudWidth;
+	const float half_angle = std::atan2(height * 0.5f, kHudDistance);
+	float pitch = kHudCenterPitch;
+	if(below_screen && screen.aspectRatio > 0.0f && screen.radius > 0.0f)
+	{
+		// Altura aparente da tela, pela mesma conta do quad equivalente.
+		const float screen_w = 2.0f * screen.radius * std::tan(screen.centralAngle * 0.5f);
+		const float screen_h = screen_w / screen.aspectRatio;
+		// Inclinada, a borda de baixo desce menos e se afasta um pouco.
+		const float tilt = ScreenTilt(screen);
+		const float bottom = std::atan2(screen.heightOffset - std::cos(tilt) * screen_h * 0.5f,
+				screen.radius + std::sin(tilt) * screen_h * 0.5f);
+		pitch = std::max(kHudMinPitch, bottom - kHudGapRadians - half_angle);
+	}
+	layer.size = XrExtent2Df{width, height};
+	layer.pose.orientation = QuatFromYawPitch(yaw, pitch);
 	layer.pose.position = XrVector3f{
-		-std::sin(yaw) * kHudDistance,
-		kHudHeightOffset,
-		-std::cos(yaw) * kHudDistance
+		-std::sin(yaw) * std::cos(pitch) * kHudDistance,
+		std::sin(pitch) * kHudDistance,
+		-std::cos(yaw) * std::cos(pitch) * kHudDistance
 	};
 	return true;
 }
@@ -909,10 +985,7 @@ bool XrVideoSession::CreateGlVideoSwapchain(int32_t width, int32_t height)
 	// cada olho e um recorte. Sobre recorte o filtro de nitidez do compositor
 	// desenhou um X atravessando a tela -- medido em hardware --, e por isso o
 	// 3D vinha sem MQSR nenhum, que e o maior ganho de nitidez que existe aqui.
-	//
-	// Estereo empacotado, o que ja chega com os dois olhos na mesma imagem,
-	// continua como estava: la o recorte e a propria natureza do conteudo.
-	const bool dois_alvos = stereo_synthetic_.load() && stereo_mode_.load() != 0;
+	const bool dois_alvos = stereo_synthetic_.load();
 
 	uint32_t format_count = 0;
 	if(XR_FAILED(xrEnumerateSwapchainFormats(session_, 0, &format_count, nullptr))
@@ -1090,6 +1163,7 @@ bool XrVideoSession::RenderVideoThroughShader()
 		if(!tone_mapper_.Init() || !tone_mapper_.Attach(pending_surface_texture_))
 		{
 			LOGE("Tone mapper unavailable; nothing will be displayed");
+			ASurfaceTexture_release(pending_surface_texture_);
 			pending_surface_texture_ = nullptr;
 			return false;
 		}
@@ -1121,56 +1195,131 @@ bool XrVideoSession::RenderVideoThroughShader()
 		nitidez = quality_.sharpness;
 	}
 
-	// O desvio que punha MQSR e automatico no shader quando o 3D estava ligado
-	// saiu daqui: com um swapchain inteiro por olho a camada deixou de ser
-	// recorte, e o filtro do compositor volta a valer. Ele so continua sendo
-	// preciso no estereo empacotado, onde o recorte e inevitavel.
-	if(stereo_mode_.load() != 0 && !stereo_synthetic_.load()
-			&& (nitidez == Sharpness::Mqsr || nitidez == Sharpness::Auto))
-	{
-		sharpen = 1.0f;
-		if(!logged_stereo_sharpen_)
-		{
-			logged_stereo_sharpen_ = true;
-			LOGI("Packed 3D: the compositor filter does not apply to a layer that is "
-					"half of a texture, so sharpening falls back to the shader");
-		}
-	}
-
-	// Teto de disparidade pela distancia interpupilar.
+	// Orcamento de disparidade do olho sintetizado, um para cada lado da tela.
 	//
-	// Uma separacao na tela maior que a distancia entre os olhos obriga os
-	// olhos a divergir, e isso nao e desconforto: e impossivel, nenhum par de
-	// olhos gira para fora. O limite sai da IPD que o runtime informou e da
-	// largura angular da tela, porque a mesma separacao em pixels vale mais
-	// numa tela grande e perto do que numa pequena e longe.
-	// O sintetizador so entra quando o estereo e nosso. Com conteudo que ja
-	// chega com os dois olhos, deformar por profundidade adivinhada poria um
-	// estereo em cima do outro.
-	if(stereo_synthetic_.load() && stereo_mode_.load() != 0)
+	// A conta e feita em dioptrias -- o inverso da distancia --, e nao em
+	// metros, porque e assim que o olho trabalha: a diferenca entre 1 e 2 m
+	// cansa, e a mesma diferenca de um metro entre 10 e 11 m nao existe para
+	// ninguem. E o unico jeito de um mesmo ajuste valer com a tela a 1 m e a
+	// 2,5 m, que e onde este app e usado.
+	//
+	// A referencia e o plano em que as lentes do aparelho focam, e nao a tela.
+	// O foco do Quest 3 e fixo, em torno de 1,3 m (a Meta nao publica o numero,
+	// entao isto e estimativa), e o olho acomoda sempre nele, esteja a tela
+	// onde estiver. Quanto mais a convergencia se afasta desse plano, mais a
+	// vergencia briga com a acomodacao -- e esse conflito e o que da o
+	// cansaco que nao se sabe de onde vem. Meia dioptria para tras e 0,3 para
+	// a frente ficam dentro da faixa em que a literatura poe o desconforto
+	// como baixo.
+	//
+	// Duas travas em cima disso, e as duas dependem da IPD do usuario, lida do
+	// runtime:
+	//  - Separacao na tela igual a IPD e o infinito, e maior que ela obriga os
+	//    olhos a divergir, o que e impossivel. O teto e 70% dela.
+	//  - Piso de 40% da IPD, senao numa tela longe a conta em dioptrias
+	//    devolveria profundidade nenhuma.
+	//
+	// A frente ganha ainda um teto em angulo, porque o que salta da tela e o
+	// que briga com a moldura.
+	//
+	// A versao anterior usava 70% da IPD sempre, sem olhar a distancia da tela.
+	// Com a tela a 1 m isso punha o fundo a 3,3 m -- 0,7 dioptria de conflito,
+	// e a faixa perdida na borda passava de 3% da largura, que foi o corte
+	// visivel no teste da dev.181.
+	//
+	if(stereo_synthetic_.load())
 	{
 		ScreenParams params;
 		{
 			std::lock_guard<std::mutex> lock(params_mutex_);
 			params = params_;
 		}
+		// Sem leitura valida do runtime ainda, a media adulta.
 		float ipd = ipd_meters_.load();
-		float teto = 0.02f;
-		if(ipd > 0.0f && params.radius > 0.01f && params.centralAngle > 0.01f)
+		if(!(ipd > 0.0f))
+			ipd = 0.063f;
+		const float distancia = params.radius > 0.01f ? params.radius : 4.0f;
+		const float angulo = params.centralAngle > 0.01f ? params.centralAngle : 1.22f;
+		const float largura_m = std::max(2.0f * distancia * std::tan(angulo * 0.5f), 0.01f);
+		const float forca = std::min(std::max(stereo_strength_.load(), 0.0f), 1.0f);
+
+		// Onde as lentes focam, em dioptrias, e o quanto a vergencia pode
+		// afastar-se disso para cada lado.
+		const float foco = 1.0f / 1.3f;
+		const float atras_d = 0.5f;
+		const float frente_d = 0.3f;
+
+		// O fundo: a vergencia mais distante admitida, presa entre o teto da
+		// divergencia (70% da IPD) e o piso de profundidade (40% dela).
+		const float v_tela = 1.0f / distancia;
+		const float v_fundo = std::min(std::max(foco - atras_d, 0.30f * v_tela),
+				0.60f * v_tela);
+
+		// Teto de qualidade, e nao de conforto: 1% da largura.
+		//
+		// O conforto admite bem mais -- na tela a 1,5 m a conta em dioptrias
+		// dava 2,4% --, mas quem carrega a disparidade e um palpite de
+		// profundidade, e o erro dele cresce junto. Medido na dev.183: acima de
+		// cerca de 1% da largura o palpite aparece como borracha, com o objeto
+		// esticando e ondulando na borda, e a imagem parece pior do que em 2D.
+		// Foi o "50, 75 e 100% ficaram impossiveis de usar" do teste.
+		//
+		// Isto nao e teimosia do numero: se um dia a profundidade vier de uma
+		// rede neural, este teto sobe junto com a confianca no mapa. Ele existe
+		// porque o limite de hoje e a estimativa, e nao o olho.
+		const float teto_qualidade = 0.010f;
+		// Separacao na tela, em metros, e depois em fracao da largura.
+		const float atras = std::min(ipd * (1.0f - distancia * v_fundo) / largura_m,
+				teto_qualidade) * forca;
+
+		// A frente, pelo mesmo caminho, e ainda limitada em angulo.
+		// Pop-out (dev.214): a frente ganha mais teto e mais angulo, a
+		// convergencia desce para haver o que saltar, e a moldura flutuante vai
+		// na frente de tudo isso. Na dev.216 o dono achou quase imperceptivel
+		// (moldura de 0,1 a 1,25%); a dev.217 dobra teto e angulo e desce a
+		// convergencia a 45%. O teto e o que segura a borracha do palpite de
+		// profundidade: se ela aparecer nas bordas, e aqui que se recua.
+		const bool salta = stereo_pop_out_.load();
+		const float v_perto = foco + (salta ? frente_d * 2.0f : frente_d);
+		const float frente_m = std::max(ipd * (distancia * v_perto - 1.0f), 0.0f);
+		const float frente = std::min(std::min(frente_m / largura_m,
+				((salta ? 1.4f : 0.35f) * 3.14159265f / 180.0f) / angulo),
+				teto_qualidade * (salta ? 2.0f : 0.5f)) * forca;
+		// Com a convergencia em 100% nada fica a frente da tela: o Pop-out a
+		// traz para no maximo 45%, e a parte mais perto da cena salta.
+		const float convergencia = salta ? std::min(stereo_convergence_.load(), 0.45f)
+				: stereo_convergence_.load();
+		// A moldura na disparidade maxima da frente, e um pouco alem: o que
+		// salta ao maximo continua atras dela.
+		const float janela = salta ? frente * 1.15f + 0.001f : 0.0f;
+		tone_mapper_.SetStereo(true, atras, frente, convergencia, !vertical_flip_.load(), janela);
+
+		// Uma linha quando o que vale muda. A forca em porcentagem nao diz
+		// quanto a cena afunda -- isso depende da IPD, da distancia e do
+		// tamanho da tela --, e foi por o diario nao mostrar o valor aplicado
+		// que um teto engoliu o botao de forca sem ninguem ver.
+		if(std::fabs(atras - logged_stereo_back_) > 1e-5f
+				|| std::fabs(convergencia - logged_stereo_convergence_) > 1e-4f
+				|| salta != logged_pop_out_)
 		{
-			// Largura da tela em metros, e quanto dela a IPD ocupa. Essa fracao
-			// e a separacao maxima admissivel, em fracao da largura da imagem.
-			float largura_m = 2.0f * params.radius * std::tan(params.centralAngle * 0.5f);
-			teto = ipd / std::max(largura_m, 0.01f);
+			logged_pop_out_ = salta;
+			if(salta)
+				LOGI("3D pop-out: floating window %.2f%% of width per eye", (double)(janela * 100.0f));
+			logged_stereo_back_ = atras;
+			logged_stereo_convergence_ = convergencia;
+			const float fundo = v_fundo > 1e-3f ? 1.0f / v_fundo : 0.0f;
+			const float perto = frente > 0.0f ? 1.0f / v_perto : distancia;
+			LOGI("3D disparity: behind %.2f%% of width (far end ~%.1f m), in front %.2f%% "
+					"(near end ~%.1f m), convergence %.0f%%, one-eye edge strip up to %.2f%% | "
+					"IPD %.1f mm, screen %.2f m wide at %.1f m",
+					(double)(atras * 100.0f), (double)fundo, (double)(frente * 100.0f),
+					(double)perto, (double)(convergencia * 100.0f),
+					(double)(100.0f * std::max(atras, frente)),
+					(double)(ipd * 1000.0f), (double)largura_m, (double)distancia);
 		}
-		// Metade do teto teorico: a divergencia comeca a incomodar bem antes de
-		// ser geometricamente impossivel, e o palpite de profundidade erra.
-		float forca = std::min(stereo_strength_.load(), teto * 0.5f);
-		tone_mapper_.SetStereo(true, forca, stereo_convergence_.load(),
-				!vertical_flip_.load());
 	}
 	else
-		tone_mapper_.SetStereo(false, 0.0f, 0.0f, true);
+		tone_mapper_.SetStereo(false, 0.0f, 0.0f, 1.0f, true);
 
 	// O olho direito, quando existe, e adquirido junto: o desenho dos dois
 	// acontece numa passada so do tone mapper, que assim consome um quadro do
@@ -1292,6 +1441,12 @@ jobject XrVideoSession::CreateVideoSurface(JNIEnv *env, int32_t width, int32_t h
 
 	video_width_ = width;
 	video_height_ = height;
+	// O decodificador desta sessao ainda nao contou o tamanho; o da sessao
+	// anterior podia ser de outra resolucao, e cortaria errado ate a primeira
+	// contagem nova. Este Surface e que vai nascer o decodificador, entao
+	// zerar aqui vem sempre antes.
+	g_decoder_height.store(0);
+	logged_direct_rows_ = -1;
 	{
 		std::lock_guard<std::mutex> lock(params_mutex_);
 		params_.aspectRatio = (float)width / (float)height;
@@ -1299,8 +1454,10 @@ jobject XrVideoSession::CreateVideoSurface(JNIEnv *env, int32_t width, int32_t h
 
 	LOGI("Video swapchain created: %dx%d (create_info_fb=%d)", width, height,
 			(int)surface_swapchain_create_supported_);
-	// Devolvemos referencia global: o Surface vai viver no lado Kotlin.
-	return env->NewGlobalRef(surface);
+	// Devolvida como veio: o retorno do JNI ja entrega ao Kotlin uma
+	// referencia que o coletor acompanha. A global que ia aqui nunca era
+	// apagada, e prendia um Surface por sessao ate o processo morrer.
+	return surface;
 }
 
 void XrVideoSession::SetScreenParams(const ScreenParams &params)
@@ -1317,6 +1474,8 @@ void XrVideoSession::SetQualityParams(const QualityParams &params)
 {
 	{
 		std::lock_guard<std::mutex> lock(params_mutex_);
+		if(params.frameExtrapolation != quality_.frameExtrapolation)
+			LOGI("Quality: frame extrapolation %s", params.frameExtrapolation ? "on" : "off");
 		quality_ = params;
 	}
 	if(passthrough_layer_ != XR_NULL_HANDLE && pfnPassthroughLayerSetStyleFB)
@@ -1365,13 +1524,17 @@ void XrVideoSession::SetQualityParams(const QualityParams &params)
 	}
 }
 
-float XrVideoSession::SelectDisplayRefreshRate(int sourceFps)
+float XrVideoSession::SelectDisplayRefreshRate(int sourceFps, int maxHz)
 {
+	if(maxHz < 72)
+		maxHz = 120;
+	refresh_max_hz_.store(maxHz);
 	// Pedido cedo demais nao vale nada: enquanto a sessao nao passa pelo
 	// xrBeginSession o runtime da Meta responde XR_SUCCESS com lista vazia, e
 	// era exatamente isso que o log mostrava -- "devolveu 0 taxas: XR_SUCCESS".
 	// Entao o pedido fica guardado e o frame loop o cumpre assim que a sessao
 	// comeca de fato.
+	refresh_fps_wanted_.store(sourceFps);
 	if(!session_running_)
 	{
 		pending_refresh_fps_.store(sourceFps);
@@ -1443,22 +1606,43 @@ float XrVideoSession::SelectDisplayRefreshRate(int sourceFps)
 		LOGI("Rates the panel offers: %s", list.c_str());
 	}
 
-	// Preferimos o maior multiplo inteiro do framerate da fonte: assim cada
-	// frame do console ocupa um numero inteiro de frames do painel e a cadencia
-	// fica uniforme. So se nenhum multiplo existir e que caimos na maior taxa.
+	// Preferimos o maior multiplo inteiro do framerate da fonte ate o teto
+	// (120 Hz padrao, 180 opcional): assim cada frame do console ocupa um
+	// numero inteiro de frames do painel e a cadencia fica uniforme. So se
+	// nenhum multiplo existir e que caimos na maior taxa ate o teto.
 	float best = 0.0f;
 	for(float rate : rates)
 	{
 		float ratio = rate / (float)sourceFps;
 		bool integral = std::fabs(ratio - std::round(ratio)) < 0.01f && ratio >= 1.0f;
-		if(integral && rate > best)
+		if(integral && rate <= (float)maxHz + 0.5f && rate > best)
 			best = rate;
 	}
 	if(best <= 0.0f)
 	{
+		// Em 18/11/2026 (adb, VrApi em FPS=72) o runtime passou a devolver uma
+		// lista so com 72 -- antes vinha vazia e o pedido as cegas abaixo dava
+		// 120. A lista curta nao quer dizer que o painel recuse: pedir o
+		// multiplo antes de aceitar o judder, como no caso da lista vazia.
+		const float kBlind[] = { 120.0f, 90.0f };
+		for(float rate : kBlind)
+		{
+			if(rate > (float)maxHz + 0.5f)
+				continue;
+			res = pfnRequestDisplayRefreshRateFB(session_, rate);
+			if(XR_SUCCEEDED(res))
+			{
+				LOGI("Panel at %.1f Hz, asked for although the list did not offer it", rate);
+				return rate;
+			}
+			LOGW("Request for %.1f Hz outside the list refused: %s", rate,
+					XrResultStr(instance_, res));
+		}
 		for(float rate : rates)
-			if(rate > best)
+			if(rate <= (float)maxHz + 0.5f && rate > best)
 				best = rate;
+		if(best <= 0.0f)
+			best = rates.front();
 		LOGW("No rate that is a multiple of %d Hz; using %.1f Hz and accepting judder",
 				sourceFps, best);
 	}
@@ -1642,6 +1826,10 @@ void XrVideoSession::StartFrameLoop()
 {
 	if(running_.exchange(true))
 		return;
+	// Uma thread que saiu sozinha (o eglMakeCurrent dela falhou) ainda precisa
+	// de join: atribuir por cima de uma std::thread nao juntada aborta o app.
+	if(frame_thread_.joinable())
+		frame_thread_.join();
 	// Quem chama isto e a activity, na thread principal do app -- e este e o
 	// unico ponto em que temos o tid dela. O frame loop precisa dele para
 	// declara-la ao runtime, e la dentro `gettid()` ja devolveria outra coisa.
@@ -1651,10 +1839,14 @@ void XrVideoSession::StartFrameLoop()
 
 void XrVideoSession::StopFrameLoop()
 {
-	if(!running_.exchange(false))
-		return;
+	// O join vem antes de olhar se o loop rodava: a thread que desiste no
+	// eglMakeCurrent zera running_ sozinha, e sair cedo aqui a deixava sem
+	// join -- o destrutor de uma std::thread nessa situacao chama terminate.
+	const bool rodava = running_.exchange(false);
 	if(frame_thread_.joinable())
 		frame_thread_.join();
+	if(!rodava)
+		return;
 
 	// Terminar a sessao aqui, e nao por sorte de agendamento.
 	//
@@ -1797,7 +1989,18 @@ void XrVideoSession::PollEvents()
 			case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
 				LOGW("The OpenXR instance will be lost; ending the loop");
 				exit_requested_ = true;
+				session_ended_ = true;
 				break;
+			case XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB:
+			{
+				// Quem troca a taxa por fora e o sistema; o diario precisa ver,
+				// porque 60 fps num painel que nao e multiplo de 60 e engasgo.
+				const auto *rate =
+						reinterpret_cast<const XrEventDataDisplayRefreshRateChangedFB *>(&event);
+				LOGI("Panel rate changed: %.1f -> %.1f Hz", rate->fromDisplayRefreshRate,
+						rate->toDisplayRefreshRate);
+				break;
+			}
 			default:
 				break;
 		}
@@ -1828,19 +2031,28 @@ static const char *XrSessionStateStr(XrSessionState state)
 void XrVideoSession::HandleSessionStateChange(XrSessionState state)
 {
 	LOGI("OpenXR session state: %s", XrSessionStateStr(state));
-	session_state_ = state;
 	switch(state)
 	{
 		case XR_SESSION_STATE_READY:
 		{
 			XrSessionBeginInfo begin{XR_TYPE_SESSION_BEGIN_INFO};
 			begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-			if(XR_SUCCEEDED(xrBeginSession(session_, &begin)))
+			XrResult res = xrBeginSession(session_, &begin);
+			if(XR_FAILED(res))
+				LOGE("xrBeginSession failed: %s; nothing will be shown until the next READY",
+						XrResultStr(instance_, res));
+			else
 			{
 				session_running_ = true;
+				// Em todo READY, e nao so no primeiro: depois de tirar o
+				// headset ou abrir o menu do sistema a sessao passa por
+				// STOPPING e READY de novo, e nada garante que o runtime
+				// devolva a taxa que tinhamos pedido.
 				int fps = pending_refresh_fps_.exchange(0);
+				if(fps <= 0)
+					fps = refresh_fps_wanted_.load();
 				if(fps > 0)
-					SelectDisplayRefreshRate(fps);
+					SelectDisplayRefreshRate(fps, refresh_max_hz_.load());
 				ApplyPerformanceLevels();
 				InitPerformanceMetrics();
 			}
@@ -1856,6 +2068,7 @@ void XrVideoSession::HandleSessionStateChange(XrSessionState state)
 					XrSessionStateStr(state));
 			session_running_ = false;
 			exit_requested_ = true;
+			session_ended_ = true;
 			break;
 		default:
 			break;
@@ -1866,12 +2079,30 @@ void XrVideoSession::RenderFrame()
 {
 	XrFrameWaitInfo wait_info{XR_TYPE_FRAME_WAIT_INFO};
 	XrFrameState frame_state{XR_TYPE_FRAME_STATE};
-	if(XR_FAILED(xrWaitFrame(session_, &wait_info, &frame_state)))
+	XrResult wait_res = xrWaitFrame(session_, &wait_info, &frame_state);
+	if(XR_FAILED(wait_res))
+	{
+		// O xrWaitFrame e quem da o ritmo ao loop; falhando, o loop girava
+		// sem pausa nenhuma, um nucleo inteiro por nada.
+		if(wait_res == XR_ERROR_SESSION_LOST || wait_res == XR_ERROR_INSTANCE_LOST)
+		{
+			LOGE("xrWaitFrame: %s; the immersive session is over", XrResultStr(instance_, wait_res));
+			session_ended_ = true;
+			exit_requested_ = true;
+			return;
+		}
+		ContarFalhaDeQuadro("xrWaitFrame", wait_res);
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
 		return;
+	}
 
 	XrFrameBeginInfo begin_info{XR_TYPE_FRAME_BEGIN_INFO};
-	if(XR_FAILED(xrBeginFrame(session_, &begin_info)))
+	XrResult begin_res = xrBeginFrame(session_, &begin_info);
+	if(XR_FAILED(begin_res))
+	{
+		ContarFalhaDeQuadro("xrBeginFrame", begin_res);
 		return;
+	}
 
 	// Localizar as views todo frame e o que qualquer app OpenXR faz. A camada e
 	// posicionada no espaco LOCAL e nao por olho, entao a pose em si nao e
@@ -1896,12 +2127,16 @@ void XrVideoSession::RenderFrame()
 		// tela seria duplicar um numero que o sistema ja tem certo, e um
 		// palpite errado brigaria com o valor bom.
 		//
-		// Onde ela vai importar e no olho sintetizado, e por um motivo so:
-		// disparidade maior que a IPD obriga os olhos a divergir, o que nao e
-		// desconforto, e impossivel -- nenhum par de olhos gira para fora. E o
-		// teto rigido da forca do efeito, e ele sai daqui de graca.
-		if(located >= 2 && !logged_ipd_ &&
-				(view_state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT))
+		// Onde ela importa e no olho sintetizado: ela escala a separacao que
+		// cada profundidade recebe, e da o teto rigido -- disparidade maior
+		// que a IPD obriga os olhos a divergir, o que nao e desconforto, e
+		// impossivel. Nenhum par de olhos gira para fora.
+		//
+		// Lida todo quadro, e nao uma vez so: a roda de IPD do Quest se mexe
+		// com a sessao aberta, e o valor guardado na abertura passava a estar
+		// errado sem nada dizer. Escrever um float atomico por quadro nao
+		// aparece na conta. O diario continua falando uma vez.
+		if(located >= 2 && (view_state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT))
 		{
 			const XrVector3f &a = views_[0].pose.position;
 			const XrVector3f &b = views_[1].pose.position;
@@ -1909,10 +2144,13 @@ void XrVideoSession::RenderFrame()
 			float ipd = std::sqrt(dx * dx + dy * dy + dz * dz);
 			if(ipd > 0.03f && ipd < 0.09f)
 			{
-				logged_ipd_ = true;
 				ipd_meters_.store(ipd);
-				LOGI("Interpupillary distance in use: %.1f mm (read from the runtime, "
-						"not asked for)", (double)(ipd * 1000.0f));
+				if(!logged_ipd_)
+				{
+					logged_ipd_ = true;
+					LOGI("Interpupillary distance in use: %.1f mm (read from the runtime, "
+							"not asked for)", (double)(ipd * 1000.0f));
+				}
 			}
 		}
 	}
@@ -1963,9 +2201,16 @@ void XrVideoSession::RenderFrame()
 			std::lock_guard<std::mutex> lock(params_mutex_);
 			recenter_orientation_ = QuatFromYaw(YawFromQuat(loc.pose.orientation));
 		}
+		else
+			// Sem rastreio ainda (o pedido da abertura chega antes dele): fica
+			// para o quadro seguinte, em vez de a tela nascer no yaw zero.
+			recenter_requested_ = true;
 	}
 
-	std::vector<const XrCompositionLayerBaseHeader *> layers;
+	// Reaproveitada de quadro em quadro: criar a lista a cada quadro era uma
+	// alocacao e uma liberacao por quadro, 90 a 120 vezes por segundo.
+	auto &layers = frame_layers_;
+	layers.clear();
 
 	XrCompositionLayerPassthroughFB passthrough_layer_info{XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB};
 	if(passthrough_supported_ && passthrough_enabled_)
@@ -2024,14 +2269,9 @@ void XrVideoSession::RenderFrame()
 		// Quando a camada e metade de uma textura maior, o MQSR e o automatico
 		// desenharam um X discreto atravessando a tela -- medido em hardware.
 		// O filtro nao foi feito para uma camada que e um recorte de outra.
-		//
-		// Isso hoje acontece so no estereo empacotado, em que o conteudo ja
-		// chega com os dois olhos numa imagem so e nao ha como nao recortar. No
-		// estereo que nos sintetizamos cada olho tem swapchain proprio e entra
-		// inteiro, entao o filtro vale como vale no mono.
-		const bool recorta_a_camada = stereo_mode_.load() != 0 && !stereo_synthetic_.load();
-		const bool compositor_owns_filter = !recorta_a_camada
-				&& (render_path_ == RenderPath::Direct
+		// No 3D emulado cada olho tem swapchain proprio e entra inteiro, entao o
+		// filtro vale como vale no mono.
+		const bool compositor_owns_filter = (render_path_ == RenderPath::Direct
 						|| quality.sharpness == Sharpness::Mqsr
 						|| quality.sharpness == Sharpness::Auto);
 		if(compositor_owns_filter)
@@ -2125,12 +2365,15 @@ void XrVideoSession::RenderFrame()
 		cylinder.subImage.swapchain = video_swapchain_;
 		cylinder.subImage.imageRect.offset = XrOffset2Di{0, 0};
 		cylinder.subImage.imageRect.extent = XrExtent2Di{video_width_, video_height_};
+		if(render_path_ == RenderPath::Direct)
+			cylinder.subImage.imageRect.extent.height = DirectContentHeight();
 		cylinder.subImage.imageArrayIndex = 0;
 
 		// A tela e um arco: a pose marca o eixo do cilindro, e o arco visivel
 		// fica centrado em -Z dessa pose. Yaw da recentragem + ajuste do usuario.
 		float yaw = YawFromQuat(recenter) + params.yawOffset;
-		cylinder.pose.orientation = QuatFromYaw(yaw);
+		const float tilt = ScreenTilt(params);
+		cylinder.pose.orientation = QuatFromYawPitch(yaw, tilt);
 		// Curvatura separada da distancia.
 		//
 		// Com a pose na origem, o olho fica no centro do cilindro e a tela sai
@@ -2145,12 +2388,13 @@ void XrVideoSession::RenderFrame()
 		const float curvature = params.curvature;
 		const float distance = params.radius;
 		const float arc_radius = distance / curvature;
-		const float axis_back = arc_radius - distance;
 
+		// O eixo fica atras do centro da tela ao longo da frente dela, e a
+		// frente inclina junto com a tela: sem inclinacao, e o recuo de sempre.
 		cylinder.pose.position = XrVector3f{
-			std::sin(yaw) * axis_back,
-			params.heightOffset,
-			std::cos(yaw) * axis_back
+			-std::sin(yaw) * distance + std::sin(yaw) * std::cos(tilt) * arc_radius,
+			params.heightOffset - std::sin(tilt) * arc_radius,
+			-std::cos(yaw) * distance + std::cos(yaw) * std::cos(tilt) * arc_radius
 		};
 		cylinder.radius = arc_radius;
 		// O arco tem de encolher junto com a curvatura, senao a tela cresceria
@@ -2170,7 +2414,10 @@ void XrVideoSession::RenderFrame()
 		// escolher o tamanho se puder ser visto *enquanto* se escolhe -- num log
 		// lido depois ele conta o que ja passou. Custa uma chamada por quadro e
 		// vai para atomicos, que e de onde o painel de ajuste o le.
-		if(recommended_resolution_supported_ && pfnGetRecommendedLayerResolutionMETA)
+		// Quem le e o painel de ajuste, e ele so existe com o HUD a mostra; fora
+		// dele basta a leitura do primeiro quadro, que vai para o diario.
+		if(recommended_resolution_supported_ && pfnGetRecommendedLayerResolutionMETA
+				&& (hud_visible_.load() || !logged_layer_config_))
 		{
 			XrRecommendedLayerResolutionGetInfoMETA info{
 					XR_TYPE_RECOMMENDED_LAYER_RESOLUTION_GET_INFO_META};
@@ -2226,44 +2473,16 @@ void XrVideoSession::RenderFrame()
 		// continua do mesmo tamanho e no mesmo lugar --, so muda o que cada olho
 		// enxerga.
 		//
-		// Duas formas de chegar la. No estereo que nos sintetizamos cada olho ja
-		// tem um swapchain proprio, e a camada leva a imagem inteira dele. No
-		// empacotado ha uma imagem so com os dois olhos dentro, e a camada leva
-		// metade dela.
-		const int stereo = stereo_mode_.load();
-		if(stereo != 0)
+		// Um swapchain por olho, imagem inteira em cada camada. Se o segundo
+		// alvo nao existir -- criacao falhou, ou o quadro nao pode ser
+		// adquirido --, os dois olhos veem o esquerdo: um quadro sem
+		// profundidade se nota menos do que um olho vazio.
+		const bool stereo = stereo_synthetic_.load();
+		if(stereo)
 		{
 			cylinder_right = cylinder;
-			if(stereo_synthetic_.load())
-			{
-				// Nosso estereo: um swapchain por olho, imagem inteira em cada
-				// camada. Se o segundo alvo nao existir -- criacao falhou, ou o
-				// quadro nao pode ser adquirido --, os dois olhos veem o
-				// esquerdo. Um quadro sem profundidade se nota menos do que meia
-				// imagem esticada, que e o que o recorte abaixo faria com um
-				// alvo que nao tem mais o dobro da largura.
-				if(video_swapchain_right_ != XR_NULL_HANDLE && right_layer_ready_)
-					cylinder_right.subImage.swapchain = video_swapchain_right_;
-			}
-			else
-			{
-				XrRect2Di esquerdo = cylinder.subImage.imageRect;
-				XrRect2Di direito = esquerdo;
-				if(stereo == 1)
-				{
-					esquerdo.extent.width /= 2;
-					direito.extent.width /= 2;
-					direito.offset.x += esquerdo.extent.width;
-				}
-				else
-				{
-					esquerdo.extent.height /= 2;
-					direito.extent.height /= 2;
-					direito.offset.y += esquerdo.extent.height;
-				}
-				cylinder.subImage.imageRect = esquerdo;
-				cylinder_right.subImage.imageRect = direito;
-			}
+			if(video_swapchain_right_ != XR_NULL_HANDLE && right_layer_ready_)
+				cylinder_right.subImage.swapchain = video_swapchain_right_;
 			cylinder.eyeVisibility = XR_EYE_VISIBILITY_LEFT;
 			cylinder_right.eyeVisibility = XR_EYE_VISIBILITY_RIGHT;
 		}
@@ -2271,7 +2490,7 @@ void XrVideoSession::RenderFrame()
 		if(layer_shape_.load() == LayerShape::Cylinder)
 		{
 			layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader *>(&cylinder));
-			if(stereo != 0)
+			if(stereo)
 				layers.push_back(
 						reinterpret_cast<const XrCompositionLayerBaseHeader *>(&cylinder_right));
 		}
@@ -2293,7 +2512,7 @@ void XrVideoSession::RenderFrame()
 			// A pose do cilindro marca o eixo; a do quad marca o centro da tela,
 			// entao ele precisa ser empurrado para a frente pelo raio.
 			float yaw = YawFromQuat(recenter) + params.yawOffset;
-			quad.pose.orientation = QuatFromYaw(yaw);
+			quad.pose.orientation = QuatFromYawPitch(yaw, ScreenTilt(params));
 			quad.pose.position = XrVector3f{
 				-std::sin(yaw) * params.radius,
 				params.heightOffset,
@@ -2301,7 +2520,7 @@ void XrVideoSession::RenderFrame()
 			};
 
 			layers.push_back(reinterpret_cast<const XrCompositionLayerBaseHeader *>(&quad));
-			if(stereo != 0)
+			if(stereo)
 			{
 				quad_right = quad;
 				quad_right.eyeVisibility = cylinder_right.eyeVisibility;
@@ -2324,7 +2543,8 @@ void XrVideoSession::RenderFrame()
 			params = params_;
 			recenter = recenter_orientation_;
 		}
-		if(UpdateHudLayer(hud_layer, YawFromQuat(recenter) + params.yawOffset))
+		if(UpdateHudLayer(hud_layer, YawFromQuat(recenter) + params.yawOffset, params,
+				hud_below_screen_.load()))
 		{
 			// Mesma inversao de origem do video: a linha zero da textura fica
 			// na base pela convencao do GL, e o painel foi desenhado de cima
@@ -2363,7 +2583,24 @@ void XrVideoSession::RenderFrame()
 			LOGI("Local dimming attached to the frame (off while passthrough is on)");
 		}
 	}
-	xrEndFrame(session_, &end_info);
+	XrResult end_res = xrEndFrame(session_, &end_info);
+	if(XR_FAILED(end_res))
+		ContarFalhaDeQuadro("xrEndFrame", end_res);
+}
+
+// Uma camada recusada vira quadro preto sem mais nada: o runtime nao
+// escreve no diario. A primeira falha sai inteira, as seguintes em conta a
+// cada 10 s (a 120 Hz uma linha por falha afogaria o resto).
+void XrVideoSession::ContarFalhaDeQuadro(const char *chamada, XrResult res)
+{
+	const auto agora = std::chrono::steady_clock::now();
+	++frame_failures_;
+	if(frame_failures_ == 1 || agora - last_failure_log_ >= std::chrono::seconds(10))
+	{
+		last_failure_log_ = agora;
+		LOGE("%s failed: %s (%u frame call failures in this session)", chamada,
+				XrResultStr(instance_, res), frame_failures_);
+	}
 }
 
 void XrVideoSession::Destroy()
@@ -2388,7 +2625,21 @@ void XrVideoSession::Destroy()
 		xrDestroySwapchain(video_swapchain_right_);
 	video_swapchain_right_ = XR_NULL_HANDLE;
 
+	// O loop soltou o contexto ao sair, e o que vem abaixo e GL: sem contexto
+	// corrente o glDelete* e o detach da SurfaceTexture viram nada, em
+	// silencio, e o que eles deviam soltar fica ate o eglDestroyContext.
+	const bool com_contexto = egl_display_ != EGL_NO_DISPLAY && egl_context_ != EGL_NO_CONTEXT
+			&& eglMakeCurrent(egl_display_, egl_surface_, egl_surface_, egl_context_);
+	if(!com_contexto && egl_display_ != EGL_NO_DISPLAY)
+		LOGW("Session release: no GL context for the teardown (0x%x)", eglGetError());
 	tone_mapper_.Destroy();
+	// Entregue pelo Kotlin mas nunca anexada (a sessao acabou antes do
+	// primeiro quadro): so o Attach passava a posse ao tone mapper.
+	if(pending_surface_texture_)
+	{
+		ASurfaceTexture_release(pending_surface_texture_);
+		pending_surface_texture_ = nullptr;
+	}
 	tone_mapper_ready_ = false;
 	video_images_.clear();
 	video_images_right_.clear();
@@ -2427,3 +2678,52 @@ void XrVideoSession::Destroy()
 }
 
 } // namespace p5m
+
+namespace p5m {
+
+/**
+ * Quantas linhas do swapchain direto sao imagem, e nao enchimento do codec.
+ *
+ * O runtime estica o buffer inteiro do decodificador sobre as linhas do
+ * swapchain, sem olhar o recorte. Com buffer de 1088 para fonte de 1080, as 8
+ * de sobra viram a faixa no pe da tela e o resto sai 0,7% achatado. O conteudo
+ * de verdade ocupa entao 1080 * 1080 / 1088 = 1072 linhas do swapchain, e e so
+ * isso que a camada passa a mostrar.
+ *
+ * Nada muda enquanto o decodificador nao contar o tamanho, nem quando o buffer
+ * ja vier do tamanho da fonte: nao se corta nada por regra fixa.
+ */
+int32_t XrVideoSession::DirectContentHeight()
+{
+	const int32_t decoded = g_decoder_height.load();
+	if(video_height_ <= 0 || decoded <= video_height_)
+		return video_height_;
+	int32_t content = video_height_;
+	const int32_t top = g_decoder_crop_top.load(), bottom = g_decoder_crop_bottom.load();
+	if(top >= 0 && bottom >= top)
+		content = std::min(bottom - top + 1, decoded);
+	const int32_t rows = (int32_t)std::lround((double)video_height_ * content / decoded);
+	if(rows != logged_direct_rows_)
+	{
+		logged_direct_rows_ = rows;
+		LOGI("Direct path: decoder buffer %dx%d for a %dx%d swapchain; showing the top %d rows "
+				"(%d of the buffer are picture, the rest codec padding)",
+				g_decoder_width.load(), decoded, video_width_, video_height_, rows, content);
+	}
+	return rows;
+}
+
+} // namespace p5m
+
+/**
+ * Chamado pelo decodificador do chiaki (patch 0033) quando o formato de saida
+ * muda. Recorte -1 e "nao informado".
+ */
+extern "C" void p5m_video_decoder_size(int32_t width, int32_t height, int32_t crop_top,
+		int32_t crop_bottom)
+{
+	p5m::g_decoder_width.store(width);
+	p5m::g_decoder_crop_top.store(crop_top);
+	p5m::g_decoder_crop_bottom.store(crop_bottom);
+	p5m::g_decoder_height.store(height);
+}

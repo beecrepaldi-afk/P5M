@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Cartao de vidro do P5M (dev.213), o mesmo de Estilo.tocavel: branco
+     translucido mais claro em cima, borda fina de luz, e mais claro com foco. -->
+<selector xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:state_focused="true" android:drawable="@drawable/p5m_vidro_aceso" />
+    <item android:state_hovered="true" android:drawable="@drawable/p5m_vidro_aceso" />
+    <item android:state_pressed="true" android:drawable="@drawable/p5m_vidro_aceso" />
+    <item>
+        <shape android:shape="rectangle">
+            <corners android:radius="18dp" />
+            <gradient android:angle="270" android:startColor="#1EFFFFFF" android:endColor="#0CFFFFFF" />
+            <stroke android:width="1dp" android:color="#2EFFFFFF" />
+        </shape>
+    </item>
+</selector>

@@ -1,0 +1,81 @@
+diff --git a/android/app/src/main/cpp/chiaki-jni.c b/android/app/src/main/cpp/chiaki-jni.c
+index cf19b8b..8a4be0e 100644
+--- a/android/app/src/main/cpp/chiaki-jni.c
++++ b/android/app/src/main/cpp/chiaki-jni.c
+@@ -12,6 +12,10 @@
+ #include <chiaki/remote/holepunch.h>
+ 
+ #include <string.h>
++#include <errno.h>
++#include <unistd.h>
++#include <sys/resource.h>
++#include <chiaki/thread.h>
+ #include <linux/in.h>
+ #include <linux/in6.h>
+ #include <arpa/inet.h>
+@@ -76,9 +80,37 @@ static jobject get_kotlin_global_object(JNIEnv *env, const char *id)
+ static ChiakiLog global_log;
+ JavaVM *global_vm;
+ 
++/*
++ * P5M: prioridade das threads do caminho quente.
++ *
++ * Nenhuma thread do stream pedia prioridade: a recepcao da rede (que tambem
++ * entrega os quadros ao decodificador) e o envio do estado do controle
++ * disputavam CPU no mesmo nivel que qualquer tarefa do sistema. A lib ja chama
++ * este gancho no inicio de cada thread dela, pelo nome -- entao a prioridade
++ * entra por aqui, sem mexer no motor. Os valores sao os do Android para video
++ * (-10) e para exibicao urgente (-8).
++ */
++static void p5m_thread_priority(ChiakiThreadName name, void *user)
++{
++	(void)user;
++	int nice_value;
++	const char *nome;
++	switch(name)
++	{
++		case CHIAKI_THREAD_NAME_TAKION: nice_value = -10; nome = "network receive"; break;
++		case CHIAKI_THREAD_NAME_FEEDBACK: nice_value = -8; nome = "controller state send"; break;
++		default: return;
++	}
++	if(setpriority(PRIO_PROCESS, gettid(), nice_value) == 0)
++		__android_log_print(ANDROID_LOG_INFO, "P5MVR", "Thread priority: %s at %d", nome, nice_value);
++	else
++		__android_log_print(ANDROID_LOG_WARN, "P5MVR", "Thread priority: %s refused (%s)", nome, strerror(errno));
++}
++
+ JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *reserved)
+ {
+ 	global_vm = vm;
++	chiaki_thread_set_affinity_cb(p5m_thread_priority, NULL);
+ 
+ 	android_chiaki_file_log_init(&global_log, CHIAKI_LOG_ALL & ~CHIAKI_LOG_VERBOSE, NULL);
+ 	CHIAKI_LOGI(&global_log, "Loading Chiaki Library");
+diff --git a/android/app/src/main/cpp/video-decoder.c b/android/app/src/main/cpp/video-decoder.c
+index 5302260..48a4559 100644
+--- a/android/app/src/main/cpp/video-decoder.c
++++ b/android/app/src/main/cpp/video-decoder.c
+@@ -9,6 +9,9 @@
+ #include <android/native_window_jni.h>
+ 
+ #include <string.h>
++#include <sys/resource.h>
++#include <unistd.h>
++#include <errno.h>
+ #include <stdint.h>
+ #include <android/log.h>
+ 
+@@ -551,6 +554,13 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
+ {
+ 	AndroidChiakiVideoDecoder *decoder = user;
+ 
++	// P5M: a saida do decodificador e o ultimo passo antes da tela; sem
++	// prioridade ela esperava na fila do escalonador junto com o resto.
++	if(setpriority(PRIO_PROCESS, gettid(), -10) == 0)
++		__android_log_print(ANDROID_LOG_INFO, "P5MVR", "Thread priority: decoder output at -10");
++	else
++		__android_log_print(ANDROID_LOG_WARN, "P5MVR", "Thread priority: decoder output refused (%s)", strerror(errno));
++
+ 	// P5M: uma vez por sessao. Com saida em Surface nem todo codec emite
+ 	// OUTPUT_FORMAT_CHANGED, entao o primeiro buffer entregue serve de segunda
+ 	// chance -- consultar o formato so no evento deixaria o log mudo justamente

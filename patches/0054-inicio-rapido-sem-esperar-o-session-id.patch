@@ -1,0 +1,57 @@
+diff --git a/lib/include/chiaki/ctrl.h b/lib/include/chiaki/ctrl.h
+index 9d17f45d..d1c3b277 100644
+--- a/lib/include/chiaki/ctrl.h
++++ b/lib/include/chiaki/ctrl.h
+@@ -43,6 +43,8 @@ typedef struct chiaki_ctrl_t
+ 	ChiakiMutex notif_mutex;
+ 
+ 	bool login_pin_requested;
++	// P5M: recursos ja ligados e id reserva ja posto logo apos o login (patch 0054)
++	bool p5m_features_sent;
+ 	bool cant_displaya;
+ 	bool cant_displayb;
+ 
+diff --git a/lib/src/ctrl.c b/lib/src/ctrl.c
+index febcfcde..af00dfdc 100644
+--- a/lib/src/ctrl.c
++++ b/lib/src/ctrl.c
+@@ -153,6 +153,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_ctrl_init(ChiakiCtrl *ctrl, ChiakiSession *
+ 	ctrl->should_stop = false;
+ 	ctrl->login_pin_entered = false;
+ 	ctrl->login_pin_requested = false;
++	ctrl->p5m_features_sent = false;
+ 	ctrl->login_pin = NULL;
+ 	ctrl->login_pin_size = 0;
+ 	ctrl->cant_displaya = false;
+@@ -863,7 +864,10 @@ static void ctrl_message_received(ChiakiCtrl *ctrl, uint16_t msg_type, uint8_t *
+ 	{
+ 		case CTRL_MESSAGE_TYPE_SESSION_ID:
+ 			ctrl_message_received_session_id(ctrl, payload, payload_size);
+-			ctrl_enable_features(ctrl);
++			// P5M: no caminho rapido (patch 0054) os recursos ja foram ligados
++			// no login; liga-los de novo duplicaria as mensagens.
++			if(!ctrl->p5m_features_sent)
++				ctrl_enable_features(ctrl);
+ 			break;
+ 		case CTRL_MESSAGE_TYPE_HEARTBEAT_REQ:
+ 			ctrl_message_received_heartbeat_req(ctrl, payload, payload_size);
+@@ -1078,6 +1082,19 @@ static void ctrl_message_received_login(ChiakiCtrl *ctrl, uint8_t *payload, size
+ 		case CTRL_LOGIN_STATE_SUCCESS:
+ 			CHIAKI_LOGI(ctrl->session->log, "Ctrl received Login message: success");
+ 			ctrl->login_pin_requested = false;
++			// P5M (patch 0054): na LAN o PS5 responde "InvalidSessionId" sempre
++			// 2,0 s depois do login (medido em 18/11/2026: 1,910, 1,995 e
++			// 1,996 s), e o chiaki so liga os recursos (DualSense, microfone,
++			// telas) e segue com o id reserva depois disso. Aqui os dois
++			// acontecem ja no login. Pela PSN o id do console vale e a espera
++			// continua.
++			if(!ctrl->session->holepunch_session && !ctrl->p5m_features_sent)
++			{
++				CHIAKI_LOGW(ctrl->session->log, "P5M: fast start, features and fallback session id right after login");
++				ctrl->p5m_features_sent = true;
++				ctrl_enable_features(ctrl);
++				ctrl_message_set_fallback_session_id(ctrl);
++			}
+ 			break;
+ 		case CTRL_LOGIN_STATE_PIN_INCORRECT:
+ 			CHIAKI_LOGI(ctrl->session->log, "Ctrl received Login message: PIN incorrect");

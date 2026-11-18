@@ -17,30 +17,75 @@ def p5mVersionName = System.getenv("P5M_VERSION_NAME")
 // O submodulo fica intocado no git. Algumas mudancas, porem, so podem ser feitas
 // por dentro dele: as chaves de baixa latencia moram no C do decodificador, e o
 // redirecionamento da MainActivity para a activity imersiva e uma linha do
-// Kotlin dele. Aplicamos como patch idempotente antes de qualquer compilacao --
-// se ja estiver aplicado, a task nao faz nada.
+// Kotlin dele. Aplicamos os patches antes de qualquer compilacao.
+//
+// Os patches se aplicam em serie, cada um sobre o resultado do anterior, e
+// varios tocam o mesmo arquivo -- entao nao da para perguntar a cada um, em
+// separado, se "ja esta aplicado" (o --reverse --check de um patch falha
+// quando um posterior mexeu nas mesmas linhas). Em vez disso, depois de
+// aplicar a serie inteira gravamos um carimbo com o hash dela e o hash do
+// estado resultante do submodulo. Os dois batendo: nada a fazer. Qualquer
+// outro caso (build anterior que parou no meio, patch novo vindo do git,
+// submodulo mexido a mao, `gradlew clean`) volta o
+// submodulo ao commit fixado -- inclusive apagando arquivos que patches
+// criaram -- e reaplica tudo.
 def applyChiakiPatches = tasks.register('applyChiakiPatches') {
     doLast {
         def patchDir = file("$rootDir/patches")
         if (!patchDir.exists()) return
-        patchDir.listFiles().findAll { it.name.endsWith('.patch') }.sort().each { patch ->
-            def alreadyApplied = providers.exec {
-                commandLine 'git', '-C', chiakiNg.absolutePath, 'apply', '--check', '--reverse', patch.absolutePath
+        def patches = patchDir.listFiles().findAll { it.name.endsWith('.patch') }.sort()
+
+        def digest = java.security.MessageDigest.getInstance('SHA-256')
+        patches.each { digest.update(it.name.bytes); digest.update(it.bytes) }
+        def serie = digest.digest().encodeHex().toString()
+        def carimbo = file("$buildDir/chiaki-patches.sha256")
+
+        def git = { List<String> args ->
+            def saida = providers.exec {
+                commandLine(['git', '-C', chiakiNg.absolutePath] + args)
                 ignoreExitValue = true
-            }.result.get().exitValue == 0
-            if (alreadyApplied) {
-                logger.lifecycle("Patch ja aplicado, pulando: ${patch.name}")
-                return
             }
-            def result = providers.exec {
-                commandLine 'git', '-C', chiakiNg.absolutePath, 'apply', patch.absolutePath
-                ignoreExitValue = true
-            }.result.get()
-            if (result.exitValue != 0) {
-                throw new GradleException("Falha ao aplicar ${patch.name} no submodulo chiaki-ng")
-            }
-            logger.lifecycle("Patch aplicado: ${patch.name}")
+            [codigo: saida.result.get().exitValue,
+             texto : saida.standardOutput.asText.get() + saida.standardError.asText.get()]
         }
+
+        // Diff dos arquivos versionados + conteudo dos arquivos novos que os
+        // patches criaram: muda se qualquer parte da serie faltar ou sobrar.
+        def estadoDoSubmodulo = {
+            def d = java.security.MessageDigest.getInstance('SHA-256')
+            d.update(git(['diff', 'HEAD', '--binary', '--ignore-submodules=all']).texto.bytes)
+            git(['ls-files', '--others', '--exclude-standard']).texto.readLines().findAll { it }.sort().each {
+                d.update(it.bytes); d.update(file("$chiakiNg/$it").bytes)
+            }
+            d.digest().encodeHex().toString()
+        }
+
+        def alterado = git(['status', '--porcelain', '--ignore-submodules=all']).texto.trim()
+        if (alterado && carimbo.exists() && carimbo.text.trim() == "$serie ${estadoDoSubmodulo()}") {
+            logger.lifecycle("Patches do chiaki-ng ja aplicados (${patches.size()}, serie ${serie.take(12)})")
+            return
+        }
+
+        carimbo.delete()
+        if (alterado) {
+            logger.lifecycle("Submodulo chiaki-ng alterado sem carimbo valido (build anterior interrompida ou patches novos): voltando ao commit fixado")
+            [['checkout', '--', '.'], ['clean', '-fdq']].each { args ->
+                def r = git(args)
+                if (r.codigo != 0) {
+                    throw new GradleException("Nao consegui limpar o submodulo chiaki-ng (git ${args.join(' ')}): ${r.texto.trim()}")
+                }
+            }
+        }
+
+        patches.each { patch ->
+            def r = git(['apply', patch.absolutePath])
+            if (r.codigo != 0) {
+                throw new GradleException("Falha ao aplicar ${patch.name} sobre o chiaki-ng limpo mais os patches anteriores -- o patch nao casa com a arvore: ${r.texto.trim()}")
+            }
+        }
+        carimbo.parentFile.mkdirs()
+        carimbo.text = "$serie ${estadoDoSubmodulo()}"
+        logger.lifecycle("Patches aplicados no chiaki-ng: ${patches.size()} (serie ${serie.take(12)})")
     }
 }
 
@@ -82,7 +127,7 @@ android {
                         "-DCHIAKI_ENABLE_ANDROID=ON",
                         "-DCHIAKI_ENABLE_FFMPEG_DECODER=OFF",
                         "-DCHIAKI_ENABLE_PI_DECODER=OFF",
-                        "-DCHIAKI_LIB_ENABLE_OPUS=OFF",
+                        "-DCHIAKI_LIB_ENABLE_OPUS=ON",
                         "-DCHIAKI_LIB_OPENSSL_EXTERNAL_PROJECT=ON",
                         "-DCHIAKI_LIB_JSONC_EXTERNAL_PROJECT=ON",
                         "-DCHIAKI_LIB_MINIUPNPC_EXTERNAL_PROJECT=ON",
@@ -137,14 +182,47 @@ android {
         jvmTarget = "1.8"
     }
 
+    // A chave de release vem da CI, e so nas tags v*: o workflow decodifica o
+    // secret num arquivo e aponta estas variaveis para ele. Sem elas (build
+    // local, ou push de branch) o release cai na chave de depuracao, como
+    // sempre foi -- nao ha como assinar sem a chave, e nao vale quebrar o
+    // build local por isso.
+    def chaveRelease = System.getenv("P5M_KEYSTORE")
+    signingConfigs {
+        if(chaveRelease) {
+            release {
+                storeFile file(chaveRelease)
+                storeType "pkcs12"
+                storePassword System.getenv("P5M_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("P5M_KEY_ALIAS") ?: "p5m"
+                keyPassword System.getenv("P5M_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         debug {
             // APK de uso pessoal: sem minify, para o stacktrace vir legivel.
             minifyEnabled false
+            // O nativo otimizado tambem aqui. O tipo Debug do CMake nao passa
+            // -O nenhum, e o APK de todo dia -- o dev, que e o que se joga e o
+            // que se mede -- rodava a libchiaki inteira (rede, FEC, montagem
+            // de quadro), o Opus do microfone e o espacializador em -O0. So as
+            // tags saiam otimizadas. -O2 pela flag, e nao trocando o tipo para
+            // RelWithDebInfo: aquele traz -DNDEBUG, que desliga os assert da
+            // libchiaki, e eles pegam defeito cedo. Os simbolos (-g) ficam.
+            externalNativeBuild {
+                cmake {
+                    cFlags "-O2"
+                    cppFlags "-O2"
+                }
+            }
         }
         release {
+            // Sem minify tambem aqui: o lado nativo acha classes e metodos
+            // Kotlin por nome, pelo JNI, e o R8 renomearia o que ele procura.
             minifyEnabled false
-            signingConfig signingConfigs.debug
+            signingConfig chaveRelease ? signingConfigs.release : signingConfigs.debug
         }
     }
 
@@ -152,6 +230,11 @@ android {
         jniLibs {
             useLegacyPackaging false
         }
+    }
+    // O modelo da profundidade neural e mapeado direto do APK pelo LiteRT,
+    // e mapear exige o asset sem compressao.
+    androidResources {
+        noCompress 'tflite'
     }
     lint {
         abortOnError false
@@ -210,10 +293,15 @@ dependencies {
     // Audio do chiaki-jni.
     implementation "com.google.oboe:oboe:1.9.3"
     // Loader OpenXR oficial do Khronos, com headers via prefab.
-    implementation "org.khronos.openxr:openxr_loader_for_android:1.1.41"
+    implementation "org.khronos.openxr:openxr_loader_for_android:1.1.65"
 
     // Alcanca BluetoothHidHost, que e @SystemApi e esta na lista de bloqueio
     // de API escondida. A isencao instalada em DualSenseHid nomeia tres
     // classes, e nao abre a lista inteira.
     implementation "org.lsposed.hiddenapibypass:hiddenapibypass:6.1"
+
+    // LiteRT (o TensorFlow Lite renomeado) e o delegate de GPU, Apache 2.0:
+    // rodam o ZipDepth da profundidade neural do 3D emulado.
+    implementation 'com.google.ai.edge.litert:litert:1.4.2'
+    implementation 'com.google.ai.edge.litert:litert-gpu:1.4.2'
 }

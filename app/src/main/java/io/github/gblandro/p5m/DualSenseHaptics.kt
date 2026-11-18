@@ -45,6 +45,13 @@ import com.metallic.chiaki.lib.Session
  */
 class DualSenseHaptics(private val context: Context, private val hid: DualSenseHid)
 {
+	/**
+	 * Intervalo das linhas "Haptics 10s" do diario. Variavel so para o teste de
+	 * regressao: com os 10 s de producao, tres casos passavam meio minuto
+	 * dormindo a espera do relatorio.
+	 */
+	internal var relatorioMs = RELATORIO_MS
+
 	companion object
 	{
 		// Relatorio 0x32: 142 bytes, 32 amostras estereo de 8 bits a 3 kHz.
@@ -96,7 +103,15 @@ class DualSenseHaptics(private val context: Context, private val hid: DualSenseH
 		// faltam cerca de 8,8 por segundo em relacao aos 3000 nominais.
 		// O efeito no controle ainda precisa ser medido; esta margem nao prova
 		// que a fila remota fica vazia nem que as lacunas sejam imperceptiveis.
-		private const val PERIODO_NANOS = 10_698_000L
+		//
+		// dev.205: a margem caiu de 0,3% (10.698.000) para 0,05%. Os 8,8
+		// quadros por segundo que faltavam nao somem: acumulam na NOSSA fila.
+		// Num efeito continuo ela subia ate o teto e ficava la -- a dev.204
+		// mediu 110-124 B de media (uns 20 ms de atraso parado) e 100-170 B
+		// descartados a cada 10 s, cada descarte um salto na onda. Diferenca
+		// real entre dois cristais e da ordem de 50 ppm; 0,05% (500 ppm) ainda
+		// cobre dez vezes isso, e acumula 1,5 quadro por segundo em vez de 8,8.
+		private const val PERIODO_NANOS = 10_672_000L
 
 		private const val RELATORIO_MS = 10_000L
 
@@ -165,7 +180,10 @@ class DualSenseHaptics(private val context: Context, private val hid: DualSenseH
 		// relatorio de folga, e qualquer oscilacao da rede saia como salto na
 		// onda ou silencio no meio dela. Dezesseis descontinuidades por segundo
 		// nao sao uma vibracao mais fraca: sao outra coisa, aspera.
-		private const val TETO_DA_FILA = 192
+		// dev.208: 192 -> 320. Com a reamostragem mirando 96 bytes, o teto so
+		// e alcancado por uma rajada grande; cortar em 192 jogava fora trilha
+		// que a razao ainda ia absorver.
+		private const val TETO_DA_FILA = 320
 
 		// A bancada agora tem um proposito so: mostrar o teto.
 		//
@@ -192,6 +210,13 @@ class DualSenseHaptics(private val context: Context, private val hid: DualSenseH
 		// rabo de um efeito, e efeito curto e quase so rabo -- o atraso que se
 		// sentia nos toques rapidos nascia aqui.
 		private const val VOLTAS_ATE_ESVAZIAR = 2
+
+		// Reamostragem do fluxo continuo (dev.208). 32 quadros estereo por
+		// relatorio; esticar ate 0,85 e comprimir ate 1,15 acima de 160 bytes.
+		private const val QUADROS_POR_RELATORIO = 32
+		private const val FILA_ALTA = 160.0
+		private const val RAZAO_MIN = 0.85
+		private const val RAZAO_MAX = 1.15
 	}
 
 	@Volatile private var rodando = false
@@ -223,6 +248,13 @@ class DualSenseHaptics(private val context: Context, private val hid: DualSenseH
 		private set
 
 	/**
+	 * A intensidade da vibracao escolhida no PS5, como fator de amplitude: 1
+	 * forte, 0,5 media, 0,33 fraca, 0 desligada (os fatores do chiaki-ng).
+	 * Aplicada nas amostras, e nao no byte 39 -- ver ForcaGatilhos.
+	 */
+	@Volatile var ganho = 1f
+
+	/**
 	 * Bancada: toca um tom conhecido na bobina, variando como a rota e armada.
 	 *
 	 * Existe porque a pergunta "a bobina toca?" nao pode depender de um jogo. Em
@@ -244,6 +276,13 @@ class DualSenseHaptics(private val context: Context, private val hid: DualSenseH
 		val saida = StringBuilder()
 		if(!hid.conectar())
 			return "DualSense bridge did not open.\n" + hid.texto()
+		// A mesma regra da sessao (dev.232): relatorio cru de DualSense so para
+		// um DualSense. Sem ela, a bancada tocava a bobina de um 8BitDo.
+		if(!hid.alvoEDualSense())
+		{
+			hid.fechar()
+			return "The controller on the HID bridge is not a DualSense; nothing was sent.\n" + hid.texto()
+		}
 
 		// Potencia cheia tambem aqui: sem isto a bancada mediria o teto que o
 		// ultimo dono da conexao deixou, e nao o do controle.
@@ -251,16 +290,40 @@ class DualSenseHaptics(private val context: Context, private val hid: DualSenseH
 		saida.append("full motor power ").append(if(cheia) "accepted" else "refused").append("\n")
 		dormir(200)
 
+		// Duas rodadas, e a diferenca entre elas e a pergunta.
+		//
+		// A dev.141 dizia que o controle so aceita o relatorio 0x32 depois de
+		// alguem ler a calibragem dele; a dev.179 tirou essa leitura porque ela
+		// atrasava a trilha em segundos, e desde entao ninguem sabe se a bobina
+		// ainda recebe. As duas nunca foram medidas na mesma rodada, porque cada
+		// uma exigia uma build e uma sessao com o console.
+		//
+		// Aqui exigem um toque no botao. Se so a segunda rodada for sentida, a
+		// leitura e obrigatoria e o conserto e faze-la uma vez so e conviver com
+		// o que ela custa; se as duas forem, ela nao e necessaria e o caminho de
+		// hoje esta certo; se nenhuma for, o modo do controle nao e o problema e
+		// nao adianta mexer nisso.
+		//
+		// dev.206: a segunda rodada (depois de ler a calibragem) saiu. A leitura
+		// deixa o enlace lento ate o controle ser religado, e a haptica atrasava
+		// em todas as sessoes depois da bancada. Ver DualSenseHid.acordarAgora.
+		saida.append("\nThree levels, as the stream sends them:\n")
+		tocarNiveis(saida, 1)
+
+		hid.fechar()
+		return saida.toString()
+	}
+
+	/** Os tres niveis do ensaio, um atras do outro, com pausa entre eles. */
+	private fun tocarNiveis(saida: StringBuilder, rodada: Int)
+	{
 		for((nivel, nome) in ENSAIO_NIVEIS)
 		{
 			val mandados = tocarTom(nivel, false)
 			saida.append("$nome (${nivel.toInt()} of 127): $mandados reports\n")
-			Trace.log(context, "Haptics bench: $nome, $mandados reports")
+			Trace.log(context, "Haptics bench round $rodada: $nome, $mandados reports")
 			dormir(1200)
 		}
-
-		hid.fechar()
-		return saida.toString()
 	}
 
 	/**
@@ -337,12 +400,26 @@ class DualSenseHaptics(private val context: Context, private val hid: DualSenseH
 			return
 		rodando = true
 		thread = Thread({
+			// O laco manda a cada ~10 ms, e um envio que perde a vez chega a
+			// bobina atrasado. Mesma classe do audio: o que se sente fora de
+			// hora e pior do que o que nao se sente.
+			android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
 			try
 			{
 				// O segundo teste nao e redundante. Entre o pedido e a ponte de
 				// pe cabe uma sessao inteira ser encerrada, e entrar no laco
 				// depois disso seria ler um ponteiro nativo ja liberado.
-				if(hid.conectar() && rodando)
+				// O terceiro tambem nao: sem DualSense, a ponte escolhe o
+				// primeiro HID da lista, e na dev.231 foram ~2000 relatorios 0x32
+				// ao 8BitDo, que nao vibrou e nao se sabe o que fez com eles.
+				val ponte = hid.conectar()
+				if(ponte && rodando && !hid.alvoEDualSense())
+				{
+					Trace.log(context, "Haptics: the controller on the HID bridge is not a DualSense; " +
+						"raw haptics not sent, falling back to rumble")
+					aoFalhar()
+				}
+				else if(ponte && rodando)
 				{
 					// Potencia cheia antes da primeira amostra. Sem isto a
 					// bobina pode estar recebendo um oitavo do que mandamos, e
@@ -357,10 +434,16 @@ class DualSenseHaptics(private val context: Context, private val hid: DualSenseH
 					// A bancada da dev.147 tocou o mesmo tom em quatro passadas,
 					// variando so como a rota era armada antes, e as quatro
 					// foram sentidas -- inclusive a que nao armava nada. Entao a
-					// bobina ja atende o relatorio 0x32 depois da leitura do
-					// relatorio de calibragem, que a ponte faz ao conectar, e
-					// mandar um 0x31 antes so acrescentaria um passo que pode
-					// falhar sem acrescentar nada que funcione.
+					// bobina ja atendia o relatorio 0x32, e mandar um 0x31 antes
+					// so acrescentaria um passo que pode falhar sem acrescentar
+					// nada que funcione.
+					//
+					// **Aquela bancada rodou com a ponte lendo a calibragem ao
+					// conectar, e a dev.179 tirou essa leitura.** Entao a
+					// premissa mudou embaixo desta conclusao e ninguem ligou uma
+					// coisa na outra. Quem responde agora e a bancada do
+					// diagnostico, que toca o mesmo tom antes e depois da
+					// leitura na mesma rodada -- ver `ensaiar`.
 					Trace.log(context, "Haptics: raw DualSense haptics started")
 					entregando = true
 					try
@@ -378,6 +461,12 @@ class DualSenseHaptics(private val context: Context, private val hid: DualSenseH
 						"Haptics: DualSense bridge did not open; falling back to classic rumble")
 					aoFalhar()
 				}
+			}
+			catch(e: InterruptedException)
+			{
+				// O stop() pediu para sair no meio da subida da ponte. Nada a
+				// fazer alem do encerramento abaixo; deixar escapar derrubaria
+				// o app inteiro por uma thread que so ia terminar.
 			}
 			finally
 			{
@@ -406,6 +495,12 @@ class DualSenseHaptics(private val context: Context, private val hid: DualSenseH
 		if(!rodando)
 			return
 		rodando = false
+		// Acordar a thread, e nao so esperar por ela: se ela ainda estiver
+		// subindo a ponte, espera o onServiceConnected -- que so chega pela
+		// thread principal, a mesma que esta presa neste join. Sem o
+		// interrupt eram 800 ms de tela parada no encerramento, e a sessao
+		// liberada com a thread viva.
+		thread?.interrupt()
 		thread?.join(800)
 		thread = null
 		Trace.log(context, "Haptics: stopped after $mandados reports " +
@@ -424,11 +519,16 @@ class DualSenseHaptics(private val context: Context, private val hid: DualSenseH
 	{
 		try
 		{
-			val silencio = ByteArray(REPORT_SIZE)
-			val mudo = ByteArray(AMOSTRAS_BYTES)
-			java.util.Arrays.fill(mudo, SILENCIO)
-			montar(silencio, mudo, AMOSTRAS_BYTES)
-			hid.mandar(silencio)
+			// O silencio de despedida tambem e um 0x32, e sem esta checagem ia
+			// ao 8BitDo que o start acabou de recusar.
+			if(hid.alvoEDualSense())
+			{
+				val silencio = ByteArray(REPORT_SIZE)
+				val mudo = ByteArray(AMOSTRAS_BYTES)
+				java.util.Arrays.fill(mudo, SILENCIO)
+				montar(silencio, mudo, AMOSTRAS_BYTES)
+				hid.mandar(silencio)
+			}
 		}
 		catch(e: Throwable)
 		{
@@ -495,6 +595,11 @@ class DualSenseHaptics(private val context: Context, private val hid: DualSenseH
 		// enlace, porque o `sendData` so entrega o relatorio a pilha.
 		val temposEnvio = TimingHistogram()
 		var iniciosSemEspera = 0L
+		// Reamostragem: fase fracionaria (em quadros) e razao suavizada.
+		var fase = 0.0
+		var razao = 1.0
+		var somaRazao = 0.0
+		var voltasReamostradas = 0L
 
 		while(rodando)
 		{
@@ -571,15 +676,70 @@ class DualSenseHaptics(private val context: Context, private val hid: DualSenseH
 			// entrada com zero; depois mantem o enquadramento e a cadencia normais.
 			val acordando = estacionado && !fluindo && naFila in 1 until AMOSTRAS_BYTES
 
+			// dev.208: no fluxo continuo a trilha e reamostrada, e nao cortada
+			// em pedacos de 64 bytes. A dev.207 recebeu uns 90% do que o
+			// controle consome: onde faltava, o relatorio saia com 10 ms de
+			// silencio no meio da vibracao, 100 a 200 vezes a cada 10 s -- a
+			// onda "aspera, ruidosa" que o dono desenhou. Agora a razao de
+			// consumo acompanha o nivel da fila (limite +-15%):
+			// a onda fica continua, e uma vibracao tatil 10% mais grave nao
+			// se percebe, enquanto um buraco de 10 ms se sente sempre.
+			//
+			// Tres faixas. Entre um relatorio e FILA_ALTA a trilha passa como
+			// veio, byte a byte. Abaixo de um relatorio, no meio do fluxo, ela e
+			// esticada (RAZAO_MIN) em vez de virar silencio. Acima de FILA_ALTA
+			// ela e comprimida no tempo, ate RAZAO_MAX, em vez de esperar o teto
+			// e jogar trilha fora.
+			razao = when
+			{
+				naFila > FILA_ALTA -> (1.0 + (naFila - FILA_ALTA) / (2.0 * FILA_ALTA)).coerceAtMost(RAZAO_MAX)
+				naFila < AMOSTRAS_BYTES -> RAZAO_MIN
+				else -> 1.0
+			}
+			if(razao == 1.0)
+				fase = 0.0
+			val quadrosNaFila = naFila / 2
+			val precisa = kotlin.math.ceil(fase + (QUADROS_POR_RELATORIO - 1) * razao).toInt() + 2
+			val reamostra = fluindo && !esvaziando && razao != 1.0 && quadrosNaFila >= precisa
+
 			val leva = when
 			{
+				reamostra -> -1
 				fluindo && naFila >= AMOSTRAS_BYTES -> AMOSTRAS_BYTES
 				acordando -> naFila
 				esvaziando -> naFila
 				else -> 0
 			}
 
-			bytesConsumidos += leva
+			if(reamostra)
+			{
+				for(i in 0 until QUADROS_POR_RELATORIO)
+				{
+					val pos = fase + i * razao
+					val k = pos.toInt()
+					val t = pos - k
+					for(c in 0..1)
+					{
+						val a = fila[k * 2 + c].toInt()
+						val b = fila[(k + 1) * 2 + c].toInt()
+						amostras[i * 2 + c] = Math.round(a + (b - a) * t).toInt().toByte()
+					}
+				}
+				val avanco = fase + QUADROS_POR_RELATORIO * razao
+				val usados = avanco.toInt().coerceAtMost(quadrosNaFila)
+				fase = avanco - usados
+				val bytesUsados = usados * 2
+				bytesConsumidos += bytesUsados
+				naFila -= bytesUsados
+				if(naFila > 0)
+					System.arraycopy(fila, bytesUsados, fila, 0, naFila)
+				somaRazao += razao
+				voltasReamostradas++
+			}
+
+
+			if(leva >= 0)
+				bytesConsumidos += leva
 			if(acordando) {
 				fluindo = true
 				iniciosSemEspera++
@@ -593,7 +753,7 @@ class DualSenseHaptics(private val context: Context, private val hid: DualSenseH
 				if(naFila > 0)
 					System.arraycopy(fila, leva, fila, 0, naFila)
 			}
-			else
+			else if(leva == 0)
 			{
 				java.util.Arrays.fill(amostras, SILENCIO)
 				// Furo e diferente de silencio: e a fila secando no meio de uma
@@ -605,6 +765,13 @@ class DualSenseHaptics(private val context: Context, private val hid: DualSenseH
 
 			if(naFila == 0 && voltasVazias >= VOLTAS_ATE_ESVAZIAR)
 				fluindo = false
+
+			// Antes de olhar se ha sinal: com a vibracao desligada no PS5 tudo
+			// vira silencio, e o laco estaciona como estaciona em jogo quieto.
+			val g = ganho
+			if(g < 0.999f)
+				for(i in 0 until AMOSTRAS_BYTES)
+					amostras[i] = (amostras[i] * g).toInt().toByte()
 
 			// Estaciona depois de silencio prolongado, e volta na primeira
 			// trilha. Enquanto estacionado o laco continua girando: ele ainda le,
@@ -672,7 +839,7 @@ class DualSenseHaptics(private val context: Context, private val hid: DualSenseH
 				hid.potenciaCheia()
 			}
 			val agoraNanos = System.nanoTime()
-			if(agoraNanos - ultimoRelato >= RELATORIO_MS * 1_000_000L)
+			if(agoraNanos - ultimoRelato >= relatorioMs * 1_000_000L)
 			{
 				val intervaloMs = (agoraNanos - ultimoRelato) / 1_000_000L
 				ultimoRelato = agoraNanos
@@ -697,12 +864,16 @@ class DualSenseHaptics(private val context: Context, private val hid: DualSenseH
 					"source $bytesLidos B, consumed $bytesConsumidos B, dropped $bytesDescartados B; " +
 					"$prazosPerdidos missed deadlines, read peak ${picoLeituraNs / 1000} us, " +
 					"send peak ${picoEnvioNs / 1000} us; $iniciosSemEspera early onsets; " +
+					"$voltasReamostradas resampled, ratio avg " +
+					(if(voltasReamostradas > 0) "%.3f".format(somaRazao / voltasReamostradas) else "-") + "; " +
 					"send ms histogram ${TimingHistogram.TITULO}${temposEnvio.format()}")
 				enviadosComSinal = 0L
 				enviadosMudos = 0L
 				voltasEstacionadas = 0L
 				recusadosNoIntervalo = 0L
 				bytesLidos = 0L
+				voltasReamostradas = 0L
+				somaRazao = 0.0
 				bytesConsumidos = 0L
 				bytesDescartados = 0L
 				prazosPerdidos = 0L

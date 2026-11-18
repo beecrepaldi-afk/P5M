@@ -1,0 +1,31 @@
+diff --git a/android/app/src/main/cpp/chiaki-jni.c b/android/app/src/main/cpp/chiaki-jni.c
+index e800961..bdeea7f 100644
+--- a/android/app/src/main/cpp/chiaki-jni.c
++++ b/android/app/src/main/cpp/chiaki-jni.c
+@@ -255,6 +255,8 @@ typedef struct android_chiaki_session_t
+ 	unsigned int haptics_accum_count;
+ 	int haptics_last_l;
+ 	int haptics_last_r;
++	// P5M: janelas seguidas com o mesmo valor, ver o reenvio abaixo.
++	unsigned int haptics_repetidas;
+ 	bool haptics_logged;
+ 
+ 	AndroidChiakiVideoDecoder video_decoder;
+@@ -574,8 +576,16 @@ static void android_chiaki_haptics_frame(uint8_t *buf, size_t buf_size, void *us
+ 	// descarta valor repetido, mas para descobrir isso ele precisaria ter
+ 	// atravessado a fronteira -- e atravessar significa anexar e desanexar a
+ 	// thread do takion, a mesma que entrega video, cem vezes por segundo.
+-	if(rumble_l == session->haptics_last_l && rumble_r == session->haptics_last_r)
++	// P5M: valor igual ao anterior nao vira evento -- mas, vibrando, sai de
++	// novo a cada cinco janelas (uns 150 ms). E o sinal de vida da trilha:
++	// quando o console para de mandar haptica (o fim de um pulo), este
++	// callback simplesmente deixa de ser chamado, nenhum zero chega, e o motor
++	// ficava no ultimo valor ate o proximo efeito. O lado Kotlin (Rumble)
++	// solta o motor se esse sinal de vida sumir.
++	if(rumble_l == session->haptics_last_l && rumble_r == session->haptics_last_r &&
++			((rumble_l == 0 && rumble_r == 0) || ++session->haptics_repetidas < 5))
+ 		return;
++	session->haptics_repetidas = 0;
+ 	session->haptics_last_l = rumble_l;
+ 	session->haptics_last_r = rumble_r;
+ 

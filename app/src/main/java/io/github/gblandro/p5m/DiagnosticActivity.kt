@@ -6,7 +6,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.graphics.Color
 import android.net.Uri
 import android.graphics.Typeface
 import android.os.Build
@@ -16,7 +15,6 @@ import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
-import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -43,103 +41,163 @@ class DiagnosticActivity: Activity()
 	private lateinit var output: TextView
 	private val server by lazy { LogServer(this) }
 	private var hid: DualSenseHid? = null
+	// As duas bancadas dividem a ponte, e a haptica a fecha ao terminar: uma
+	// segunda por cima derrubava a primeira no meio e o relatorio saia
+	// "failed" sem ter tentado. So a thread principal mexe nisto.
+	private var bancadaRodando = false
 
 	override fun onCreate(savedInstanceState: Bundle?)
 	{
 		super.onCreate(savedInstanceState)
+		server.abrir()
 
+		// O visual de todas as telas, em Estilo (dev.213). Tres grupos, e nao
+		// treze botoes iguais: o que serve a qualquer um (relatar), o que leva
+		// o diario para fora (compartilhar), e o que so interessa a quem
+		// desenvolve -- recolhido, para ninguem apagar o diario sem querer.
 		val root = LinearLayout(this).apply {
 			orientation = LinearLayout.VERTICAL
-			setBackgroundColor(Color.parseColor("#101014"))
-			setPadding(32, 32, 32, 32)
+			background = Estilo.fundoDaTela()
+			setPadding(dp(24), dp(20), dp(24), dp(16))
 		}
 
-		root.addView(TextView(this).apply {
-			text = "P5M — diagnostics"
-			setTextColor(Color.WHITE)
-			setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
-			setTypeface(typeface, Typeface.BOLD)
-		})
-
-		root.addView(TextView(this).apply {
-			text = deviceInfo()
-			setTextColor(Color.parseColor("#9aa0a6"))
-			setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-			setPadding(0, 12, 0, 12)
+		root.addView(Estilo.marca(this, "Diagnostics", 26f))
+		root.addView(Estilo.apoio(this, deviceInfo()).apply {
+			setTextColor(Estilo.SECAO)
+			setPadding(dp(4), dp(10), 0, dp(14))
 		})
 
 		// Sozinho e no topo: e o unico botao aqui que serve a quem nao entende
-		// nada do que esta escrito no resto da tela.
-		root.addView(Button(this).apply {
-			text = "Report a problem"
-			setOnClickListener { reportProblem() }
-			layoutParams = LinearLayout.LayoutParams(
-				LinearLayout.LayoutParams.MATCH_PARENT,
-				LinearLayout.LayoutParams.WRAP_CONTENT)
+		// nada do que esta escrito no resto da tela. O mesmo botao principal do
+		// "Play" do lancador, pela mesma razao: e a acao que importa primeiro.
+		root.addView(Estilo.botaoPrincipal(this, "Report a problem") { reportProblem() }.apply {
+			layoutParams = LinearLayout.LayoutParams(-2, -2).apply { bottomMargin = dp(4) }
 		})
 
-		// Duas fileiras, e nao oito botoes numa linha so.
-		//
-		// Com oito, cada um fica com um oitavo da largura, e acertar um deles
-		// com o raio do controle dentro do headset e uma disputa. A divisao
-		// tambem separa o que le do que apaga: nunca sao a mesma intencao, e o
-		// vizinho errado ja custou um diario apagado sem querer.
-		root.addView(LinearLayout(this).apply {
-			orientation = LinearLayout.HORIZONTAL
-			addView(button("Refresh") { refresh() })
-			addView(button("Copy crash") { copyToClipboard(crashOnly = true) })
-			addView(button("Copy all") { copyToClipboard(crashOnly = false) })
-			addView(button("Copy summary") { copySummary() })
-			addView(button("Previous version") { copiarAnterior() })
-		})
+		root.addView(Estilo.secao(this, "Share the diary"))
+		root.addView(fileiraDeBotoes(
+			"Serve on network" to { toggleServer() },
+			"Send as file" to { shareAsFile() },
+			"Copy all" to { copyToClipboard(crashOnly = false) },
+			"Copy summary" to { copySummary() }))
 
-		root.addView(LinearLayout(this).apply {
-			orientation = LinearLayout.HORIZONTAL
-			addView(button("Serve on network") { toggleServer() })
-			addView(button("Send as file") { shareAsFile() })
-			addView(button("Clear crash") {
-				P5MApp.clear(this@DiagnosticActivity)
-				refresh()
+		// Ferramentas de quem desenvolve: fechadas por padrao. Apagar e ler
+		// nunca ficam lado a lado com o que o usuario comum procura -- o vizinho
+		// errado ja custou um diario apagado sem querer.
+		val ferramentas = LinearLayout(this).apply {
+			orientation = LinearLayout.VERTICAL
+			visibility = View.GONE
+			addView(fileiraDeBotoes(
+				"Refresh" to { refresh() },
+				"Copy crash" to { copyToClipboard(crashOnly = true) },
+				"Previous version" to { copiarAnterior() }))
+			addView(fileiraDeBotoes(
+				"Clear crash" to {
+					P5MApp.clear(this@DiagnosticActivity)
+					refresh()
+				},
+				"Clear diary" to {
+					// Antes de um teste dirigido, comecar do zero evita ler o
+					// registro da sessao anterior achando que e o da atual.
+					Trace.clear(this@DiagnosticActivity)
+					refresh()
+				}))
+			// O controle e o video: perguntas pelos olhos e pela mao. Bancadas de
+			// laboratorio, so com o diario detalhado ligado (dev.220): na build
+			// publica ficam fora do caminho de quem so quer jogar.
+			addView(fileiraDeBotoes(
+				"Controller lights" to { sondarDualSense() },
+				"Controller haptics" to { ensaiarHaptica() },
+				"Controller triggers" to { ensaiarGatilhos() },
+				"Video benchmark" to { abrirBancada() }).apply {
+				visibility = if(Trace.detalhado) View.VISIBLE else View.GONE
 			})
-			addView(button("Clear diary") {
-				// Antes de um teste dirigido, comecar do zero evita ler o
-				// registro da sessao anterior achando que e o da atual.
-				Trace.clear(this@DiagnosticActivity)
-				refresh()
-			})
+		}
+		// O interruptor do diario detalhado: ligado de fabrica nas builds -dev,
+		// desligado na publica. Quem ajuda um testador pede para ligar aqui.
+		val detalhe = Estilo.botao(this, "") {}.apply {
+			layoutParams = Estilo.margem(context, 16, 0)
+		}
+		fun rotuloDoDetalhe() {
+			detalhe.text = "Detailed diary: " + (if(Trace.detalhado) "On" else "Off") +
+					"   ·   periodic measurements, for troubleshooting"
+		}
+		rotuloDoDetalhe()
+		detalhe.setOnClickListener {
+			Trace.definirDetalhe(this, !Trace.detalhado)
+			rotuloDoDetalhe()
+			Trace.log(this, "Detailed diary: ${if(Trace.detalhado) "on" else "off"}")
+		}
+		root.addView(detalhe)
+		// Sondas do app oficial (dev.242): desligadas de fabrica, so com o
+		// diario detalhado, que e quando alguem esta testando de proposito.
+		fun interruptor(rotulo: String, explica: String, isOn: () -> Boolean,
+				definir: (Boolean) -> Unit) = Estilo.botao(this, "") {}.apply {
+			layoutParams = Estilo.margem(context, 16, 0)
+			visibility = if(Trace.detalhado) View.VISIBLE else View.GONE
+			fun rotular() { text = "$rotulo: " + (if(isOn()) "On" else "Off") + "   ·   $explica" }
+			rotular()
+			setOnClickListener {
+				definir(!isOn())
+				rotular()
+				Trace.log(this@DiagnosticActivity, "$rotulo: ${if(isOn()) "on" else "off"}")
+			}
+		}
+		// Diario ao vivo (dev.242): visivel sempre, porque e o que deixa quem
+		// ajuda acompanhar um teste pela rede sem o testador mandar nada.
+		root.addView(interruptor("Live diary on network",
+				"a computer on this network follows the diary while you play",
+				{ LogServer.aoVivoEscolhido(this) }, { LogServer.definirAoVivo(this, it) }).apply {
+			visibility = View.VISIBLE
 		})
-
-		// Fileira propria para o controle. As duas perguntam a mesma coisa por
-		// caminhos diferentes -- uma pelos olhos, outra pela mao --, e separa-las
-		// do resto evita apertar "clear diary" querendo apertar uma delas.
-		root.addView(LinearLayout(this).apply {
-			orientation = LinearLayout.HORIZONTAL
-			addView(button("DualSense lights") { sondarDualSense() })
-			addView(button("DualSense haptics") { ensaiarHaptica() })
-		})
+		root.addView(interruptor("Takion v20",
+				"stream protocol of the official app; off falls back to v12",
+				{ SondasDeProtocolo.takionV20(this) }, { SondasDeProtocolo.definirTakionV20(this, it) }))
+		root.addView(interruptor("Probe: ask for uncapped fps",
+				"maxFps 999 in the launch spec, try a 120 Hz game",
+				{ SondasDeProtocolo.maxFps999(this) }, { SondasDeProtocolo.definirMaxFps999(this, it) }))
+		root.addView(interruptor("Probe: ask the console for more info",
+				"RP-ReqMoreInfo, console Wi-Fi in the diary",
+				{ SondasDeProtocolo.maisInfo(this) }, { SondasDeProtocolo.definirMaisInfo(this, it) }))
+		val abrir = Estilo.botao(this, "Developer tools  ›") {}.apply {
+			layoutParams = Estilo.margem(context, 16, 8)
+			setTextColor(Estilo.SECUNDARIO)
+		}
+		abrir.setOnClickListener {
+			val aberto = ferramentas.visibility != View.VISIBLE
+			ferramentas.visibility = if(aberto) View.VISIBLE else View.GONE
+			abrir.text = if(aberto) "Developer tools  ⌄" else "Developer tools  ›"
+		}
+		root.addView(abrir)
+		root.addView(ferramentas)
 
 		output = TextView(this).apply {
-			setTextColor(Color.parseColor("#e8eaed"))
-			setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+			setTextColor(Estilo.TEXTO)
+			setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
 			typeface = Typeface.MONOSPACE
 			setTextIsSelectable(true)
 			movementMethod = ScrollingMovementMethod()
 		}
 		root.addView(ScrollView(this).apply {
 			addView(output)
+			background = Estilo.vidro(context, 0)
+			setPadding(dp(16), dp(14), dp(16), dp(14))
+			clipToOutline = true
 			layoutParams = LinearLayout.LayoutParams(
 				LinearLayout.LayoutParams.MATCH_PARENT,
 				0
-			).apply { weight = 1f }
+			).apply { weight = 1f; topMargin = dp(8) }
 		})
 
 		setContentView(root)
-		refresh()
-
 		// Quem chegou pelo "Report a problem" do lancador ja pediu o relatorio;
-		// obrigar a achar o botao de novo seria repetir a pergunta.
-		if(intent?.getBooleanExtra(EXTRA_REPORT, false) == true)
-			reportProblem()
+		// obrigar a achar o botao de novo seria repetir a pergunta. Depois da
+		// primeira leitura, que agora chega por fora da thread principal e
+		// escreveria por cima do relatorio.
+		refresh {
+			if(intent?.getBooleanExtra(EXTRA_REPORT, false) == true)
+				reportProblem()
+		}
 	}
 
 	/**
@@ -227,13 +285,46 @@ class DiagnosticActivity: Activity()
 	}
 
 
-	private fun button(label: String, onClick: () -> Unit) = Button(this).apply {
-		text = label
-		gravity = Gravity.CENTER
-		setOnClickListener { onClick() }
-		layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT)
-			.apply { weight = 1f }
+	/** Uma fileira de cartoes tocaveis, o mesmo cartao de todas as telas. */
+	private fun fileiraDeBotoes(vararg botoes: Pair<String, () -> Unit>) =
+			LinearLayout(this).apply {
+		orientation = LinearLayout.HORIZONTAL
+		layoutParams = LinearLayout.LayoutParams(
+			LinearLayout.LayoutParams.MATCH_PARENT,
+			LinearLayout.LayoutParams.WRAP_CONTENT
+		).apply { bottomMargin = dp(8) }
+		for((rotulo, onClick) in botoes)
+			addView(Estilo.botao(context, rotulo, onClick).apply {
+				gravity = Gravity.CENTER
+				setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+				layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT)
+					.apply { weight = 1f; marginStart = dp(4); marginEnd = dp(4) }
+			})
 	}
+
+	/**
+	 * A bancada de video, que morava no lancador como "Test bench" e abria uma
+	 * tela preta sem dizer nada -- o dono perguntou se era defeito. Agora ela
+	 * avisa antes o que vai acontecer.
+	 */
+	private fun abrirBancada()
+	{
+		output.text = "--- video benchmark ---\n\n" +
+				"Opening a test in the headset: a pattern generated on this device plays\n" +
+				"through the whole video path, with no console and no network. The screen\n" +
+				"may look dark or plain -- that is the test. It closes by itself; the\n" +
+				"result goes to the diary (Refresh here afterwards).\n"
+		try
+		{
+			startActivity(Intent(this, BancoDeEnsaioActivity::class.java))
+		}
+		catch(e: Throwable)
+		{
+			output.append("\nCould not open it: ${e::class.java.simpleName}: ${e.message}\n")
+		}
+	}
+
+	private fun dp(valor: Int): Int = Estilo.dp(this, valor)
 
 	/**
 	 * Copia só as linhas que costumam responder a pergunta.
@@ -264,10 +355,30 @@ class DiagnosticActivity: Activity()
 					"sending work normally. It stops when you leave this screen.\n\n" +
 					"${output.text}"
 		else
-			output.text = "Could not start the server.\n\n${output.text}"
+			output.text = "Could not start the server (${server.falha}).\n\n${output.text}"
 	}
 
-	private fun refresh()
+	/**
+	 * Monta o texto fora da thread principal e so entrega o pronto.
+	 *
+	 * Sao dois `logcat -d` (processos externos), o diario de meio mega e a
+	 * redacao sobre o logcat inteiro: na principal isso travava a tela a cada
+	 * abertura e a cada Refresh.
+	 */
+	private fun refresh(depois: (() -> Unit)? = null)
+	{
+		Thread({
+			val texto = montarTexto()
+			runOnUiThread {
+				if(isDestroyed)
+					return@runOnUiThread
+				output.text = texto
+				depois?.invoke()
+			}
+		}, "p5m-diagnostico").start()
+	}
+
+	private fun montarTexto(): String
 	{
 		// Uma ultima captura antes de mostrar: o processo da sessao ja morreu,
 		// mas as linhas dele podem continuar no buffer, e esta e a ultima
@@ -276,7 +387,7 @@ class DiagnosticActivity: Activity()
 
 		val crash = P5MApp.lastCrash(this)
 		val pilha = PilhaNativa.ultima(this)
-		output.text = buildString {
+		return buildString {
 			// A pilha nativa primeiro: quando ela existe, e a resposta.
 			if(pilha != null)
 			{
@@ -514,11 +625,15 @@ class DiagnosticActivity: Activity()
 			return
 		}
 
-		output.text = "Two passes of red, green and blue, each colour held for a second. Watch the controller and note which pass lit up, if any."
+		if(bancadaRodando)
+			return
+		bancadaRodando = true
+		output.text = "Two passes of red, green and blue, each colour held for a second, with a short pause between them. Watch the lightbar: pass 1 is exactly what a game session sends, pass 2 releases the lightbar from the firmware first."
 		val sonda = hid ?: DualSenseHid(this).also { hid = it }
 		Thread {
 			val relatorio = sonda.sondar()
 			runOnUiThread {
+				bancadaRodando = false
 				output.text = "--- DualSense HID probe ---\n\n" + relatorio +
 						"\nBoth passes go through the interrupt channel. Did either one light up?"
 			}
@@ -542,13 +657,48 @@ class DiagnosticActivity: Activity()
 			return
 		}
 
+		if(bancadaRodando)
+			return
+		bancadaRodando = true
 		output.text = "Three bursts of a 90 Hz tone: full strength, two thirds, one third. Hold the controller and judge the first one — that is the ceiling."
 		val ponte = hid ?: DualSenseHid(this).also { hid = it }
 		Thread {
 			val relatorio = DualSenseHaptics(this, ponte).ensaiar()
 			runOnUiThread {
+				bancadaRodando = false
 				output.text = "--- DualSense haptics bench ---\n\n" + relatorio +
 						"\nWas the first burst strong? If yes, the ceiling is high and the game track is what is quiet. If no, this is as hard as the coil goes."
+			}
+		}.start()
+	}
+
+	/**
+	 * Bancada dos gatilhos adaptativos: um efeito conhecido em cada um, sem
+	 * console. Responde se o caminho app -> controle funciona antes de alguem
+	 * procurar um jogo que use gatilho.
+	 */
+	private fun ensaiarGatilhos()
+	{
+		if(!DualSenseHid.disponivel(this))
+		{
+			output.text = "Asking for Bluetooth permission. Answer the prompt, then press the button again."
+			requestPermissions(arrayOf(android.Manifest.permission.BLUETOOTH_CONNECT), PEDIDO_BLUETOOTH)
+			return
+		}
+		if(bancadaRodando)
+			return
+		bancadaRodando = true
+		output.text = "Pull both triggers now, for eight seconds. The left one should resist from " +
+				"about halfway down; the right one should resist and then give way with a click, " +
+				"like a gun trigger."
+		val ponte = hid ?: DualSenseHid(this).also { hid = it }
+		Thread {
+			val relatorio = EspelhoDualSense.ensaiar(this, ponte)
+			runOnUiThread {
+				bancadaRodando = false
+				output.text = "--- DualSense adaptive triggers bench ---\n\n" + relatorio +
+						"\nDid you feel both? If yes, the triggers work, and a game that does not " +
+						"move them is not sending effects. If no, send the diary."
 			}
 		}.start()
 	}
@@ -566,8 +716,8 @@ class DiagnosticActivity: Activity()
 	override fun onDestroy()
 	{
 		super.onDestroy()
-		// Nao deixa servidor de pe depois que a tela fecha.
-		server.stop()
+		// Nao deixa servidor de pe depois que a ultima tela de diagnostico fecha.
+		server.fechar()
 		hid?.fechar()
 	}
 
@@ -638,5 +788,6 @@ class DiagnosticActivity: Activity()
 			"P5MVR", "Chiaki", "AndroidRuntime", "DEBUG",
 			"System.err", "libc", "linker", "dlopen", "UnsatisfiedLink"
 		)
+
 	}
 }

@@ -53,9 +53,78 @@ object Trace
 	private const val KEY_VERSAO = "versao-do-diario"
 	private const val SESSION_MARK = "=== session "
 	private const val TAG = "P5MVR"
+	// As linhas do [log] vao ao logcat com outra etiqueta (dev.220): com a
+	// mesma, a copia do logcat trazia cada uma de novo, e o diario tinha tudo
+	// em dobro. Elas ja estao no arquivo; a copia fica so para o nativo.
+	private const val TAG_DO_APP = "P5M"
+	private val HORA = java.text.SimpleDateFormat("MM-dd HH:mm:ss.SSS", java.util.Locale.US)
+
+	/**
+	 * Diario detalhado (dev.220): as linhas periodicas e de uso intenso, que
+	 * servem para investigar e nao para contar o que aconteceu. Ligado nas
+	 * builds -dev e desligado na publica; o Diagnostico tem o interruptor, para
+	 * um testador ligar quando pedirem.
+	 */
+	@Volatile var detalhado = false
+		private set
+	private const val KEY_DETALHADO = "detailed-diary"
+	private val SO_DETALHADO = arrayOf("Video 10s", "Bench 10s", "Haptics 10s", "Haptics timing",
+		"Input timing", "Controller motion 10s", "Controller mirror 10s", "Rumble events 10s",
+		"Health 10s", "Neural depth 10s", "P5M: bitrate 10s", "[takion-v20] 10s", "[reorder] 10s",
+		"[packets] 10s", "[frames] 10s", "State -> console", "Key received", "Unmapped gamepad key")
+
+	/** Le o interruptor; sem escolha salva, vale o tipo da build. */
+	fun iniciarDetalhe(context: Context)
+	{
+		val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+		val versao = try
+		{
+			context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: ""
+		}
+		catch(e: Exception) { "" }
+		detalhado = prefs.getBoolean(KEY_DETALHADO, versao.contains("-dev"))
+	}
+
+	fun definirDetalhe(context: Context, ligado: Boolean)
+	{
+		detalhado = ligado
+		context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+			.putBoolean(KEY_DETALHADO, ligado).apply()
+	}
+
+	private fun soDetalhe(linha: String) = !detalhado && SO_DETALHADO.any { linha.contains(it) }
 
 	private val lock = Any()
 	private var lastCapturedStamp: String? = null
+
+	/**
+	 * A escrita em disco, numa thread só dela.
+	 *
+	 * O [log] é chamado da thread principal (cada botão apertado, com o diário
+	 * detalhado), da háptica e da entrega de áudio. Escrever ali mesmo era abrir
+	 * e fechar o arquivo, passar doze expressões regulares e, a cada 128 KB,
+	 * reler e regravar meio mega -- tudo com a trava do diário presa, no meio do
+	 * caminho de um botão até o console. Aqui a chamada só enfileira a linha,
+	 * já com a hora dela; a ordem é a da fila.
+	 *
+	 * O que ainda está na fila quando o processo morre de queda nativa se
+	 * perde: são milissegundos, e o [flush] cobre a queda Java e quem vai ler.
+	 */
+	private val escritor = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+		Thread(r, "p5m-diary-writer").apply { isDaemon = true }
+	}
+
+	/**
+	 * Espera a fila esvaziar (até um segundo). Para quem vai ler o arquivo ou
+	 * mexer nele por fora, e para o fim do processo numa exceção.
+	 */
+	fun flush()
+	{
+		if(Thread.currentThread().name == "p5m-diary-writer")
+			return
+		try { escritor.submit {}.get(1, java.util.concurrent.TimeUnit.SECONDS) }
+		catch(e: Exception) { Log.w(TAG, "Diary flush: ${e.javaClass.simpleName}") }
+	}
 
 	/**
 	 * Pares de "o que esconder" e "o que pôr no lugar".
@@ -89,7 +158,16 @@ object Trace
 		// IPv6 e MAC. Quatro dois-pontos no mínimo, e não três: com três, o
 		// horário de cada linha do logcat (12:34:56) virava endereço, e o
 		// diário saía sem hora nenhuma.
-		Regex("""\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{0,4}){4,}\b""") to "<addr>")
+		Regex("""\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{0,4}){4,}\b""") to "<addr>",
+		// MAC com hífen, que a regra acima (dois-pontos) não pega.
+		Regex("""\b(?:[0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2}\b""") to "<addr>",
+		// O id do console na descoberta do chiaki é o MAC dele em doze hexas
+		// corridos ("detected new host with id ..."), curto demais para a regra
+		// dos blocos longos.
+		Regex("""(?i)\b(with id|host[_ ]?id)(\s*[:=]?\s*)[0-9A-Fa-f]{12}\b""") to "\$1\$2<id>",
+		// O apelido do console, na linha do registro -- sem rótulo nenhum
+		// na frente, então a regra dos nomes não o vê.
+		Regex("""([:\]]\s)[^:\]\n]+?( successfully registered for Remote Play)""") to "\$1<name>\$2")
 
 	private val IPV4 = Regex("""\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b""")
 
@@ -108,8 +186,11 @@ object Trace
 	 */
 	fun log(context: Context, message: String)
 	{
-		Log.i(TAG, message)
-		append(context, message)
+		Log.i(TAG_DO_APP, message)
+		if(soDetalhe(message))
+			return
+		val hora = synchronized(HORA) { HORA.format(java.util.Date()) }
+		append(context, "$hora I/$TAG_DO_APP ${android.os.Process.myPid()}: $message")
 	}
 
 	/**
@@ -161,21 +242,92 @@ object Trace
 		}
 	}
 
+	/**
+	 * Diário ao vivo (dev.242): as últimas linhas já redigidas, numeradas, para
+	 * o [LogServer] entregar em `/follow` assim que são gravadas. Antes, quem
+	 * acompanhava um teste esperava o dono terminar, ligar o servidor e mandar
+	 * o diário; agora o computador da mesma rede lê enquanto ele joga.
+	 *
+	 * Só memória e só as recentes: o arquivo continua sendo o registro, isto
+	 * é a janela de quem está olhando agora.
+	 */
+	private val vivo = ArrayDeque<String>()
+	private var vivoUltima = 0L
+	private val vivoTrava = Object()
+	private const val VIVO_MAX = 2000
+
+	private fun publicarAoVivo(linhas: List<String>)
+	{
+		synchronized(vivoTrava)
+		{
+			for(l in linhas)
+			{
+				vivo.addLast(l)
+				vivoUltima++
+				if(vivo.size > VIVO_MAX)
+					vivo.removeFirst()
+			}
+			vivoTrava.notifyAll()
+		}
+	}
+
+	/**
+	 * As linhas depois da número [depois], esperando até [esperaMs] se não
+	 * houver nenhuma. Devolve também o número da última, para a próxima
+	 * chamada. Um [depois] maior que o contador (o processo reabriu) entrega
+	 * tudo o que há.
+	 */
+	fun aoVivoDepois(depois: Long, esperaMs: Long): Pair<Long, List<String>>
+	{
+		synchronized(vivoTrava)
+		{
+			if(vivoUltima == depois && esperaMs > 0)
+				vivoTrava.wait(esperaMs)
+			val novas = if(depois > vivoUltima) vivo.size
+				else (vivoUltima - depois).coerceAtMost(vivo.size.toLong()).toInt()
+			return vivoUltima to vivo.toList().takeLast(novas)
+		}
+	}
+
+	/** O número da última linha publicada, para começar a seguir dali. */
+	fun aoVivoUltima(): Long = synchronized(vivoTrava) { vivoUltima }
+
 	private fun append(context: Context, line: String)
 	{
-		synchronized<Unit>(lock)
+		val app = context.applicationContext ?: context
+		escritor.execute {
+			synchronized<Unit>(lock)
+			{
+				try
+				{
+					val f = file(app)
+					val redigida = redact(line)
+					f.appendText(redigida + "\n")
+					publicarAoVivo(listOf(redigida))
+					if(f.length() > MAX_BYTES)
+						trim(f)
+				}
+				catch(e: Exception)
+				{
+					Log.w(TAG, "Failed to write to the diary: ${e.message}")
+				}
+			}
+		}
+	}
+
+	/**
+	 * Troca o conteúdo do arquivo de uma vez: grava ao lado e renomeia. Um
+	 * processo morto no meio do `writeText` direto deixava o diário truncado --
+	 * e o aparo acontece justamente nas sessões longas, as que mais importam.
+	 */
+	private fun regravar(f: File, texto: String)
+	{
+		val tmp = File(f.parentFile, f.name + ".tmp")
+		tmp.writeText(texto)
+		if(!tmp.renameTo(f))
 		{
-			try
-			{
-				val f = file(context)
-				f.appendText(redact(line) + "\n")
-				if(f.length() > MAX_BYTES)
-					trim(f)
-			}
-			catch(e: Exception)
-			{
-				Log.w(TAG, "Failed to write to the diary: ${e.message}")
-			}
+			f.writeText(texto)
+			tmp.delete()
 		}
 	}
 
@@ -215,7 +367,7 @@ object Trace
 			// por completo, nunca no meio de uma.
 			val cut = (text.length - KEEP_BYTES).coerceAtLeast(0)
 			val mark = text.indexOf(needle, cut).let { if(it in 0..lastMark) it else lastMark }
-			f.writeText("(older sessions dropped for size)\n"
+			regravar(f, "(older sessions dropped for size)\n"
 					+ text.substring(mark + 1))
 			return
 		}
@@ -229,7 +381,7 @@ object Trace
 		val head = text.substring(headStart, headEnd).substringBeforeLast('\n', "")
 		val tailStart = (text.length - (KEEP_BYTES - HEAD_BYTES)).coerceIn(headEnd, text.length)
 		val tail = text.substring(tailStart).substringAfter('\n', "")
-		f.writeText(head + "\n(middle of the session dropped for size; "
+		regravar(f, head + "\n(middle of the session dropped for size; "
 				+ "the opening and the end are kept)\n" + tail)
 	}
 
@@ -254,19 +406,29 @@ object Trace
 			val lines = BufferedReader(InputStreamReader(process.inputStream))
 				.use { it.readLines() }
 
-			// Só o que é mais novo que a última captura, senão cada passagem
-			// duplicaria tudo que já está gravado.
-			val previous = lastCapturedStamp
-			val fresh = if(previous == null) lines
-				else lines.filter { it.length > 18 && it.substring(0, 18) > previous }
-			if(fresh.isEmpty())
-				return
-			lastCapturedStamp = fresh.last().take(18)
-
+			// Tudo sob a trava, a marca inclusive: três threads chamam isto (o
+			// tick, o Diagnóstico e o banco de ensaio), e duas lendo a mesma
+			// marca gravavam as mesmas linhas duas vezes.
 			synchronized<Unit>(lock)
 			{
+				// Só o que é mais novo que a última captura, senão cada passagem
+				// duplicaria tudo que já está gravado.
+				val previous = lastCapturedStamp
+				val fresh = if(previous == null) lines
+					else lines.filter { it.length > 18 && it.substring(0, 18) > previous }
+				if(fresh.isEmpty())
+					return
+				lastCapturedStamp = fresh.last().take(18)
+				val guardar = if(detalhado) fresh else fresh.filter { !soDetalhe(it) }
+				if(guardar.isEmpty())
+					return
+
+				// Pela redação também: estas linhas vêm do chiaki, que imprime o
+				// apelido do console e o id dele (o MAC) sem passar por nós.
 				val f = file(context)
-				f.appendText(collapseRepeats(fresh).joinToString("\n") + "\n")
+				val redigidas = collapseRepeats(guardar).map { redact(it) }
+				f.appendText(redigidas.joinToString("\n") + "\n")
+				publicarAoVivo(redigidas)
 				if(f.length() > MAX_BYTES)
 					trim(f)
 			}
@@ -321,13 +483,20 @@ object Trace
 		return out
 	}
 
-	fun read(context: Context): String? =
-		file(context).takeIf { it.exists() }?.readText()?.takeIf { it.isNotBlank() }
+	fun read(context: Context): String?
+	{
+		flush()
+		return file(context).takeIf { it.exists() }?.readText()?.takeIf { it.isNotBlank() }
+	}
 
 	fun clear(context: Context)
 	{
-		synchronized<Unit>(lock) { file(context).delete() }
-		lastCapturedStamp = null
+		flush()
+		synchronized<Unit>(lock)
+		{
+			file(context).delete()
+			lastCapturedStamp = null
+		}
 	}
 
 	/**
@@ -399,6 +568,7 @@ object Trace
 	 */
 	private fun guardarAnterior(context: Context)
 	{
+		flush()
 		synchronized<Unit>(lock)
 		{
 			val atual = file(context)

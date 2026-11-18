@@ -24,6 +24,27 @@ class InputArrival(private var inicio: Long)
 	private val intervalos = TimingHistogram()
 	private var ultima = 0L
 	private var amostras = 0
+	private var eventos = 0
+	private var comHistorico = 0
+	private var maiorLote = 0
+
+	/**
+	 * Um evento, com o tamanho do lote que ele trouxe.
+	 *
+	 * É o que separa as duas explicações possíveis para um pente largo. Se o
+	 * Android estivesse juntando os relatórios do controle e entregando um
+	 * punhado por quadro, cada evento traria histórico e o lote seria grande;
+	 * se o histórico vier quase sempre vazio, os relatórios estão chegando
+	 * espaçados de verdade, e o assunto é o enlace Bluetooth, não o Android.
+	 */
+	fun event(historico: Int)
+	{
+		eventos++
+		if(historico > 0)
+			comHistorico++
+		if(historico > maiorLote)
+			maiorLote = historico
+	}
 
 	/** Uma amostra, com o horário do evento em nanossegundos. */
 	fun sample(nanos: Long)
@@ -48,9 +69,13 @@ class InputArrival(private var inicio: Long)
 		val linha = if(amostras == 0)
 			"Input timing: $decorrido ms, 0 axis samples (a resting stick sends nothing; move one to measure)"
 		else
-			"Input timing: $decorrido ms, $amostras axis samples, clock $relogio; " +
+			"Input timing: $decorrido ms, $amostras axis samples in $eventos events " +
+					"($comHistorico batched, biggest batch $maiorLote), clock $relogio; " +
 					"gap ms histogram ${TimingHistogram.TITULO}${intervalos.format()}"
 		amostras = 0
+		eventos = 0
+		comHistorico = 0
+		maiorLote = 0
 		intervalos.clear()
 		return linha
 	}

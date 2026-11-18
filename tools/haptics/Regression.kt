@@ -6,10 +6,17 @@ import java.util.zip.CRC32
 
 // Executa o laco de producao. So Android, JNI e transporte sao substituidos;
 // a fila, o empacotamento e a decisao de enviar sao os do APK.
-private fun runFrames(frames: List<ByteArray>, hid: DualSenseHid = DualSenseHid()):
-	Pair<DualSenseHaptics, List<ByteArray>>
+// Os casos que leem a linha de diagnostico rodam ate o primeiro relatorio. Com
+// o intervalo de producao (10 s) eram 950 quadros e dez segundos de relogio
+// por caso; 2 s cobrem o mesmo comportamento em um quinto do tempo.
+private const val RELATO_MS = 2_000L
+private const val RELATO_QUADROS = 190
+
+private fun runFrames(frames: List<ByteArray>, hid: DualSenseHid = DualSenseHid(),
+	relatorioMs: Long = 10_000L): Pair<DualSenseHaptics, List<ByteArray>>
 {
 	val h = DualSenseHaptics(Context(), hid)
+	h.relatorioMs = relatorioMs
 	val running = h.javaClass.getDeclaredField("rodando").also { it.isAccessible = true }
 	running.setBoolean(h, true)
 	var index = 0
@@ -65,7 +72,8 @@ fun main()
 		val impulse = ByteArray(60) { 9 }
 		val (_, reports) = runFrames(List(40) { byteArrayOf() } + List(16) { impulse } + List(5) { byteArrayOf() })
 		val active = reports.map(::payload).filter { p -> p.any { it != 0.toByte() } }
-		check(active.flatMap { it.toList() }.count { it == 9.toByte() } == 60 * 16)
+		// dev.208: esticar a trilha cria amostras interpoladas; nenhuma se perde.
+		check(active.flatMap { it.toList() }.count { it == 9.toByte() } >= 60 * 16)
 		check(active.drop(1).dropLast(1).all { p -> p.all { it == 9.toByte() } })
 	}
 	test("isolated 30-frame effect drains without a second effect") {
@@ -84,16 +92,31 @@ fun main()
 		check(payload(reports.last()).all { it == 1.toByte() })
 		check(h.mudos == 40L) { "silent PCM missing from diagnostics" }
 	}
-	test("30-frame network chunks preserve stereo order across 32-frame reports") {
-		val input = ByteArray(60 * 16) { ((it % 120) + 1).toByte() }
-		val frames = (0 until 16).map { input.copyOfRange(it * 60, (it + 1) * 60) }
+	// dev.208: 60 bytes por pacote contra 64 por relatorio ja nao abrem buraco
+	// no meio do efeito -- a trilha e esticada -- e a ordem estereo continua.
+	test("30-frame network chunks leave no hole and keep stereo order") {
+		val frames = List(40) { ByteArray(60) { if(it % 2 == 0) 10 else -20 } }
 		val (_, reports) = runFrames(frames + List(5) { byteArrayOf() })
-		val active = reports.map(::payload).filter { p -> p.any { it != 0.toByte() } }
-		check(active.flatMap { it.toList() }.toByteArray().contentEquals(input))
+		val cargas = reports.map(::payload)
+		val ativos = cargas.indices.filter { i -> cargas[i].any { it != 0.toByte() } }
+		check(ativos.isNotEmpty())
+		// O fim da rajada ainda espera duas voltas vazias antes de soltar o rabo
+		// (VOLTAS_ATE_ESVAZIAR): um relatorio mudo ali e o comportamento antigo.
+		check((ativos.first()..ativos.last() - 2).all { it in ativos }) { "silent report in the middle of the effect: " + cargas.joinToString("") { c -> if(c.any { it != 0.toByte() }) "1" else "0" } }
+		for(i in ativos)
+			for(k in 0 until 32)
+			{
+				val l = cargas[i][k * 2]; val r = cargas[i][k * 2 + 1]
+				check((l == 10.toByte() && r == (-20).toByte()) || (l == 0.toByte() && r == 0.toByte())) {
+					"stereo order broken at report $i frame $k: $l $r" }
+			}
 	}
 	test("queue overflow keeps newest stereo frames") {
-		val (_, reports) = runFrames(listOf(ByteArray(256) { (it / 2).toByte() }))
-		check(payload(reports.single()).contentEquals(ByteArray(64) { ((it + 64) / 2).toByte() }))
+		val (_, reports) = runFrames(listOf(
+			ByteArray(256) { (it / 2).toByte() },
+			ByteArray(256) { (64 + it / 4).toByte() }))
+		val ultimo = payload(reports.last())
+		check(ultimo.all { it >= 64 }) { "old samples survived the overflow: ${ultimo.toList()}" }
 	}
 	test("missing source parks without replaying an old effect") {
 		val (h, reports) = runFrames(listOf(ByteArray(64) { -1 }) + List(40) { byteArrayOf() })
@@ -102,7 +125,7 @@ fun main()
 	}
 	test("diagnostic RMS measures actual signed stereo output") {
 		Trace.lines.clear()
-		runFrames(List(950) { ByteArray(64) { if(it % 2 == 0) -3 else 4 } })
+		runFrames(List(RELATO_QUADROS) { ByteArray(64) { if(it % 2 == 0) -3 else 4 } }, relatorioMs = RELATO_MS)
 		check(Trace.lines.any { it.contains("output RMS 3.54, output peak 4") })
 		val timing = Trace.lines.first { it.startsWith("Haptics timing:") }
 		val counts = Regex("(\\d+) loops, (\\d+) active sent, (\\d+) zero sent, (\\d+) idle, (\\d+) refused")
@@ -116,7 +139,7 @@ fun main()
 	test("send histogram separates sends that wait from the ones that do not") {
 		Trace.lines.clear()
 		val hid = DualSenseHid().also { it.sendDelayMs = { i -> if(i % 4 == 3) 3L else 0L } }
-		runFrames(List(950) { ByteArray(64) { 5 } }, hid)
+		runFrames(List(RELATO_QUADROS) { ByteArray(64) { 5 } }, hid, RELATO_MS)
 		val timing = Trace.lines.first { it.startsWith("Haptics timing:") }
 		val sent = Regex("(\\d+) active sent").find(timing)!!.groupValues[1].toInt()
 		val bins = sendBins(timing)
@@ -127,7 +150,7 @@ fun main()
 	}
 	test("timing distinguishes zero reports from parked loops") {
 		Trace.lines.clear()
-		runFrames(List(950) { ByteArray(64) })
+		runFrames(List(RELATO_QUADROS) { ByteArray(64) }, relatorioMs = RELATO_MS)
 		val timing = Trace.lines.first { it.startsWith("Haptics timing:") }
 		val counts = Regex("(\\d+) loops, (\\d+) active sent, (\\d+) zero sent, (\\d+) idle, (\\d+) refused")
 			.find(timing)!!.groupValues.drop(1).map { it.toLong() }
@@ -153,6 +176,16 @@ fun main()
 		check(reportSeq[1] == (reportSeq[0] + 1) and 0x0F)
 		check(reportSeq[2] == (reportSeq[1] + 1) and 0x0F)
 		check((b[10].toInt() and 0xFF) == ((a[10].toInt() + 1) and 0xFF))
+	}
+	test("raw haptics never reach a controller that is not a DualSense") {
+		val hid = DualSenseHid().also { it.dualSense = false }
+		val h = DualSenseHaptics(Context(), hid)
+		var fallback = false
+		h.start(Session { 0 }) { fallback = true }
+		val t = h.javaClass.getDeclaredField("thread").also { it.isAccessible = true }.get(h) as Thread
+		t.join(2_000)
+		check(fallback) { "rumble fallback not asked for" }
+		check(hid.reports.isEmpty()) { "${hid.reports.size} report(s) sent to a non-DualSense" }
 	}
 	check(failed == 0) { "$failed regression(s)" }
 }

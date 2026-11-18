@@ -1,0 +1,226 @@
+diff --git a/android/app/src/main/cpp/audio-decoder.c b/android/app/src/main/cpp/audio-decoder.c
+index 35f97e9..b1ab397 100644
+--- a/android/app/src/main/cpp/audio-decoder.c
++++ b/android/app/src/main/cpp/audio-decoder.c
+@@ -8,9 +8,43 @@
+ #include <media/NdkMediaFormat.h>
+ 
+ #include <string.h>
++#include <stdlib.h>
++#include <stdatomic.h>
++#include <pthread.h>
++#include <android/log.h>
+ 
+ #define INPUT_BUFFER_TIMEOUT_MS 10
+ 
++// P5M: a thread de saida espera por no maximo isto de cada vez, e entre uma
++// espera e outra confere se o encerramento pediu para ela sair.
++#define OUTPUT_BUFFER_TIMEOUT_MS 100
++
++// P5M: o que a thread de saida divide com o encerramento (dev.231).
++//
++// Ate a dev.227 a thread esperava o codec sem prazo (-1) e lia
++// decoder->codec a cada volta. Quando o decodificador para de produzir --
++// "Failed to get input audio buffer" pouco antes do fim, uma em tres
++// sessoes na dev.226 -- a espera nunca voltava, e a checagem de
++// encerramento no laco nunca rodava. Pior: no caminho de prazo esgotado o
++// encerramento zerava decoder->codec com a thread viva, que ao acordar
++// chamaria o codec por um ponteiro nulo.
++//
++// Agora a thread tem a propria copia do codec, espera no maximo
++// OUTPUT_BUFFER_TIMEOUT_MS de cada vez e sai assim que `parar` sobe. Se
++// ainda assim nao sair a tempo, o encerramento a ABANDONA com uma troca
++// atomica de `estado`, e a partir dai ela e dona do codec e desta
++// estrutura: quando finalmente sair, apaga os dois. Quem ganhar a troca
++// limpa; o outro nao toca em nada.
++enum { P5M_SAIDA_RODANDO, P5M_SAIDA_TERMINOU, P5M_SAIDA_ABANDONADA };
++
++typedef struct p5m_saida_audio_t
++{
++	struct AMediaCodec *codec;
++	AndroidChiakiAudioDecoder *decoder;
++	atomic_bool parar;
++	atomic_int estado;
++} P5MSaidaAudio;
++
+ static void *android_chiaki_audio_decoder_output_thread_func(void *user);
+ static void android_chiaki_audio_decoder_header(ChiakiAudioHeader *header, void *user);
+ static void android_chiaki_audio_decoder_frame(uint8_t *buf, size_t buf_size, void *user);
+@@ -20,6 +54,7 @@ ChiakiErrorCode android_chiaki_audio_decoder_init(AndroidChiakiAudioDecoder *dec
+ 	decoder->log = log;
+ 	memset(&decoder->audio_header, 0, sizeof(decoder->audio_header));
+ 	decoder->codec = NULL;
++	decoder->p5m_saida = NULL;
+ 	decoder->timestamp_cur = 0;
+ 
+ 	decoder->cb_user = NULL;
+@@ -31,8 +66,21 @@ ChiakiErrorCode android_chiaki_audio_decoder_init(AndroidChiakiAudioDecoder *dec
+ 
+ void android_chiaki_audio_decoder_shutdown_codec(AndroidChiakiAudioDecoder *decoder)
+ {
++	P5MSaidaAudio *saida = decoder->p5m_saida;
+ 	chiaki_mutex_lock(&decoder->codec_mutex);
+-	ssize_t codec_buf_index = AMediaCodec_dequeueInputBuffer(decoder->codec, -1);
++	if(saida)
++		atomic_store(&saida->parar, true);
++	// P5M: com prazo, e parando o codec de qualquer jeito.
++	//
++	// A espera por um lugar na fila de entrada era sem prazo (-1), e a thread
++	// de saida so saia ao ver o fim de fluxo. Com a fila cheia na hora de
++	// encerrar -- o diario da dev.224 registrou tres "Failed to get input
++	// audio buffer" meio segundo antes --, o fim de fluxo nunca entrava, a
++	// espera nunca voltava e o onDestroy travava ate o sistema matar o
++	// processo (destroyTimeout): tela preta por 10 s e o menu sem o
++	// DualSense. O stop solta a thread de saida, que sai no primeiro erro;
++	// e o mesmo desenho do kill_decoder do video.
++	ssize_t codec_buf_index = AMediaCodec_dequeueInputBuffer(decoder->codec, 100 * 1000);
+ 	if(codec_buf_index >= 0)
+ 	{
+ 		CHIAKI_LOGI(decoder->log, "Audio Decoder sending EOS buffer");
+@@ -40,10 +88,35 @@ void android_chiaki_audio_decoder_shutdown_codec(AndroidChiakiAudioDecoder *deco
+ 	}
+ 	else
+ 		CHIAKI_LOGE(decoder->log, "Failed to get input buffer for shutting down Audio Decoder!");
++	__android_log_print(ANDROID_LOG_INFO, "P5MVR", "Audio decoder release: stopping the codec");
++	AMediaCodec_stop(decoder->codec);
+ 	chiaki_mutex_unlock(&decoder->codec_mutex);
+-	chiaki_thread_join(&decoder->output_thread, NULL);
++
++	// P5M: espera com prazo pela thread de saida. Ela confere `parar` a cada
++	// OUTPUT_BUFFER_TIMEOUT_MS, entao 1 s so esgota se ela estiver presa
++	// dentro do proprio codec ou do callback de audio. Nesse caso ela e
++	// abandonada e passa a ser dona do codec (ver P5MSaidaAudio): apaga-lo
++	// daqui com ela ainda dentro dele derrubaria o processo.
++	__android_log_print(ANDROID_LOG_INFO, "P5MVR", "Audio decoder release: waiting for the output thread");
++	if(saida && chiaki_thread_timedjoin(&decoder->output_thread, NULL, 1000) != CHIAKI_ERR_SUCCESS)
++	{
++		int esperado = P5M_SAIDA_RODANDO;
++		if(atomic_compare_exchange_strong(&saida->estado, &esperado, P5M_SAIDA_ABANDONADA))
++		{
++			__android_log_print(ANDROID_LOG_WARN, "P5MVR",
++					"Audio decoder release: the output thread is still stuck after 1 s; it will delete the codec when it exits");
++			decoder->codec = NULL;
++			decoder->p5m_saida = NULL;
++			return;
++		}
++		// Terminou entre o prazo e a troca: agora o join volta na hora.
++		chiaki_thread_join(&decoder->output_thread, NULL);
++	}
++	__android_log_print(ANDROID_LOG_INFO, "P5MVR", "Audio decoder release: deleting the codec");
+ 	AMediaCodec_delete(decoder->codec);
+ 	decoder->codec = NULL;
++	free(saida);
++	decoder->p5m_saida = NULL;
+ }
+ 
+ void android_chiaki_audio_decoder_fini(AndroidChiakiAudioDecoder *decoder)
+@@ -62,33 +135,60 @@ void android_chiaki_audio_decoder_get_sink(AndroidChiakiAudioDecoder *decoder, C
+ 
+ static void *android_chiaki_audio_decoder_output_thread_func(void *user)
+ {
+-	AndroidChiakiAudioDecoder *decoder = user;
++	P5MSaidaAudio *saida = user;
++	AndroidChiakiAudioDecoder *decoder = saida->decoder;
++	struct AMediaCodec *codec = saida->codec;
+ 
+ 	while(1)
+ 	{
+ 		AMediaCodecBufferInfo info;
+-		ssize_t codec_buf_index = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, -1);
++		ssize_t codec_buf_index = AMediaCodec_dequeueOutputBuffer(codec, &info, OUTPUT_BUFFER_TIMEOUT_MS * 1000);
++		// P5M: pedido de encerramento vale mais que qualquer amostra.
++		if(atomic_load(&saida->parar))
++		{
++			if(codec_buf_index >= 0)
++				AMediaCodec_releaseOutputBuffer(codec, (size_t)codec_buf_index, false);
++			break;
++		}
+ 		if(codec_buf_index >= 0)
+ 		{
+ 			if(decoder->settings_cb)
+ 			{
+ 				size_t codec_buf_size;
+-				uint8_t *codec_buf = AMediaCodec_getOutputBuffer(decoder->codec, (size_t)codec_buf_index, &codec_buf_size);
++				uint8_t *codec_buf = AMediaCodec_getOutputBuffer(codec, (size_t)codec_buf_index, &codec_buf_size);
+ 				size_t samples_count = info.size / sizeof(int16_t);
+ 				//CHIAKI_LOGD(decoder->log, "Got %llu samples => %f ms of audio", (unsigned long long)samples_count, 1000.0f * (float)(samples_count / 2) / (float)decoder->audio_header.rate);
+ 				decoder->frame_cb((int16_t *)codec_buf, samples_count, decoder->cb_user);
+ 			}
+-			AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)codec_buf_index, false);
++			AMediaCodec_releaseOutputBuffer(codec, (size_t)codec_buf_index, false);
+ 			if(info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)
+ 			{
+ 				CHIAKI_LOGI(decoder->log, "AMediaCodec for Audio Decoder reported EOS");
+ 				break;
+ 			}
+ 		}
++		// P5M: codigo negativo que nao e aviso e o codec parado ou quebrado.
++		// Antes o laco girava para sempre nele; agora e a saida.
++		else if(codec_buf_index != AMEDIACODEC_INFO_TRY_AGAIN_LATER
++				&& codec_buf_index != AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED
++				&& codec_buf_index != AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED)
++			break;
+ 	}
+ 
+-	CHIAKI_LOGI(decoder->log, "Audio Decoder Output Thread exiting");
++	int esperado = P5M_SAIDA_RODANDO;
++	if(atomic_compare_exchange_strong(&saida->estado, &esperado, P5M_SAIDA_TERMINOU))
++	{
++		CHIAKI_LOGI(decoder->log, "Audio Decoder Output Thread exiting");
++		return NULL;
++	}
+ 
++	// P5M: abandonada pelo encerramento. O decodificador pode nem existir
++	// mais; so o codec e esta estrutura sao nossos, e ninguem vai dar join.
++	__android_log_print(ANDROID_LOG_WARN, "P5MVR",
++			"Audio decoder release: the abandoned output thread exited; deleting its codec");
++	AMediaCodec_delete(codec);
++	free(saida);
++	pthread_detach(pthread_self());
+ 	return NULL;
+ }
+ 
+@@ -123,12 +223,28 @@ static void android_chiaki_audio_decoder_header(ChiakiAudioHeader *header, void
+ 
+ 	AMediaFormat_delete(format);
+ 
+-	ChiakiErrorCode err = chiaki_thread_create(&decoder->output_thread, android_chiaki_audio_decoder_output_thread_func, decoder);
++	P5MSaidaAudio *saida = calloc(1, sizeof(P5MSaidaAudio));
++	if(!saida)
++	{
++		CHIAKI_LOGE(decoder->log, "Failed to allocate the output thread state for AMediaCodec");
++		AMediaCodec_delete(decoder->codec);
++		decoder->codec = NULL;
++		goto beach;
++	}
++	saida->codec = decoder->codec;
++	saida->decoder = decoder;
++	atomic_init(&saida->parar, false);
++	atomic_init(&saida->estado, P5M_SAIDA_RODANDO);
++	decoder->p5m_saida = saida;
++
++	ChiakiErrorCode err = chiaki_thread_create(&decoder->output_thread, android_chiaki_audio_decoder_output_thread_func, saida);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 	{
+ 		CHIAKI_LOGE(decoder->log, "Failed to create output thread for AMediaCodec");
+ 		AMediaCodec_delete(decoder->codec);
+ 		decoder->codec = NULL;
++		free(saida);
++		decoder->p5m_saida = NULL;
+ 	}
+ 
+ 	uint8_t opus_id_head[0x13];
+diff --git a/android/app/src/main/cpp/audio-decoder.h b/android/app/src/main/cpp/audio-decoder.h
+index c365cd2..629cfec 100644
+--- a/android/app/src/main/cpp/audio-decoder.h
++++ b/android/app/src/main/cpp/audio-decoder.h
+@@ -19,6 +19,9 @@ typedef struct android_chiaki_audio_decoder_t
+ 
+ 	ChiakiMutex codec_mutex;
+ 	struct AMediaCodec *codec;
++	// P5M: o que a thread de saida da vez divide com o encerramento (ver
++	// audio-decoder.c). NULL quando nao ha codec.
++	struct p5m_saida_audio_t *p5m_saida;
+ 	uint64_t timestamp_cur;
+ 	ChiakiThread output_thread;
+ 

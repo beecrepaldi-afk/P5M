@@ -9,9 +9,12 @@ class DualSenseHid
 	var sendDelayMs: (Int) -> Long = { 0L }
 	var accept = true
 	var recoveries = 0
+	var dualSense = true
+	fun alvoEDualSense() = dualSense
 	fun recuperar(): Boolean { recoveries++; return false }
 	fun conectar() = true
 	fun potenciaCheia() = true
+	fun acordarAgora() = true
 	fun texto() = "test transport"
 	fun fechar() {}
 	fun mandar(report: ByteArray): Boolean

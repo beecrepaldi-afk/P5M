@@ -43,8 +43,17 @@ class MenuController private constructor(private val activity: Activity,
 	}
 
 	override fun onWindowFocusChanged(hasFocus: Boolean) {
-		if(!hasFocus) {
+		if(hasFocus) {
+			// Correcao barata da mesma medicao: o Horizon pode devolver o foco da
+			// janela sem que ensureFocus() tenha rodado desde o retorno do
+			// stream. Chamar de novo aqui e idempotente (so reafirma o foco e
+			// o contorno visual), entao nao ha risco de duplicar nada.
+			ensureFocus()
+			FocoDoRetorno.ganhou(activity)
+		} else {
 			cancelInput()
+			// Foco perdido logo depois da volta do stream: pede de volta (dev.219).
+			FocoDoRetorno.perdeu(activity)
 		}
 		original.onWindowFocusChanged(hasFocus)
 	}
@@ -85,11 +94,15 @@ class MenuController private constructor(private val activity: Activity,
 		marked = next
 		foreground = next?.foreground
 		if(next != null) {
+			// O mesmo contorno em toda tela, inclusive nas do chiaki: branco,
+			// como o foco do PS5 (dev.213). Os numeros sao os de
+			// Estilo.contornoDeFoco, repetidos porque o teste do menu compila
+			// este arquivo sozinho.
 			val density = activity.resources.displayMetrics.density
 			val outline = GradientDrawable().apply {
 				setColor(Color.TRANSPARENT)
-				cornerRadius = 12 * density
-				setStroke((3 * density).toInt(), Color.rgb(121, 169, 255))
+				cornerRadius = 18 * density
+				setStroke((3 * density).toInt(), Color.rgb(255, 255, 255))
 			}
 			next.foreground = foreground?.let {
 				android.graphics.drawable.LayerDrawable(arrayOf(it, outline))
@@ -208,6 +221,20 @@ class MenuController private constructor(private val activity: Activity,
 	}
 
 	companion object {
+		/** Chamado pelo P5MApp quando uma tela 2D volta depois de um stream. */
+		fun noteStreamReturn(activity: Activity) {
+			FocoDoRetorno.voltou()
+		}
+
+		/** Correcao barata do retorno do imersivo: instala o MenuController se ainda nao
+		 * estiver (idempotente, ver [attach]) e reforca o foco, para o caso
+		 * de a janela ganhar foco antes de onActivityPostResumed rodar ou
+		 * depois de um retorno do stream em que ele nao rodou de novo. */
+		fun ensureInstalledAndFocus(activity: Activity) {
+			attach(activity)
+			(activity.window.callback as? MenuController)?.ensureFocus()
+		}
+
 		fun attach(activity: Activity) {
 			if(activity is com.metallic.chiaki.stream.StreamActivity ||
 				activity is com.metallic.chiaki.stream.VrStreamActivity ||

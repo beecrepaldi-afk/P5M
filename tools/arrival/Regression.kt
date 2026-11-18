@@ -15,7 +15,8 @@ fun main()
 	val active = InputArrival(0L)
 	for(i in 1..100) active.sample(1_000 * MS + i * 4 * MS)
 	val a = active.report(10_000 * MS, "ns")
-	check(a.startsWith("Input timing: 10000 ms, 100 axis samples, clock ns;")) { a }
+	check(a.startsWith("Input timing: 10000 ms, 100 axis samples in 0 events " +
+		"(0 batched, biggest batch 0), clock ns;")) { a }
 	check(bins(a) == mapOf("4.00" to 99)) { a }
 
 	// Enlace em janelas de 11,25 ms: três relatórios colados por janela. A

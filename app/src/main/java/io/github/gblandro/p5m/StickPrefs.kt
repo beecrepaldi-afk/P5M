@@ -66,14 +66,14 @@ class StickPrefs(context: Context)
 	private fun ler(lado: String) = Calibragem(
 		prefs.getFloat("$lado$KEY_CX", 0f).coerceIn(-MAX_CENTER, MAX_CENTER),
 		prefs.getFloat("$lado$KEY_CY", 0f).coerceIn(-MAX_CENTER, MAX_CENTER),
-		prefs.getFloat("$lado$KEY_DZ", DEFAULT_DEADZONE).coerceIn(0f, MAX_DEADZONE))
+		prefs.getFloat("$lado$KEY_DZ", DEFAULT_DEADZONE).coerceIn(MIN_DEADZONE, MAX_DEADZONE))
 
 	private fun gravar(lado: String, c: Calibragem)
 	{
 		prefs.edit()
 			.putFloat("$lado$KEY_CX", c.centerX.coerceIn(-MAX_CENTER, MAX_CENTER))
 			.putFloat("$lado$KEY_CY", c.centerY.coerceIn(-MAX_CENTER, MAX_CENTER))
-			.putFloat("$lado$KEY_DZ", c.deadzone.coerceIn(0f, MAX_DEADZONE))
+			.putFloat("$lado$KEY_DZ", c.deadzone.coerceIn(MIN_DEADZONE, MAX_DEADZONE))
 			.apply()
 	}
 
@@ -106,6 +106,16 @@ class StickPrefs(context: Context)
 		 */
 		const val MAX_CENTER = 0.25f
 		const val MAX_DEADZONE = 0.40f
+
+		/**
+		 * Piso da zona morta (dev.226). O DualSense nao volta sempre ao mesmo
+		 * ponto quando e solto: no controle do dono o repouso variava ate ~6%
+		 * de uma soltura para outra, e a calibragem antiga, que so media o
+		 * tremor parado num ponto, tinha gravado 2,1% -- o boneco seguia
+		 * andando depois de soltar o analogico. Vale tambem para quem ja
+		 * calibrou, sem precisar medir de novo.
+		 */
+		const val MIN_DEADZONE = 0.06f
 
 		/**
 		 * Aplica a calibração a um par de eixos crus.

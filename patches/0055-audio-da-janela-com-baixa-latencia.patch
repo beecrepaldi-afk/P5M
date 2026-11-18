@@ -1,0 +1,20 @@
+diff --git a/android/app/src/main/cpp/audio-output.cpp b/android/app/src/main/cpp/audio-output.cpp
+index e6c90484..d1c5d495 100644
+--- a/android/app/src/main/cpp/audio-output.cpp
++++ b/android/app/src/main/cpp/audio-output.cpp
+@@ -148,9 +148,12 @@ extern "C" void android_chiaki_audio_output_settings(uint32_t channels, uint32_t
+ 			&& p5m_prefers_system_mixer_fn() != 0;
+ 
+ 	oboe::AudioStreamBuilder builder;
+-	builder.setPerformanceMode(p5m_shared
+-				? oboe::PerformanceMode::None
+-				: oboe::PerformanceMode::LowLatency)
++	// P5M (patch 0055): baixa latencia tambem no compartilhado. Com None o
++	// mixer entregava blocos de 960 quadros (20 ms) no modo janela; o imersivo,
++	// que cai no compartilhado com LowLatency, recebe 192 (4 ms). O stream
++	// continua compartilhado e com os mesmos atributos, entao o mixer do
++	// sistema -- e o espacializador -- seguem no caminho.
++	builder.setPerformanceMode(oboe::PerformanceMode::LowLatency)
+ 		->setSharingMode(p5m_shared
+ 				? oboe::SharingMode::Shared
+ 				: oboe::SharingMode::Exclusive)

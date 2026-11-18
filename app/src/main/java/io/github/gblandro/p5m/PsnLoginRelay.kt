@@ -105,7 +105,8 @@ class PsnLoginRelay(private val context: Context)
 
 	private fun respond(client: Socket)
 	{
-		val request = client.getInputStream().bufferedReader().readLine().orEmpty()
+		// Com prazo e teto, pelo mesmo motivo do servidor do diário.
+		val request = primeiraLinhaHttp(client)
 		val path = request.split(" ").getOrNull(1) ?: "/"
 
 		// Formulário por GET, e não por POST, de propósito: assim a requisição

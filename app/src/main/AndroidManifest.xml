@@ -16,6 +16,7 @@
     <uses-feature android:name="android.hardware.gamepad" android:required="false" />
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.HIGH_SAMPLING_RATE_SENSORS" />
@@ -32,15 +33,21 @@
          Nao ha varredura nem descoberta: por isso BLUETOOTH_CONNECT sozinha,
          sem BLUETOOTH_SCAN, que arrastaria pedido de localizacao junto. -->
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- Atualizacao em um toque: o app baixa o APK e abre o instalador. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- Sem isto o loader OpenXR nao enxerga o runtime do Horizon OS no Android 11+. -->
     <queries>
         <provider android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker" />
     </queries>
 
+    <!-- Sem backup: o que o app guarda e segredo: a chave de registro de cada
+         console (rp_key) e o refresh token da PSN, em texto. Nada depende de
+         restaurar isso: trocar de build ja pede desinstalar e logar de novo. -->
     <application
         android:name="io.github.gblandro.p5m.P5MApp"
-        android:allowBackup="true"
+        android:allowBackup="false"
+        android:networkSecurityConfig="@xml/p5m_network_security"
         android:icon="@mipmap/ic_p5m"
         android:label="P5M"
         android:isGame="true"
@@ -73,9 +80,18 @@
              carregado por fora, a etiqueta e o que garante. Ignorada por
              versoes que nao a conhecem. -->
         <meta-data android:name="com.oculus.enable_frame_sync" android:value="true" />
+        <!-- Sem isto o Horizon OS pode tratar o app como de um aparelho mais
+             antigo (modo de compatibilidade). -->
+        <meta-data android:name="com.oculus.supportedDevices" android:value="quest3|quest3s|questpro|quest2" />
 
+        <!-- Autoridade derivada do NOSSO applicationId, e nao a do chiaki.
+             Autoridade de provider e unica no aparelho inteiro: com a do chiaki
+             aqui, quem ja tinha o Chiaki carregado por fora via a instalacao do
+             P5M ser recusada pelo sistema e precisava desinstalar o outro app
+             primeiro. O nome fica em sincronia com o da LogManager.kt pelo
+             patch 0028, que tambem passou a deriva-lo do applicationId. -->
         <provider
-            android:authorities="com.metallic.chiaki.fileprovider"
+            android:authorities="io.github.gblandro.p5m.fileprovider"
             android:name="androidx.core.content.FileProvider"
             android:grantUriPermissions="true"
             android:exported="false">
@@ -89,7 +105,7 @@
              limite de caracteres de uma issue, anexar arquivo nao. -->
         <provider
             android:authorities="io.github.gblandro.p5m.diagnostics"
-            android:name="androidx.core.content.FileProvider"
+            android:name="io.github.gblandro.p5m.ProvedorDeArquivos"
             android:grantUriPermissions="true"
             android:exported="false">
             <meta-data
@@ -170,7 +186,7 @@
         <activity
             android:name="io.github.gblandro.p5m.DiagnosticActivity"
             android:label="P5M Diagnostics"
-            android:exported="true"
+            android:exported="false"
             android:theme="@android:style/Theme.Material"
             android:configChanges="keyboard|keyboardHidden|orientation|screenSize">
             <intent-filter>

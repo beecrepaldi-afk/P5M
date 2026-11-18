@@ -55,15 +55,35 @@ import android.view.InputDevice
  * suficiente para não abrir buraco, e cinco chamadas de binder por segundo em
  * vez das sessenta que os eventos do console trariam.
  */
-class Rumble(private val enabled: Boolean)
+class Rumble(enabled: Boolean)
 {
-	/** Um gamepad que respondeu ter motor, com o caminho por onde acioná-lo. */
+	/**
+	 * Ligado de verdade: a preferencia do chiaki E a escolha do lancador.
+	 *
+	 * O `desligado` e do processo, e nao deste objeto, porque o modo janela
+	 * constroi o `Rumble` dentro do chiaki-ng, por patch, e nao ha como passar
+	 * a preferencia ate la sem regerar patch. O `DisplayMode.startStream` e o
+	 * funil por onde as duas telas passam, e e ele quem escreve aqui.
+	 */
+	private val enabled = enabled && !desligado
+
+	/**
+	 * Um gamepad que respondeu ter motor, com o caminho por onde acioná-lo.
+	 *
+	 * Com `formato`, o motor não passa pelo Android: vai por relatório HID
+	 * do fabricante, pela ponte Bluetooth (ver [PadHid]). A ponte só nasce
+	 * no primeiro envio, para a varredura não abrir uma por controle que olha.
+	 */
 	private class Destino(
 		val nome: String,
 		val manager: VibratorManager?,
 		val ids: IntArray,
 		val legacy: Vibrator?,
-		val amplitudeControl: Boolean)
+		val amplitudeControl: Boolean,
+		val formato: PadHid.Formato? = null)
+	{
+		var pad: PadHid? = null
+	}
 
 	private var destino: Destino? = null
 	private var preferido: Int? = null
@@ -77,6 +97,38 @@ class Rumble(private val enabled: Boolean)
 	// nem a de eventos do chiaki (que também entrega vídeo).
 	private var relogioThread: HandlerThread? = null
 	private var relogio: Handler? = null
+
+	/**
+	 * No modo motor a intensidade vem da trilha da bobina, e o fim de um efeito
+	 * nao manda zero: o console so para de mandar trilha. O lado nativo
+	 * (patch 0032) repete o valor a cada ~150 ms enquanto a trilha vive; se
+	 * esse sinal de vida some, isto solta o motor. Antes o controle vibrava
+	 * sem parar depois de um pulo, ate o proximo efeito.
+	 */
+	private val vigia = object: Runnable
+	{
+		override fun run()
+		{
+			synchronized(this@Rumble)
+			{
+				if(lastLeft <= 0 && lastRight <= 0)
+					return
+				soltosPelaVigia++
+				if(soltosPelaVigia == 1)
+					Log.i(TAG, "Rumble: the console's haptic track stopped without a zero; " +
+							"motor released after ${VIGIA_MS} ms")
+				lastLeft = 0
+				lastRight = 0
+				relogio?.removeCallbacks(rearme)
+				// Dentro da trava, como no set(): fora dela, um efeito novo
+				// que chegasse entre zerar e cancelar seria cancelado aqui.
+				cancel()
+			}
+		}
+	}
+
+	/** Quantas vezes a vigia soltou o motor, para o diario. */
+	@Volatile var soltosPelaVigia = 0
 
 	private val rearme = object: Runnable
 	{
@@ -126,9 +178,14 @@ class Rumble(private val enabled: Boolean)
 			return
 		}
 
-		Log.i(TAG, "Rumble target: '${achado.nome}', "
-				+ "${if(achado.manager != null) "${achado.ids.size} motor(s)" else "1 motor"}, "
-				+ "${if(achado.amplitudeControl) "variable" else "fixed"} strength")
+		val formato = achado.formato
+		if(formato != null)
+			Log.i(TAG, "Rumble target: '${achado.nome}', ${formato.rotulo} report over the "
+					+ "Bluetooth HID bridge")
+		else
+			Log.i(TAG, "Rumble target: '${achado.nome}', "
+					+ "${if(achado.manager != null) "${achado.ids.size} motor(s)" else "1 motor"}, "
+					+ "${if(achado.amplitudeControl) "variable" else "fixed"} strength")
 
 		// Buzina de teste. Não é enfeite: sem ela, "o jogo não vibrou" e "a rota
 		// não funciona" continuam indistinguíveis, e a diferença entre as duas
@@ -142,9 +199,8 @@ class Rumble(private val enabled: Boolean)
 	 * Intensidades do console, de 0 a 255.
 	 *
 	 * Chamado da thread de eventos do chiaki, não da principal. Valor repetido é
-	 * descartado antes de virar chamada de binder: durante vibração contínua os
-	 * eventos chegam sem parar, e refazer o mesmo pedido dezenas de vezes por
-	 * segundo trava a thread que também entrega vídeo.
+	 * descartado aqui mesmo: durante vibração contínua os eventos chegam sem
+	 * parar. O resto vai para o relógio (ver [aplicarUltimo]).
 	 */
 	@Synchronized
 	fun set(left: Int, right: Int)
@@ -156,43 +212,83 @@ class Rumble(private val enabled: Boolean)
 		}
 		if(!enabled)
 			return
+		// Antes da deduplicacao: o valor repetido e justamente o sinal de vida.
+		if(vigiarTrilha)
+		{
+			relogio?.removeCallbacks(vigia)
+			if(left > 0 || right > 0)
+				relogio?.postDelayed(vigia, VIGIA_MS)
+		}
 		if(left == lastLeft && right == lastRight)
 			return
 		lastLeft = left
 		lastRight = right
 
-		if(destino == null)
+		// A chamada ao sistema vai para o relogio, e nao aqui. Esta e a thread
+		// de eventos do chiaki, a mesma que entrega video, e vibrar (ou varrer
+		// os controles atras de motor) e binder: cada mudanca de intensidade a
+		// fazia esperar o servico do Android. Um Runnable so, reposto: valores
+		// que chegam antes de ele rodar so trocam o que ele vai ler.
+		val r = relogio
+		if(r != null)
 		{
-			// O controle pode ter acordado depois da abertura do stream, e um
-			// evento de silêncio não é motivo para varrer o barramento inteiro.
-			if(left == 0 && right == 0)
-				return
-			if(SystemClock.uptimeMillis() - ultimaVarreduraMs < REVARREDURA_MS)
-				return
-			val achado = varrer() ?: return
-			destino = achado
-			Log.i(TAG, "Rumble target found late: '${achado.nome}' — it was not exposing "
-					+ "a motor when the stream opened")
+			r.removeCallbacks(aplicarUltimo)
+			r.post(aplicarUltimo)
 		}
+	}
 
-		if(left == 0 && right == 0)
+	/**
+	 * O ultimo valor pedido, aplicado no relogio. Tudo que chama o sistema
+	 * (vibrar, cancelar, varrer) passa a correr numa thread so, em ordem, e sem
+	 * a trava: o set() nunca espera por binder.
+	 */
+	private val aplicarUltimo = object: Runnable
+	{
+		override fun run()
 		{
-			// Cancela sem passar por stop(): aquele também zera o último valor
-			// lido, e zerá-lo aqui desfaria a deduplicação que acabamos de
-			// fazer -- cada evento de silêncio repetido viraria outra chamada de
-			// binder, na thread que também entrega vídeo.
+			val left: Int
+			val right: Int
+			synchronized(this@Rumble)
+			{
+				// Depois do stop() nada mais sai, mesmo que isto ja estivesse
+				// na fila quando ele rodou.
+				if(relogio == null)
+					return
+				left = lastLeft
+				right = lastRight
+				if(destino == null)
+				{
+					// O controle pode ter acordado depois da abertura do stream, e
+					// um evento de silencio nao e motivo para varrer o barramento
+					// inteiro.
+					if(left <= 0 && right <= 0)
+						return
+					if(SystemClock.uptimeMillis() - ultimaVarreduraMs < REVARREDURA_MS)
+						return
+					val achado = varrer() ?: return
+					destino = achado
+					Log.i(TAG, "Rumble target found late: '${achado.nome}' — it was not exposing "
+							+ "a motor when the stream opened")
+				}
+			}
+
+			if(left <= 0 && right <= 0)
+			{
+				// Cancela sem passar por stop(): aquele tambem zera o ultimo
+				// valor lido, e zera-lo aqui desfaria a deduplicacao.
+				relogio?.removeCallbacks(rearme)
+				cancel()
+				return
+			}
+
+			emitir(left, right, SUSTAIN_MS)
 			relogio?.removeCallbacks(rearme)
-			cancel()
-			return
+			// So quem nao se sustenta precisa de relogio. Rearmar uma onda que ja
+			// se repete e o que fazia o motor pulsar: cada reemissao reinicia o
+			// efeito do zero.
+			if(!sustentaSozinho())
+				relogio?.postDelayed(rearme, REARMAR_MS)
 		}
-
-		emitir(left, right, SUSTAIN_MS)
-		relogio?.removeCallbacks(rearme)
-		// So quem nao se sustenta precisa de relogio. Rearmar uma onda que ja
-		// se repete e o que fazia o motor pulsar: cada reemissao reinicia o
-		// efeito do zero.
-		if(!sustentaSozinho())
-			relogio?.postDelayed(rearme, REARMAR_MS)
 	}
 
 	/**
@@ -227,6 +323,8 @@ class Rumble(private val enabled: Boolean)
 			val resposta = when
 			{
 				achado == null -> "no motor exposed to Android"
+				achado.formato != null -> "no motor exposed to Android; " +
+						"${achado.formato.rotulo} report over the Bluetooth HID bridge instead"
 				achado.manager != null -> "${achado.ids.size} motor(s) via vibrator manager, " +
 						"${if(achado.amplitudeControl) "variable" else "fixed"} strength"
 				else -> "1 motor via the legacy path, " +
@@ -278,7 +376,14 @@ class Rumble(private val enabled: Boolean)
 			}
 		}
 		if(manager == null && legacy == null)
-			return null
+		{
+			// O último recurso, e só para quem conhecemos: mandar relatório de
+			// fabricante a um controle desconhecido não é inócuo.
+			val formato = PadHid.formato(device) ?: return null
+			if(P5MApp.contexto == null || !DualSenseHid.disponivel(P5MApp.contexto!!))
+				return null
+			return Destino(device.name, null, IntArray(0), null, true, formato)
+		}
 		return Destino(device.name, manager, ids, legacy, amplitude)
 	}
 
@@ -294,6 +399,17 @@ class Rumble(private val enabled: Boolean)
 		val alvo = destino ?: return
 		val l = left.coerceIn(0, 255)
 		val r = right.coerceIn(0, 255)
+		val formato = alvo.formato
+		if(formato != null)
+		{
+			val ctx = P5MApp.contexto ?: return
+			val pad = alvo.pad ?: PadHid(ctx, alvo.nome, formato).also { alvo.pad = it }
+			if(sustentado)
+				pad.vibrar(l, r)
+			else
+				pad.tocar(l, r, durationMs)
+			return
+		}
 		try
 		{
 			val mgr = alvo.manager
@@ -403,6 +519,7 @@ class Rumble(private val enabled: Boolean)
 		{
 			destino?.manager?.cancel()
 			destino?.legacy?.cancel()
+			destino?.pad?.vibrar(0, 0)
 		}
 		catch(e: Exception)
 		{
@@ -415,7 +532,11 @@ class Rumble(private val enabled: Boolean)
 	fun stop()
 	{
 		relogio?.removeCallbacks(rearme)
+		relogio?.removeCallbacks(vigia)
+		relogio?.removeCallbacks(aplicarUltimo)
 		cancel()
+		destino?.pad?.fechar()
+		destino?.pad = null
 		relogioThread?.quitSafely()
 		relogioThread = null
 		relogio = null
@@ -425,6 +546,19 @@ class Rumble(private val enabled: Boolean)
 
 	companion object
 	{
+		/**
+		 * Ninguem vibra, nem a buzina de teste.
+		 *
+		 * Existe porque vibracao incomoda parte das pessoas, e porque o
+		 * desligado tem de valer nos dois modos de tela -- o da janela nasce
+		 * dentro do codigo do chiaki.
+		 */
+		@Volatile var desligado = false
+
+		/** Modo motor: soltar o motor quando a trilha do console some. */
+		@Volatile var vigiarTrilha = false
+		private const val VIGIA_MS = 300L
+
 		private const val TAG = "P5MVR"
 
 		/**

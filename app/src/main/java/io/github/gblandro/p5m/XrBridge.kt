@@ -48,6 +48,14 @@ class XrBridge(private val activity: Activity)
 	val lastError: String
 		get() = if(nativePtr != 0L) nativeLastError(nativePtr) else "session not created"
 
+	/**
+	 * O runtime encerrou a sessão imersiva por conta própria (saída pelo menu
+	 * do sistema, perda da sessão). O loop de quadros já parou; a activity
+	 * precisa sair, ou o som segue sobre uma tela que não volta.
+	 */
+	val sessionEnded: Boolean
+		get() = nativePtr != 0L && nativeSessionEnded(nativePtr)
+
 	fun start()
 	{
 		if(nativePtr != 0L)
@@ -100,8 +108,8 @@ class XrBridge(private val activity: Activity)
 	 * Casa a taxa do painel com o framerate da fonte e devolve a taxa aplicada,
 	 * ou 0 se o runtime não expuser a extensão.
 	 */
-	fun selectDisplayRefreshRate(sourceFps: Int): Float =
-		if(nativePtr != 0L) nativeSelectDisplayRefreshRate(nativePtr, sourceFps) else 0f
+	fun selectDisplayRefreshRate(sourceFps: Int, maxHz: Int = 120): Float =
+		if(nativePtr != 0L) nativeSelectDisplayRefreshRate(nativePtr, sourceFps, maxHz) else 0f
 
 	/** @param shape 0 = cilindro (tela curva), 1 = quad (tela plana). */
 	fun setLayerShape(shape: Int)
@@ -129,6 +137,9 @@ class XrBridge(private val activity: Activity)
 	 * Tem de vir antes de [createVideoSurface]: os dois caminhos criam
 	 * swapchains de tipos diferentes.
 	 */
+	/** Banco de ensaio: a verdade de real/repetição vem no pts (ver FonteSintetica). */
+	fun setBenchTruth(enabled: Boolean) = nativeSetBenchTruth(enabled)
+
 	fun setRenderPath(path: Int, sourceIsPq: Boolean)
 	{
 		if(nativePtr != 0L)
@@ -217,22 +228,11 @@ class XrBridge(private val activity: Activity)
 			nativeSetVerticalFlip(nativePtr, enabled)
 	}
 
-	/**
-	 * Diz se a imagem carrega os dois olhos: 0 mono, 1 lado a lado, 2 uma sobre
-	 * a outra.
-	 *
-	 * Vale para as duas origens de estereo, e `synthetic` diz qual delas e.
-	 *
-	 * Do lado da submissao elas deixaram de ser a mesma coisa. Um video que ja
-	 * veio com os dois olhos numa imagem so obriga cada camada a ser metade
-	 * dessa imagem; a saida do nosso sintetizador vai para um swapchain por
-	 * olho, e cada camada leva uma imagem inteira. So a segunda aceita o filtro
-	 * de nitidez do compositor -- sobre recorte ele desenha um X na tela.
-	 */
-	fun setStereoMode(mode: Int, synthetic: Boolean = false)
+	/** 3D emulado: dois olhos deformados pela profundidade adivinhada. */
+	fun setSyntheticStereo(on: Boolean)
 	{
 		if(nativePtr != 0L)
-			nativeSetStereoMode(nativePtr, mode, synthetic)
+			nativeSetSyntheticStereo(nativePtr, on)
 	}
 
 	/**
@@ -247,6 +247,13 @@ class XrBridge(private val activity: Activity)
 			nativeSetStereoTuning(nativePtr, strength, convergence)
 	}
 
+	/** Modo Pop-out do 3D: mais salto, com moldura flutuante na frente. */
+	fun setStereoPopOut(on: Boolean)
+	{
+		if(nativePtr != 0L)
+			nativeSetStereoPopOut(nativePtr, on)
+	}
+
 	/** Sobe o painel de ajuda ja desenhado. O bitmap precisa ser ARGB_8888. */
 	fun setHudBitmap(bitmap: Bitmap)
 	{
@@ -258,6 +265,16 @@ class XrBridge(private val activity: Activity)
 	{
 		if(nativePtr != 0L)
 			nativeSetHudVisible(nativePtr, visible)
+	}
+
+	/**
+	 * Painel logo abaixo da tela do jogo (true, o normal) ou um pouco abaixo da
+	 * linha dos olhos (false: teclado do PIN, quando ainda nao ha tela).
+	 */
+	fun setHudBelowScreen(below: Boolean)
+	{
+		if(nativePtr != 0L)
+			nativeSetHudBelowScreen(nativePtr, below)
 	}
 
 	fun setPassthrough(enabled: Boolean)
@@ -279,9 +296,14 @@ class XrBridge(private val activity: Activity)
 			return
 		nativeDestroy(nativePtr)
 		nativePtr = 0L
-		videoSurface = null
 		// Depois do destroy nativo: o lado C++ solta a ASurfaceTexture, e
-		// liberar antes deixaria ele com referencia para objeto morto.
+		// liberar antes deixaria ele com referencia para objeto morto. O
+		// Surface do caminho com shader e nosso e segura um buffer da fila da
+		// textura ate o release; o do caminho direto e do runtime, que o
+		// desfaz junto com o swapchain.
+		if(surfaceTexture != null)
+			videoSurface?.release()
+		videoSurface = null
 		surfaceTexture?.release()
 		surfaceTexture = null
 	}
@@ -289,26 +311,30 @@ class XrBridge(private val activity: Activity)
 	private external fun nativeCreate(activity: Activity): Long
 	private external fun nativeCreateVideoSurface(ptr: Long, width: Int, height: Int): Surface?
 	private external fun nativeLastError(ptr: Long): String
+	private external fun nativeSessionEnded(ptr: Long): Boolean
 	private external fun nativeStart(ptr: Long)
 	private external fun nativeStop(ptr: Long)
 	private external fun nativeSetScreenParams(ptr: Long, radius: Float, centralAngle: Float, yawOffset: Float, heightOffset: Float, curvature: Float)
 	private external fun nativeSetQuality(ptr: Long, sharpness: Int, sharpenAmount: Float,
 			passthroughOpacity: Float, cinemaBrightness: Float, cinemaContrast: Float,
 			cinemaSaturation: Float, videoBrightness: Float, frameExtrapolation: Boolean)
-	private external fun nativeSelectDisplayRefreshRate(ptr: Long, sourceFps: Int): Float
+	private external fun nativeSelectDisplayRefreshRate(ptr: Long, sourceFps: Int, maxHz: Int): Float
 	private external fun nativeSetLayerShape(ptr: Long, shape: Int)
 	private external fun nativeSetVideoLayerEnabled(ptr: Long, enabled: Boolean)
 	private external fun nativeSetVerticalFlip(ptr: Long, enabled: Boolean)
-	private external fun nativeSetStereoMode(ptr: Long, mode: Int, synthetic: Boolean)
+	private external fun nativeSetSyntheticStereo(ptr: Long, on: Boolean)
 	private external fun nativeSetStereoTuning(ptr: Long, strength: Float, convergence: Float)
+	private external fun nativeSetStereoPopOut(ptr: Long, on: Boolean)
 	private external fun nativeSetWideColor(ptr: Long, wide: Boolean)
 	private external fun nativeSetSpatialAudio(strength: Float)
 	private external fun nativeReadPerformance(ptr: Long): FloatArray?
 	private external fun nativeRecommendedResolution(ptr: Long): Long
 	private external fun nativeSetRenderPath(ptr: Long, path: Int, sourceIsPq: Boolean)
+	private external fun nativeSetBenchTruth(enabled: Boolean)
 	private external fun nativeAttachSurfaceTexture(ptr: Long, texture: SurfaceTexture): Boolean
 	private external fun nativeSetHudBitmap(ptr: Long, bitmap: Bitmap)
 	private external fun nativeSetHudVisible(ptr: Long, visible: Boolean)
+	private external fun nativeSetHudBelowScreen(ptr: Long, below: Boolean)
 	private external fun nativeSetPassthrough(ptr: Long, enabled: Boolean)
 	private external fun nativeIsPassthroughSupported(ptr: Long): Boolean
 	private external fun nativeRecenter(ptr: Long)

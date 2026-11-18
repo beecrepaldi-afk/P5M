@@ -1,0 +1,79 @@
+diff --git a/lib/src/streamconnection.c b/lib/src/streamconnection.c
+index 142f57f..1c49db3 100644
+--- a/lib/src/streamconnection.c
++++ b/lib/src/streamconnection.c
+@@ -12,6 +12,66 @@
+ #include <string.h>
+ #include <inttypes.h>
+ #include <assert.h>
++#include <chiaki/time.h>
++
++/*
++ * P5M: o bitrate de verdade, no diario, a cada dez segundos.
++ *
++ * O console manda de tempos em tempos um relatorio de qualidade da conexao
++ * com o bitrate que o codificador dele esta mirando, e o chiaki calcula o que
++ * chegou; os dois so saiam no nivel verbose, desligado. Sem eles nao havia
++ * como saber se um teto acima de 50 Mbps e aceito pelo console, nem quanto
++ * ele de fato usa (dev.212). O maximo da sessao vai junto em cada linha,
++ * porque a pergunta e "passou dos 50?" e a resposta tem de sobreviver a uma
++ * janela calma no fim.
++ *
++ * Estaticas porque ha uma sessao por processo; zeradas quando a janela nasce
++ * de uma sessao nova (stream_connection diferente).
++ */
++static void p5m_bitrate_janela(ChiakiStreamConnection *sc, int32_t alvo, double rtt, long long perda)
++{
++	static ChiakiStreamConnection *dono = NULL;
++	static uint64_t inicio_ms = 0;
++	static unsigned relatos = 0;
++	static int32_t alvo_min = 0, alvo_max = 0, alvo_ultimo = 0, alvo_sessao = 0;
++	static double medido_soma = 0.0, medido_max = 0.0, medido_sessao = 0.0, rtt_max = 0.0;
++	static long long perda_max = 0;
++	uint64_t agora = chiaki_time_now_monotonic_ms();
++	if(dono != sc)
++	{
++		dono = sc;
++		inicio_ms = agora;
++		relatos = 0;
++		alvo_sessao = 0;
++		medido_sessao = 0.0;
++		alvo_min = alvo_max = 0;
++		medido_soma = medido_max = rtt_max = 0.0;
++		perda_max = 0;
++	}
++	double medido = sc->measured_bitrate;
++	if(relatos == 0 || alvo < alvo_min) alvo_min = alvo;
++	if(relatos == 0 || alvo > alvo_max) alvo_max = alvo;
++	if(alvo > alvo_sessao) alvo_sessao = alvo;
++	if(medido > medido_max) medido_max = medido;
++	if(medido > medido_sessao) medido_sessao = medido;
++	if(rtt > rtt_max) rtt_max = rtt;
++	if(perda > perda_max) perda_max = perda;
++	alvo_ultimo = alvo;
++	medido_soma += medido;
++	relatos++;
++	if(agora - inicio_ms < 10000)
++		return;
++	CHIAKI_LOGE(sc->log, "P5M: bitrate 10s: asked %u kbps; console target %d..%d (last %d, session max %d); "
++			"received %.1f Mbps avg, %.1f max (session max %.1f); %u reports, rtt max %.4f, loss max %lld",
++			(unsigned)sc->session->connect_info.video_profile.bitrate,
++			alvo_min, alvo_max, alvo_ultimo, alvo_sessao,
++			medido_soma / relatos, medido_max, medido_sessao, relatos, rtt_max, perda_max);
++	inicio_ms = agora;
++	relatos = 0;
++	alvo_min = alvo_max = 0;
++	medido_soma = medido_max = rtt_max = 0.0;
++	perda_max = 0;
++}
+ #ifndef _WIN32
+ #include <unistd.h>
+ #include <sys/types.h>
+@@ -786,6 +846,7 @@ static void stream_connection_takion_data_idle(ChiakiStreamConnection *stream_co
+ 			 q.disable_upstream_audio, q.rtt, q.loss);
+ 		stream_connection->measured_bitrate = chiaki_stream_stats_bitrate(&stream_connection->video_receiver->frame_processor.stream_stats, stream_connection->session->connect_info.video_profile.max_fps) / 1000000.0;
+ 		CHIAKI_LOGV(stream_connection->log, "StreamConnection measured bitrate: %.4f MBit/s", stream_connection->measured_bitrate);
++		p5m_bitrate_janela(stream_connection, q.target_bitrate, q.rtt, q.loss);
+ 		chiaki_stream_stats_reset(&stream_connection->video_receiver->frame_processor.stream_stats);
+ 		break;
+ 	}

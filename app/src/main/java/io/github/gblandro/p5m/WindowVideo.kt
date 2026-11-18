@@ -51,7 +51,7 @@ object WindowVideo
 		//
 		// No modo imersivo isso não acontecia porque lá o gamut é declarado ao
 		// compositor; uma janela do Android não tem onde declarar nada.
-		if((sharpen <= 0f && !quality.tenBit) || owner == null)
+		if((sharpen <= 0f && !quality.tenBitNaSessao) || owner == null)
 		{
 			Log.i(TAG, "Window without shader: the decoder writes straight to the surface")
 			session.attachToSurfaceView(surfaceView)
@@ -72,7 +72,7 @@ object WindowVideo
 		// sido pedida a conversão de tons: o decodificador entrega PQ de todo
 		// jeito -- o pedido de mapeamento é ignorado, como o log mostrou --, e
 		// tratar esses valores como SDR sairia com as cores deslocadas.
-		val view = SharpVideoView(activity, quality.tenBit, sharpen) { surface ->
+		val view = SharpVideoView(activity, quality.tenBitNaSessao, sharpen) { surface ->
 			session.attachToSurface(surface)
 		}
 		val index = parent.indexOfChild(surfaceView)
@@ -109,6 +109,6 @@ object WindowVideo
 
 		Log.i(TAG, "Window with shader: sharpness ${quality.windowSharpness} "
 				+ "(${StreamQualityPrefs.SHARPNESS_NAMES[quality.windowSharpness]})"
-				+ (if(quality.tenBit) ", 10-bit PQ source" else ", 8-bit SDR source"))
+				+ (if(quality.tenBitNaSessao) ", 10-bit PQ source" else ", 8-bit SDR source"))
 	}
 }

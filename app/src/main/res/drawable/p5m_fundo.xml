@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- O fundo do P5M (dev.213): o degrade azul do PS5 com dois brilhos difusos,
+     o mesmo de Estilo.fundoDaTela, para a lista de consoles do chiaki. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <gradient android:angle="270" android:startColor="#0A1428" android:endColor="#05070D" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <gradient android:type="radial" android:gradientRadius="70%p"
+                android:centerX="0.15" android:centerY="0.05"
+                android:startColor="#6E1E5AD2" android:endColor="#001E5AD2" />
+        </shape>
+    </item>
+    <item>
+        <shape android:shape="rectangle">
+            <gradient android:type="radial" android:gradientRadius="60%p"
+                android:centerX="0.9" android:centerY="0.95"
+                android:startColor="#465A3CC8" android:endColor="#005A3CC8" />
+        </shape>
+    </item>
+</layer-list>

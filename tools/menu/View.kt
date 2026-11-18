@@ -46,7 +46,11 @@ class Window {
     }
 }
 class InputDevice(val sources:Int) {
-    companion object { const val SOURCE_GAMEPAD=0x401; const val SOURCE_JOYSTICK=0x1000010 }
+    val name="stub"
+    companion object {
+        const val SOURCE_GAMEPAD=0x401; const val SOURCE_JOYSTICK=0x1000010
+        fun getDevice(id:Int):InputDevice?=InputDevice(SOURCE_JOYSTICK)
+    }
 }
 class KeyEvent(val downTime:Long,val eventTime:Long,val action:Int,val keyCode:Int,
     val repeatCount:Int,val metaState:Int=0,val deviceId:Int=62,val scanCode:Int=0,
@@ -62,7 +66,9 @@ class KeyEvent(val downTime:Long,val eventTime:Long,val action:Int,val keyCode:I
 }
 class MotionEvent(val deviceId:Int,val x:Float,val y:Float) {
     val action=ACTION_MOVE
+    val source=InputDevice.SOURCE_JOYSTICK
+    val device=InputDevice(source)
     fun isFromSource(s:Int)=s==InputDevice.SOURCE_JOYSTICK
     fun getAxisValue(a:Int)=when(a) { AXIS_X->x; AXIS_Y->y; else->0f }
-    companion object { const val ACTION_MOVE=2; const val AXIS_X=0; const val AXIS_Y=1; const val AXIS_HAT_X=15; const val AXIS_HAT_Y=16 }
+    companion object { const val ACTION_MOVE=2; const val AXIS_X=0; const val AXIS_Y=1; const val AXIS_HAT_X=15; const val AXIS_HAT_Y=16; const val AXIS_LTRIGGER=17; const val AXIS_RTRIGGER=18; const val AXIS_GAS=22; const val AXIS_BRAKE=23 }
 }

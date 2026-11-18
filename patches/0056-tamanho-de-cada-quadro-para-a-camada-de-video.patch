@@ -1,0 +1,31 @@
+diff --git a/android/app/src/main/cpp/video-decoder.c b/android/app/src/main/cpp/video-decoder.c
+index 975477b..65c6f1d 100644
+--- a/android/app/src/main/cpp/video-decoder.c
++++ b/android/app/src/main/cpp/video-decoder.c
+@@ -505,6 +505,26 @@ bool android_chiaki_video_decoder_video_sample(uint8_t *buf, size_t buf_size, in
+ 		goto beach;
+ 	}
+ 
++	// P5M (patch 0056): o tamanho de cada quadro vai para a camada de video,
++	// indexado pelo mesmo pts que volta no timestamp da SurfaceTexture. Jogo a
++	// 30 fps num stream de 60 manda metade dos quadros como repeticao, e
++	// repeticao chega quase vazia; e assim que o quadro previsto sabe que a
++	// imagem nao andou. Mesmo caminho do p5m_video_decoder_size: dlsym na
++	// biblioteca ja carregada, procurado uma vez so.
++	{
++		static void (*tamanho_quadro)(uint64_t, uint32_t) = NULL;
++		static bool procurado = false;
++		if(!procurado)
++		{
++			procurado = true;
++			void *p5m = dlopen("libp5m-vr.so", RTLD_NOW);
++			if(p5m)
++				tamanho_quadro = (void (*)(uint64_t, uint32_t))dlsym(p5m, "p5m_video_sample_size");
++		}
++		if(tamanho_quadro)
++			tamanho_quadro(decoder->timestamp_cur, (uint32_t)buf_size);
++	}
++
+ 	while(buf_size > 0)
+ 	{
+ 		ssize_t codec_buf_index = AMediaCodec_dequeueInputBuffer(decoder->codec, INPUT_BUFFER_TIMEOUT_MS * 1000);

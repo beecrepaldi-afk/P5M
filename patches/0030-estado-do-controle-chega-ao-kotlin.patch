@@ -1,0 +1,270 @@
+diff --git a/android/app/src/main/cpp/chiaki-jni.c b/android/app/src/main/cpp/chiaki-jni.c
+index c0cd369..641f5bd 100644
+--- a/android/app/src/main/cpp/chiaki-jni.c
++++ b/android/app/src/main/cpp/chiaki-jni.c
+@@ -181,6 +181,12 @@ typedef struct android_chiaki_session_t
+ 	jmethodID java_session_event_login_pin_request_meth;
+ 	jmethodID java_session_event_quit_meth;
+ 	jmethodID java_session_event_rumble_meth;
++	jmethodID java_session_event_trigger_effects_meth;
++	jmethodID java_session_event_trigger_intensity_meth;
++	jmethodID java_session_event_haptic_intensity_meth;
++	jmethodID java_session_event_led_color_meth;
++	jmethodID java_session_event_player_index_meth;
++	jmethodID java_session_event_led_brightness_meth;
+ 	jfieldID java_controller_state_buttons;
+ 	jfieldID java_controller_state_l2_state;
+ 	jfieldID java_controller_state_r2_state;
+@@ -293,6 +299,57 @@ static void android_chiaki_event_cb(ChiakiEvent *event, void *user)
+ 							  (jint)event->rumble.left,
+ 							  (jint)event->rumble.right);
+ 			break;
++		// P5M: os gatilhos adaptativos. O console so manda quando o cliente se
++		// anuncia como DualSense, e manda o efeito ja no formato do controle:
++		// um byte de modo e dez de parametro por gatilho. Vai ao Kotlin na
++		// ordem do relatorio 0x31 -- direito primeiro, depois esquerdo -- para
++		// que la seja copiar e nao remontar.
++		case CHIAKI_EVENT_TRIGGER_EFFECTS:
++		{
++			jbyteArray efeito = E->NewByteArray(env, 22);
++			if(!efeito)
++				break;
++			jbyte bytes[22];
++			bytes[0] = (jbyte)event->trigger_effects.type_right;
++			memcpy(bytes + 1, event->trigger_effects.right, 10);
++			bytes[11] = (jbyte)event->trigger_effects.type_left;
++			memcpy(bytes + 12, event->trigger_effects.left, 10);
++			E->SetByteArrayRegion(env, efeito, 0, 22, bytes);
++			E->CallVoidMethod(env, session->java_session,
++							  session->java_session_event_trigger_effects_meth, efeito);
++			E->DeleteLocalRef(env, efeito);
++			break;
++		}
++		// A intensidade que o jogador escolheu nos ajustes do proprio PS5:
++		// 0 desligado, 1 forte, 2 media, 3 fraca.
++		case CHIAKI_EVENT_TRIGGER_INTENSITY:
++			E->CallVoidMethod(env, session->java_session,
++							  session->java_session_event_trigger_intensity_meth,
++							  (jint)event->intensity);
++			break;
++		// A intensidade da vibracao, do mesmo menu do PS5, na mesma escala.
++		case CHIAKI_EVENT_HAPTIC_INTENSITY:
++			E->CallVoidMethod(env, session->java_session,
++							  session->java_session_event_haptic_intensity_meth,
++							  (jint)event->intensity);
++			break;
++		// A cor da barra de luz que o jogo escolheu, e o numero do jogador.
++		case CHIAKI_EVENT_LED_COLOR:
++			E->CallVoidMethod(env, session->java_session,
++							  session->java_session_event_led_color_meth,
++							  (jint)event->led_state[0], (jint)event->led_state[1],
++							  (jint)event->led_state[2]);
++			break;
++		case CHIAKI_EVENT_PLAYER_INDEX:
++			E->CallVoidMethod(env, session->java_session,
++							  session->java_session_event_player_index_meth,
++							  (jint)event->player_index);
++			break;
++		case CHIAKI_EVENT_P5M_LED_BRIGHTNESS:
++			E->CallVoidMethod(env, session->java_session,
++							  session->java_session_event_led_brightness_meth,
++							  (jint)event->p5m_led_brightness);
++			break;
+ 		default:
+ 			break;
+ 	}
+@@ -762,6 +819,12 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject
+ 	session->java_session_event_login_pin_request_meth = E->GetMethodID(env, session->java_session_class, "eventLoginPinRequest", "(Z)V");
+ 	session->java_session_event_quit_meth = E->GetMethodID(env, session->java_session_class, "eventQuit", "(ILjava/lang/String;)V");
+ 	session->java_session_event_rumble_meth = E->GetMethodID(env, session->java_session_class, "eventRumble", "(II)V");
++	session->java_session_event_trigger_effects_meth = E->GetMethodID(env, session->java_session_class, "eventTriggerEffects", "([B)V");
++	session->java_session_event_trigger_intensity_meth = E->GetMethodID(env, session->java_session_class, "eventTriggerIntensity", "(I)V");
++	session->java_session_event_haptic_intensity_meth = E->GetMethodID(env, session->java_session_class, "eventHapticIntensity", "(I)V");
++	session->java_session_event_led_color_meth = E->GetMethodID(env, session->java_session_class, "eventLedColor", "(III)V");
++	session->java_session_event_player_index_meth = E->GetMethodID(env, session->java_session_class, "eventPlayerIndex", "(I)V");
++	session->java_session_event_led_brightness_meth = E->GetMethodID(env, session->java_session_class, "eventLedBrightness", "(I)V");
+ 
+ 	// O sink de haptica so pode ser ligado depois dos method ids: o callback
+ 	// usa java_session_event_rumble_meth, e a trilha pode comecar a chegar
+diff --git a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+index 79370a2..2cd5a14 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+@@ -398,6 +398,19 @@ object ConnectedEvent: Event()
+ data class LoginPinRequestEvent(val pinIncorrect: Boolean): Event()
+ data class QuitEvent(val reason: QuitReason, val reasonString: String?): Event()
+ data class RumbleEvent(val left: UByte, val right: UByte): Event()
++// P5M: efeito dos gatilhos adaptativos, onze bytes por gatilho (modo e dez de
++// parametro), ja no formato do relatorio 0x31 do DualSense.
++class TriggerEffectsEvent(val right: ByteArray, val left: ByteArray): Event()
++// P5M: a intensidade dos gatilhos escolhida nos ajustes do PS5. 0 desligado,
++// 1 forte, 2 media, 3 fraca -- a ordem do protocolo, e nao a de forca.
++data class TriggerIntensityEvent(val intensity: Int): Event()
++// P5M: a intensidade da vibracao, do mesmo menu e na mesma escala.
++data class HapticIntensityEvent(val intensity: Int): Event()
++// P5M: a cor da barra de luz, 0 a 255 por canal, e o numero do jogador.
++data class LedColorEvent(val red: Int, val green: Int, val blue: Int): Event()
++data class PlayerIndexEvent(val index: Int): Event()
++// P5M: brilho dos indicadores escolhido no PS5, 0 a 2.
++data class LedBrightnessEvent(val level: Int): Event()
+ 
+ class CreateError(val errorCode: ErrorCode): Exception("Failed to create a native object: $errorCode")
+ 
+@@ -475,6 +488,36 @@ class Session(connectInfo: ConnectInfo, logFile: String?, logVerbose: Boolean)
+ 		event(RumbleEvent(left.toUByte(), right.toUByte()))
+ 	}
+ 
++	private fun eventTriggerEffects(efeito: ByteArray)
++	{
++		event(TriggerEffectsEvent(efeito.copyOfRange(0, 11), efeito.copyOfRange(11, 22)))
++	}
++
++	private fun eventTriggerIntensity(intensity: Int)
++	{
++		event(TriggerIntensityEvent(intensity))
++	}
++
++	private fun eventHapticIntensity(intensity: Int)
++	{
++		event(HapticIntensityEvent(intensity))
++	}
++
++	private fun eventLedColor(red: Int, green: Int, blue: Int)
++	{
++		event(LedColorEvent(red and 0xFF, green and 0xFF, blue and 0xFF))
++	}
++
++	private fun eventPlayerIndex(index: Int)
++	{
++		event(PlayerIndexEvent(index and 0xFF))
++	}
++
++	private fun eventLedBrightness(level: Int)
++	{
++		event(LedBrightnessEvent(level and 0xFF))
++	}
++
+ 	fun setSurface(surface: Surface?)
+ 	{
+ 		// P5M: depois do dispose o ponteiro e zero, e o lado nativo o
+diff --git a/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt b/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt
+index 9b01e4a..f68af42 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/session/StreamSession.kt
+@@ -170,6 +170,9 @@ class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, va
+ 			}
+ 			is LoginPinRequestEvent -> _state.value = StreamStateLoginPinRequest(event.pinIncorrect)
+ 			is RumbleEvent -> _rumbleState.value = event
++			// P5M: gatilhos, barra de luz e intensidades so chegam ao controle
++			// no modo imersivo; aqui o espelho do controle ainda nao existe.
++			else -> {}
+ 		}
+ 	}
+ 
+diff --git a/lib/include/chiaki/session.h b/lib/include/chiaki/session.h
+index e90ecea..230d131 100644
+--- a/lib/include/chiaki/session.h
++++ b/lib/include/chiaki/session.h
+@@ -171,6 +171,7 @@ typedef enum {
+ 	CHIAKI_EVENT_HAPTIC_INTENSITY,
+ 	CHIAKI_EVENT_TRIGGER_INTENSITY,
+ 	CHIAKI_EVENT_VIDEO_FEC_FAILURE,
++	CHIAKI_EVENT_P5M_LED_BRIGHTNESS, // P5M: no fim, para nao renumerar os de cima
+ } ChiakiEventType;
+ 
+ typedef struct chiaki_event_t
+@@ -185,6 +186,7 @@ typedef struct chiaki_event_t
+ 		ChiakiTriggerEffectsEvent trigger_effects;
+ 		uint8_t led_state[0x3];
+ 		uint8_t player_index;
++		uint8_t p5m_led_brightness;
+ 		struct
+ 		{
+ 			bool pin_incorrect; // false on first request, true if the pin entered before was incorrect
+diff --git a/lib/include/chiaki/streamconnection.h b/lib/include/chiaki/streamconnection.h
+index 56ec7b6..5916ef0 100644
+--- a/lib/include/chiaki/streamconnection.h
++++ b/lib/include/chiaki/streamconnection.h
+@@ -46,6 +46,9 @@ typedef struct chiaki_stream_connection_t
+ 	uint8_t motion_counter[4];
+ 	uint8_t led_state[3];
+ 	uint8_t player_index;
++	// P5M: brilho dos indicadores escolhido no PS5 (0, 1, 2), que o upstream
++	// ainda nao le. Achado pelo diario da dev.200.
++	uint8_t p5m_led_brightness;
+ 	ChiakiDualSenseEffectIntensity haptic_intensity;
+ 	ChiakiDualSenseEffectIntensity trigger_intensity;
+ 	ChiakiFeedbackSender feedback_sender;
+diff --git a/lib/src/streamconnection.c b/lib/src/streamconnection.c
+index a5d434f..142f57f 100644
+--- a/lib/src/streamconnection.c
++++ b/lib/src/streamconnection.c
+@@ -72,8 +72,13 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_stream_connection_init(ChiakiStreamConnecti
+ 	stream_connection->gkcrypt_local = NULL;
+ 	stream_connection->streaminfo_early_buf = NULL;
+ 	stream_connection->streaminfo_early_buf_size = 0;
+-	stream_connection->player_index = 0;
+-	memset(stream_connection->led_state, 0, sizeof(stream_connection->led_state));
++	// P5M: valores que o console nunca manda, para o primeiro pacote sempre
++	// virar evento. Com zero, um console que manda zero nunca era ouvido, e a
++	// dev.199 passou a sessao inteira sem cor e sem jogador.
++	stream_connection->player_index = 0xff;
++	memset(stream_connection->led_state, 0xff, sizeof(stream_connection->led_state));
++	stream_connection->led_state[0] = 0x01;
++	stream_connection->p5m_led_brightness = 0xff;
+ 
+ 	stream_connection->haptic_intensity = Strong;
+ 	stream_connection->trigger_intensity = Strong;
+@@ -556,10 +561,11 @@ static void stream_connection_takion_data_pad_info(ChiakiStreamConnection *strea
+ 	bool motion_reset = false;
+ 	bool haptic_intensity_changed = false;
+ 	bool trigger_intensity_changed = false;
++	bool p5m_brightness_changed = false;
+ 
+ 	CHIAKI_LOGV(stream_connection->log, "Pad info packet: ");
+ 	chiaki_log_hexdump(stream_connection->log, CHIAKI_LOG_VERBOSE, buf, buf_size);
+ 
+ 	switch(buf_size)
+ 	{
+ 		case 0x19:
+@@ -593,6 +622,13 @@ static void stream_connection_takion_data_pad_info(ChiakiStreamConnection *strea
+ 				led_changed = true;
+ 				memcpy(stream_connection->led_state, buf + 9, 3);
+ 			}
++			// P5M: o formato longo e o curto deslocado em oito, como os
++			// campos acima; no curto o brilho e o byte 14.
++			if(buf[22] != stream_connection->p5m_led_brightness)
++			{
++				stream_connection->p5m_led_brightness = buf[22];
++				p5m_brightness_changed = true;
++			}
+ 			break;
+ 		}
+ 		case 0x11:
+@@ -621,6 +657,12 @@ static void stream_connection_takion_data_pad_info(ChiakiStreamConnection *strea
+ 				led_changed = true;
+ 				memcpy(stream_connection->led_state, buf + 1, 3);
+ 			}
++			// P5M: brilho dos indicadores, 0 a 2, mudado no PS5 na dev.200.
++			if(buf[14] != stream_connection->p5m_led_brightness)
++			{
++				stream_connection->p5m_led_brightness = buf[14];
++				p5m_brightness_changed = true;
++			}
+ 			break;
+ 		}
+ 		default:
+@@ -653,6 +695,13 @@ static void stream_connection_takion_data_pad_info(ChiakiStreamConnection *strea
+ 		event.intensity = stream_connection->trigger_intensity;
+ 		chiaki_session_send_event(stream_connection->session, &event);
+ 	}
++	if(p5m_brightness_changed)
++	{
++		ChiakiEvent event = { 0 };
++		event.type = CHIAKI_EVENT_P5M_LED_BRIGHTNESS;
++		event.p5m_led_brightness = stream_connection->p5m_led_brightness;
++		chiaki_session_send_event(stream_connection->session, &event);
++	}
+ 	if(led_changed)
+ 	{
+ 		CHIAKI_LOGV(stream_connection->log, "Set LED state to - red: %x, green: %x, blue: %x", stream_connection->led_state[0], stream_connection->led_state[1], stream_connection->led_state[2]);

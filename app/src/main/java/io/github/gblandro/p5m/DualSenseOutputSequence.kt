@@ -16,9 +16,16 @@ internal object DualSenseOutputSequence
 	private var relatorio = 0
 	private var audio = 0
 
+	// Quando saiu o ultimo relatorio ao controle, de qualquer ponte. O
+	// EnlaceAtivo so manda o dele se ninguem mais mandou nada ha um tempo.
+	// Relogio do Java, e nao o do Android, para o teste rodar fora do aparelho.
+	@Volatile var ultimoEnvioMs = 0L
+		private set
+
 	@Synchronized
 	fun preparar(bytes: ByteArray)
 	{
+		ultimoEnvioMs = System.nanoTime() / 1_000_000
 		if(bytes.size != 78 && bytes.size != 142)
 			return
 		val id = bytes[0].toInt() and 0xFF

@@ -3,6 +3,10 @@
      chiaki-ng de proposito: nome de arquivo distinto nao colide na fusao de
      recursos, entao nao precisa de patch no submodulo. -->
 <paths>
+    <!-- APK da atualizacao em um toque (InstaladorDeAtualizacao). -->
+    <cache-path
+        name="p5m_updates"
+        path="updates/" />
     <cache-path
         name="p5m_diagnostics"
         path="diagnostics/" />

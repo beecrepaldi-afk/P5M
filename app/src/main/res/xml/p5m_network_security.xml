@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- O intermediario da Sectigo so e publicado por HTTP (o endereco vem da
+     extensao AIA do proprio certificado), e sem esta excecao o Android recusa
+     a busca antes de ela sair do aparelho: o CaBundle ficava so com a copia do
+     APK, que a build local nao tem. Nao ha risco em aceitar texto puro aqui:
+     o que chega passa pela mesma prova contra as raizes do sistema antes de
+     ser usado. Todo o resto continua exigindo HTTPS. -->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">crt.comodoca.com</domain>
+        <domain includeSubdomains="false">crt.sectigo.com</domain>
+    </domain-config>
+</network-security-config>

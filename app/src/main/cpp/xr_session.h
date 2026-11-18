@@ -14,6 +14,7 @@
 #include <jni.h>
 #include "tone_mapper.h"
 #include <atomic>
+#include <chrono>
 #include <thread>
 #include <mutex>
 #include <string>
@@ -279,28 +280,14 @@ public:
 	 * oculos obturador, onde os dois olhos dividem a mesma tela -- aqui
 	 * cortaria a taxa por olho pela metade em troca de nada.
 	 */
-	/**
-	 * `synthetic` separa duas origens que ate aqui dividiam o mesmo
-	 * interruptor.
-	 *
-	 * Com estereo sintetizado somos nos que produzimos os dois olhos, e cada um
-	 * vai para um swapchain proprio, inteiro. Com estereo empacotado e o
-	 * conteudo que ja chega com os dois olhos numa imagem so, e ai nao ha o que
-	 * fazer alem de recortar metades -- inclusive no caminho direto, onde nao
-	 * existe passada de GPU nossa para separa-las. A distincao importa porque e
-	 * o recorte, e nao o estereo, que briga com o filtro do compositor.
-	 */
-	void SetStereoMode(int mode, bool synthetic)
-	{
-		stereo_mode_ = mode;
-		stereo_synthetic_ = synthetic;
-	}
+	/** 3D emulado: dois olhos deformados pela profundidade adivinhada. */
+	void SetSyntheticStereo(bool on) { stereo_synthetic_ = on; }
 
 	/**
 	 * Forca e convergencia do olho sintetizado.
 	 *
-	 * `strength` e a disparidade pedida, em fracao da largura da imagem; o que
-	 * vale e o menor entre ela e o teto que a IPD impoe. `convergence` diz que
+	 * `strength` vai de 0 a 1 e e fracao do orcamento de disparidade, que sai
+	 * da IPD e do tamanho da tela (ver o Render). `convergence` diz que
 	 * profundidade fica no plano da tela: o que estiver a frente salta, o que
 	 * estiver atras afunda.
 	 */
@@ -309,6 +296,9 @@ public:
 		stereo_strength_ = strength;
 		stereo_convergence_ = convergence;
 	}
+
+	/** Modo Pop-out do 3D: mais salto, com moldura flutuante (dev.214). */
+	void SetStereoPopOut(bool on) { stereo_pop_out_ = on; }
 
 	/**
 	 * Declara o gamut do conteudo: BT.2020 com 10 bits, Rec.709 com 8.
@@ -330,8 +320,14 @@ public:
 	 * Pode ser chamada de qualquer thread; o envio para a GPU acontece no frame
 	 * loop, que e onde o contexto EGL esta corrente.
 	 */
-	void SetHudBitmap(const uint8_t *pixels, int32_t width, int32_t height);
+	void SetHudBitmap(const uint8_t *pixels, int32_t width, int32_t height, int32_t stride);
 	void SetHudVisible(bool visible) { hud_visible_ = visible; }
+	/**
+	 * Onde o painel aparece: logo abaixo da tela do jogo (painel de ajustes e
+	 * avisos) ou um pouco abaixo da linha dos olhos (teclado do PIN, quando
+	 * ainda nao ha tela).
+	 */
+	void SetHudBelowScreen(bool below) { hud_below_screen_ = below; }
 
 	/**
 	 * Escolhe a taxa de atualizacao do painel.
@@ -344,7 +340,8 @@ public:
 	 * @param sourceFps framerate negociado com o console
 	 * @return taxa efetivamente aplicada, ou 0 se a extensao nao existir
 	 */
-	float SelectDisplayRefreshRate(int sourceFps);
+	// maxHz: teto escolhido pelo usuario (120 padrao, 180 opcional).
+	float SelectDisplayRefreshRate(int sourceFps, int maxHz);
 	// Zera a orientacao: a tela volta para a frente de onde a cabeca olha agora.
 	void Recenter();
 
@@ -354,6 +351,7 @@ public:
 
 	/** Motivo da ultima falha, para a UI mostrar sem depender do log. */
 	const char *LastError() const { return last_error_.c_str(); }
+	bool SessionEnded() const { return session_ended_.load(); }
 
 private:
 	bool InitEgl();
@@ -369,8 +367,11 @@ private:
 	// Devolve false quando nao ha imagem pronta para submeter neste frame.
 	bool RenderVideoThroughShader();
 	// Devolve false quando nao ha o que compor; so entao a camada e omitida.
-	// Nao recebe ScreenParams: o painel tem posicao fixa, independente da tela.
-	bool UpdateHudLayer(XrCompositionLayerQuad &layer, float yaw);
+	// Recebe a tela para ficar logo abaixo dela (dev.210).
+	bool UpdateHudLayer(XrCompositionLayerQuad &layer, float yaw, const ScreenParams &screen,
+			bool below_screen);
+	// Linhas do swapchain direto que sao imagem; ver xr_session.cpp.
+	int32_t DirectContentHeight();
 	void PollEvents();
 	void RenderFrame();
 	void FrameLoop();
@@ -385,7 +386,7 @@ private:
 	::XrSession session_ = XR_NULL_HANDLE;
 	XrSpace app_space_ = XR_NULL_HANDLE;   // espaco de referencia LOCAL
 	XrSpace view_space_ = XR_NULL_HANDLE;  // espaco VIEW, usado na recentragem
-	XrSessionState session_state_ = XR_SESSION_STATE_UNKNOWN;
+	std::vector<const XrCompositionLayerBaseHeader *> frame_layers_;
 
 	RenderPath render_path_ = RenderPath::Direct;
 	ToneMapper tone_mapper_;
@@ -418,11 +419,18 @@ private:
 	// produz a imagem somos nos, nao um decodificador.
 	XrSwapchain hud_swapchain_ = XR_NULL_HANDLE;
 	std::vector<XrSwapchainImageOpenGLESKHR> hud_images_;
+	// Imagens do rodizio que ainda nao receberam o painel atual, e se alguma
+	// ja recebeu algum (antes disso a camada nao entra). So o frame loop
+	// decrementa; o SetHudBitmap rearma, sob hud_mutex_.
+	uint32_t hud_uploads_pending_ = 0;
+	bool hud_has_content_ = false;
 	int32_t hud_width_ = 0;
 	int32_t hud_height_ = 0;
 	std::mutex hud_mutex_;
 	std::vector<uint8_t> hud_pixels_;
 	std::atomic<bool> hud_visible_{false};
+	std::atomic<bool> hud_below_screen_{true};
+	int32_t logged_direct_rows_ = -1;
 
 	XrPassthroughFB passthrough_ = XR_NULL_HANDLE;
 	XrPassthroughLayerFB passthrough_layer_ = XR_NULL_HANDLE;
@@ -438,6 +446,13 @@ private:
 	std::atomic<bool> running_{false};
 	std::atomic<bool> session_running_{false};
 	std::atomic<bool> exit_requested_{false};
+	// O runtime encerrou a sessao imersiva (EXITING, LOSS_PENDING, perda da
+	// instancia). O loop para, e a activity precisa saber: sem isto o som
+	// seguia tocando sobre uma tela que nunca mais voltaria.
+	std::atomic<bool> session_ended_{false};
+	uint32_t frame_failures_ = 0;
+	std::chrono::steady_clock::time_point last_failure_log_{};
+	void ContarFalhaDeQuadro(const char *chamada, XrResult res);
 
 	std::string last_error_;
 	bool logged_layer_config_ = false;
@@ -459,7 +474,6 @@ private:
 	// proprio sintetizador, que escreve os dois olhos na mesma textura. Do lado
 	// da submissao os dois casos sao identicos, e unificar evita dois caminhos
 	// que fariam a mesma coisa de jeitos que acabariam divergindo.
-	std::atomic<int> stereo_mode_{0};
 	std::atomic<bool> stereo_synthetic_{false};
 
 	// Distancia interpupilar em metros, lida do runtime. Zero ate a primeira
@@ -469,12 +483,15 @@ private:
 	std::atomic<float> ipd_meters_{0.0f};
 
 	// Forca e convergencia do olho sintetizado, ajustaveis em jogo. A forca e
-	// um pedido: o limite real sai da IPD e do tamanho da tela, e o Render
-	// aplica o menor dos dois.
-	std::atomic<float> stereo_strength_{0.012f};
-	std::atomic<float> stereo_convergence_{0.35f};
+	// fracao, de 0 a 1, de um orcamento que sai da IPD e do tamanho da tela.
+	std::atomic<float> stereo_strength_{0.5f};
+	std::atomic<float> stereo_convergence_{1.0f};
+	// O ultimo valor escrito no diario, para escrever so quando muda.
+	float logged_stereo_back_ = -1.0f;
+	bool logged_pop_out_ = false;
+	std::atomic<bool> stereo_pop_out_{false};
+	float logged_stereo_convergence_ = -1.0f;
 	bool logged_ipd_ = false;
-	bool logged_stereo_sharpen_ = false;
 
 	// Configuracao de view do sistema, consultada uma vez na criacao. O app nao
 	// desenha nada, mas o runtime espera esse handshake e ha implementacoes que
@@ -536,6 +553,10 @@ private:
 	// Framerate da fonte guardado a espera do xrBeginSession. Ver
 	// SelectDisplayRefreshRate.
 	std::atomic<int> pending_refresh_fps_{0};
+	// A fonte que pediu a taxa, para refazer o pedido em cada READY.
+	std::atomic<int> refresh_fps_wanted_{0};
+	// O teto do painel que veio junto com o pedido.
+	std::atomic<int> refresh_max_hz_{120};
 	PFN_xrPassthroughLayerSetStyleFB pfnPassthroughLayerSetStyleFB = nullptr;
 	PFN_xrCreatePassthroughFB pfnCreatePassthroughFB = nullptr;
 	PFN_xrDestroyPassthroughFB pfnDestroyPassthroughFB = nullptr;

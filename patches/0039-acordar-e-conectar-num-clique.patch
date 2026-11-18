@@ -1,0 +1,42 @@
+diff --git a/android/app/src/main/java/com/metallic/chiaki/main/DisplayHostRecyclerViewAdapter.kt b/android/app/src/main/java/com/metallic/chiaki/main/DisplayHostRecyclerViewAdapter.kt
+index 465a2a7..6c7de51 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/main/DisplayHostRecyclerViewAdapter.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/main/DisplayHostRecyclerViewAdapter.kt
+@@ -69,7 +69,10 @@ class DisplayHostRecyclerViewAdapter(
+ 				else
+ 					""
+ 			it.bottomInfoTextView.text = (host as? DiscoveredDisplayHost)?.discoveredHost?.let { discoveredHost ->
+-				if(discoveredHost.runningAppName != null || discoveredHost.runningAppTitleid != null)
++				// P5M: em repouso, dizer o que o clique faz (dev.216).
++				if(discoveredHost.state == DiscoveryHost.State.STANDBY && host.isRegistered)
++					"In rest mode · select to wake it up and connect"
++				else if(discoveredHost.runningAppName != null || discoveredHost.runningAppTitleid != null)
+ 					context.getString(R.string.display_host_app_title_id, discoveredHost.runningAppName ?: "", discoveredHost.runningAppTitleid ?: "")
+ 				else
+ 					""
+diff --git a/android/app/src/main/java/com/metallic/chiaki/main/MainActivity.kt b/android/app/src/main/java/com/metallic/chiaki/main/MainActivity.kt
+index f4e8651..9cb1e61 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/main/MainActivity.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/main/MainActivity.kt
+@@ -183,17 +183,10 @@ class MainActivity : AppCompatActivity()
+ 
+ 			if(host is DiscoveredDisplayHost && host.discoveredHost.state == DiscoveryHost.State.STANDBY)
+ 			{
+-				MaterialAlertDialogBuilder(this)
+-					.setMessage(R.string.alert_message_standby_wakeup)
+-					.setPositiveButton(R.string.action_wakeup) { _, _ ->
+-						wakeupHost(host)
+-					}
+-					.setNeutralButton(R.string.action_connect_immediately) { _, _ ->
+-						connect()
+-					}
+-					.setNegativeButton(R.string.action_connect_cancel_connect) { _, _ -> }
+-					.create()
+-					.show()
++				// P5M: acorda e conecta num clique so, com a espera a vista
++				// (dev.216). A pergunta de tres botoes mandava o pacote e sumia.
++				io.github.gblandro.p5m.AcordarConsole(this, host, viewModel.displayHosts,
++					{ wakeupHost(host) }, { connect() }).iniciar()
+ 			}
+ 			else
+ 				connect()

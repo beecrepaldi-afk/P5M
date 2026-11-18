@@ -35,8 +35,69 @@ class FonteSintetica(
 	private val largura: Int = 1920,
 	private val altura: Int = 1080,
 	private val fps: Int = 60,
-	private val segundos: Int = 2)
+	private val segundos: Int = 2,
+	/**
+	 * Cenario do framegen: 12 s em tres partes, cada uma com a verdade de
+	 * quadro real/repeticao escrita no pts (bit 0 = repeticao, bits 1-2 =
+	 * parte), que a camada nativa confere contra o que ela classificou.
+	 *  0. Camera andando a 30 fps (cada imagem duas vezes no stream de 60).
+	 *  1. Parado a 30 fps, so com ruido pequeno -- o caso da tremulacao.
+	 *  2. Camera andando com quedas: imagens de 2, 2 e 3 tempos (~27 fps), e
+	 *     o movimento pelo relogio, como num jogo de verdade.
+	 */
+	private val cenario: Boolean = false)
 {
+	// Por quadro do laco, no cenario: repeticao da imagem anterior, parte, e
+	// o instante (em quadros de 60) que a imagem mostra.
+	private var repete = BooleanArray(0)
+	private var parte = IntArray(0)
+	private var instante = IntArray(0)
+
+	private fun montarCenario(total: Int)
+	{
+		repete = BooleanArray(total)
+		parte = IntArray(total)
+		instante = IntArray(total)
+		val terco = total / 3
+		var ultimaTroca = 0
+		var padrao = 0
+		var restante = 0
+		for(n in 0 until total)
+		{
+			val p = minOf(n / terco, 2)
+			parte[n] = p
+			when(p)
+			{
+				0, 1 ->
+				{
+					repete[n] = n % 2 == 1
+					instante[n] = if(repete[n]) instante[n - 1] else n
+				}
+				else ->
+				{
+					if(restante == 0)
+					{
+						restante = intArrayOf(2, 2, 3)[padrao % 3]
+						padrao++
+						ultimaTroca = n
+					}
+					repete[n] = n != ultimaTroca
+					instante[n] = ultimaTroca
+					restante--
+				}
+			}
+		}
+	}
+
+	/** O pts do quadro n do laco: contador, com a verdade nos bits baixos. */
+	private fun pts(n: Long): Long
+	{
+		if(!cenario || repete.isEmpty())
+			return n
+		val i = (n % repete.size).toInt()
+		return n * 8 + parte[i] * 2 + (if(repete[i]) 1 else 0)
+	}
+
 	private val quadros = ArrayList<ByteArray>()
 	private var configuracao: ByteArray? = null
 	private var decodificador: MediaCodec? = null
@@ -59,6 +120,8 @@ class FonteSintetica(
 	fun preparar(): Boolean
 	{
 		val total = fps * segundos
+		if(cenario)
+			montarCenario(total)
 		val formato = MediaFormat.createVideoFormat(MIME, largura, altura).apply {
 			setInteger(MediaFormat.KEY_COLOR_FORMAT,
 					MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
@@ -189,6 +252,11 @@ class FonteSintetica(
 	 */
 	private fun desenhar(codificador: MediaCodec, indice: Int, n: Int)
 	{
+		if(cenario)
+		{
+			desenharCenario(codificador, indice, n)
+			return
+		}
 		val imagem = codificador.getInputImage(indice) ?: return
 		val planos = imagem.planes
 
@@ -208,6 +276,50 @@ class FonteSintetica(
 			y.put(linha, 0, largura)
 		}
 
+		for(p in 1 until planos.size)
+			preencher(planos[p].buffer, 128.toByte())
+	}
+
+	/**
+	 * Tabuleiro que anda na horizontal (600 px/s), textura para a previsao ter
+	 * o que seguir, ou parado com um ruido pequeno que muda a cada imagem nova.
+	 * Repeticao desenha exatamente a imagem anterior.
+	 */
+	private fun desenharCenario(codificador: MediaCodec, indice: Int, n: Int)
+	{
+		val imagem = codificador.getInputImage(indice) ?: return
+		val planos = imagem.planes
+		val t = instante[n]
+		val parado = parte[n] == 1
+		val desloc = if(parado) 0 else t * 10
+		val bloco = 48
+		val linhas = Array(2) { paridade ->
+			ByteArray(largura) { x ->
+				val c = ((x + desloc) / bloco + paridade) % 2
+				(if(c == 0) 40 else 170).toByte()
+			}
+		}
+		// Ruido: alguns pontos numa regiao, sorteados pelo instante (igual
+		// na repeticao, diferente na imagem nova).
+		val ruido = java.util.Random(t.toLong() * 7919)
+		val y = planos[0].buffer
+		val passo = planos[0].rowStride
+		for(l in 0 until altura)
+		{
+			y.position(l * passo)
+			y.put(linhas[(l / bloco) % 2], 0, largura)
+		}
+		if(parado)
+		{
+			// Denso o bastante para a grade de comparacao (64x36 pontos) ver:
+			// no jogo parado a diferenca medida foi 0,1-0,5.
+			for(l in 0 until altura)
+				for(x in 0 until largura)
+				{
+					val i = l * passo + x
+					y.put(i, (y.get(i) + ruido.nextInt(3) - 1).toByte())
+				}
+		}
 		for(p in 1 until planos.size)
 			preencher(planos[p].buffer, 128.toByte())
 	}
@@ -246,15 +358,20 @@ class FonteSintetica(
 			setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
 		}
 
+		var criado: MediaCodec? = null
 		val codec = try
 		{
 			MediaCodec.createDecoderByType(MIME).also {
+				criado = it
 				it.configure(formato, destino, null, 0)
 				it.start()
 			}
 		}
 		catch(e: Exception)
 		{
+			// Criado e recusado no configure/start ainda segura um decodificador
+			// de hardware, e o Quest tem poucos.
+			criado?.release()
 			ultimoErro = "Could not open the decoder: " +
 					"${e::class.java.simpleName}: ${e.message}"
 			Log.e(TAG, ultimoErro, e)
@@ -317,8 +434,9 @@ class FonteSintetica(
 							// real. Carimbo de tempo de verdade faria o codec
 							// pacear por conta própria, e o que se quer medir é
 							// justamente o tempo dele.
-							medidor.entrada(n)
-							codec.queueInputBuffer(i, 0, au.size, n, 0)
+							val p = pts(n)
+							medidor.entrada(p)
+							codec.queueInputBuffer(i, 0, au.size, p, 0)
 						}
 					}
 				}

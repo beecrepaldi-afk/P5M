@@ -15,7 +15,18 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Versao fixa: o ubuntu-latest passa a ser o Ubuntu 26 a partir de
+    # 19/10/2026, e a troca de imagem nao pode acontecer sem a gente saber.
+    runs-on: ubuntu-24.04
+    env:
+      # O ccache reconhece o compilador pela data do arquivo, e o NDK e
+      # reinstalado a cada build: o clang chega sempre com data nova, e o
+      # placar da dev.234 deu 0 acertos em 416. A versao do NDK, que e o que
+      # de fato muda o compilador, passa a ser a identidade dele.
+      CCACHE_COMPILERCHECK: string:ndk-26.3.11579264
+      # Caminhos relativos a raiz do checkout no hash, por garantia: o runner
+      # usa sempre o mesmo, mas uma troca de imagem nao pode zerar o cache.
+      CCACHE_BASEDIR: ${{ github.workspace }}
     # Necessario para o passo de release publicar a tag e o APK.
     permissions:
       contents: write
@@ -26,7 +37,7 @@ jobs:
       issues: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -46,27 +57,26 @@ jobs:
         run: python3 tools/compilar_nativo.py
 
       - name: JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Android SDK
-        uses: android-actions/setup-android@v3
-
-      # O NDK sao mais de um giga que nao mudam entre builds. Baixar de novo a
-      # cada push custava mais de meio minuto por build, e a chave e a lista de
-      # componentes: enquanto ela nao mudar, nada e rebaixado.
-      - name: Cache do NDK e do SDK
-        uses: actions/cache@v4
+        uses: android-actions/setup-android@v4
         with:
-          path: |
-            ${{ env.ANDROID_SDK_ROOT }}/ndk/26.3.11579264
-            ${{ env.ANDROID_SDK_ROOT }}/cmake/3.22.1
-            ${{ env.ANDROID_SDK_ROOT }}/platforms/android-34
-            ${{ env.ANDROID_SDK_ROOT }}/build-tools/34.0.0
-          key: android-ndk26.3.11579264-cmake3.22.1-p34-bt34.0.0
+          # O padrao desta action pede "tools platform-tools", e o pacote
+          # "tools" saiu do repositorio do SDK: desde 23/09 o sdkmanager sai
+          # com erro so por causa dele, e a build morria em 44 s (dev.193). So
+          # platform-tools basta: NDK, CMake, plataforma e build-tools o passo
+          # seguinte instala explicitamente. Achado no fork pedrinmz/P5M.
+          packages: platform-tools
 
+      # Sem cache do SDK: a imagem do runner ja traz parte destes pacotes em
+      # pasta do sistema (build-tools 34.0.0, ao menos), e restaurar o cache
+      # por cima falhava com "Cannot change mode ... Operation not permitted"
+      # -- o que descartava o cache inteiro, NDK junto, em toda build. O
+      # sdkmanager abaixo pula o que ja esta instalado e baixa so o que falta.
       - name: NDK e CMake
         run: |
           sdkmanager --install "ndk;26.3.11579264" "cmake;3.22.1" "platforms;android-34" "build-tools;34.0.0"
@@ -149,14 +159,20 @@ jobs:
       # duzia de linhas nossas. O ccache reconhece isso pelo conteudo, e nao
       # pela data, entao atravessa ate uma arvore recriada do zero.
       - name: Cache do ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ccache
           key: ccache-${{ github.run_number }}
           restore-keys: ccache-
 
+      # Zera o placar antes da build, para o passo "Placar do ccache" contar
+      # so esta. Sem placar nao da para saber se o cache acerta: a compilacao
+      # nativa e o caminho critico da build (uns 2 min de 3,5 na dev.232).
+      - name: Zerar o placar do ccache
+        run: ccache -z
+
       - name: Cache Gradle
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.gradle/caches
@@ -224,44 +240,91 @@ jobs:
       # do console, modo de exibicao, nitidez. Cada APK novo chegava como um
       # aplicativo diferente que por acaso tem o mesmo nome.
       #
-      # A chave fica no cache do Actions e nao no repositorio: e material de
-      # assinatura, e material de assinatura nao se versiona. O cache e por
-      # repositorio e cada acerto renova os 7 dias de validade, entao enquanto
-      # houver um build por semana ela sobrevive indefinidamente. Se um dia
-      # expirar, o proximo APK volta a exigir uma desinstalacao -- uma vez, e
-      # com aviso aqui em vez de surpresa no aparelho.
-      - name: Chave de assinatura estavel
-        uses: actions/cache@v4
+      # A chave vem do secret P5M_DEBUG_KEYSTORE_BASE64 (copia em
+      # ~/projetos/PSMeta-docs/p5m-debug.keystore, fora do repositorio:
+      # material de assinatura nao se versiona). Ate a dev.244 ela vivia so no
+      # cache do Actions, que o GitHub apaga depois de 7 dias sem uso: um mes
+      # sem push (14/10 a 18/11) levou a chave e obrigou a desinstalar. O cache
+      # continua como reserva para um fork sem o secret.
+      - name: Chave de assinatura do secret
+        env:
+          P5M_DEBUG_KEYSTORE_BASE64: ${{ secrets.P5M_DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$P5M_DEBUG_KEYSTORE_BASE64" ]; then
+            mkdir -p ~/.android
+            echo "$P5M_DEBUG_KEYSTORE_BASE64" | base64 -d > ~/.android/debug.keystore
+            echo "P5M_DEBUG_FROM_SECRET=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: Chave de assinatura estavel (reserva)
+        if: env.P5M_DEBUG_FROM_SECRET != '1'
+        uses: actions/cache@v6
         with:
           path: ~/.android/debug.keystore
           key: debug-keystore-v1
 
       - name: Conferir a chave
         run: |
-          if [ -f ~/.android/debug.keystore ]; then
+          if [ "$P5M_DEBUG_FROM_SECRET" = "1" ]; then
+            echo "Chave fixa do secret; este APK instala por cima do anterior."
+          elif [ -f ~/.android/debug.keystore ]; then
             echo "Chave restaurada do cache; este APK instala por cima do anterior."
           else
             echo "::warning::Sem chave no cache. O Gradle vai criar uma nova, e este"
             echo "::warning::APK NAO instala por cima: sera preciso desinstalar uma vez."
           fi
 
-      - name: Build debug APK
-        run: ./gradlew --no-daemon assembleDebug
+      # Tag v* sai em release, assinado com a chave de publicacao; push de
+      # branch continua em debug, com a chave do cache, para o dev rolante
+      # instalar por cima do anterior como sempre.
+      #
+      # As duas chaves sao diferentes de proposito, e isso tem custo: trocar
+      # entre o dev e uma versao marcada pede desinstalar uma vez. Sem o secret
+      # a tag falha em vez de publicar um APK de debug como se fosse release.
+      - name: Chave de publicacao
+        if: steps.version.outputs.tagged == 'true'
+        env:
+          P5M_KEYSTORE_BASE64: ${{ secrets.P5M_KEYSTORE_BASE64 }}
+          P5M_KEYSTORE_PASSWORD: ${{ secrets.P5M_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$P5M_KEYSTORE_BASE64" ] || [ -z "$P5M_KEYSTORE_PASSWORD" ]; then
+            echo "::error::Tag sem os secrets P5M_KEYSTORE_BASE64 e P5M_KEYSTORE_PASSWORD."
+            exit 1
+          fi
+          echo "$P5M_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/p5m-release.p12"
+          echo "P5M_KEYSTORE=$RUNNER_TEMP/p5m-release.p12" >> "$GITHUB_ENV"
+          echo "P5M_KEYSTORE_PASSWORD=$P5M_KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
 
-      - name: Upload APK (artefato)
-        uses: actions/upload-artifact@v4
-        with:
-          name: p5m-debug-apk
-          path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
+      - name: Build APK
+        id: apk
+        run: |
+          if [ "${{ steps.version.outputs.tagged }}" = "true" ]; then
+            ./gradlew --no-daemon assembleRelease
+            echo "path=app/build/outputs/apk/release/app-release.apk" >> "$GITHUB_OUTPUT"
+          else
+            ./gradlew --no-daemon assembleDebug
+            echo "path=app/build/outputs/apk/debug/app-debug.apk" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Placar do ccache
+        if: always()
+        run: ccache -s -v || true
+
+      - name: Apagar a chave de publicacao
+        if: always() && steps.version.outputs.tagged == 'true'
+        run: rm -f "$RUNNER_TEMP/p5m-release.p12"
+
+      # Sem artefato do Actions: o APK que vale e o do release, e a copia de
+      # conveniencia enchia a cota de armazenamento do repositorio privado
+      # (24/09 e de novo 29/09, na dev.229), mesmo expirando em 3 dias.
 
       # Release rolante: uma unica tag 'dev' que sempre aponta para o build mais
       # recente. Assim o APK tem URL fixa e baixa direto, sem zip e sem precisar
       # achar o run certo no Actions.
       - name: Preparar APK
         run: |
-          cp app/build/outputs/apk/debug/app-debug.apk p5m.apk
-          cp app/build/outputs/apk/debug/app-debug.apk "p5m-${{ steps.version.outputs.version }}.apk"
+          cp "${{ steps.apk.outputs.path }}" p5m.apk
+          cp "${{ steps.apk.outputs.path }}" "p5m-${{ steps.version.outputs.version }}.apk"
           ls -lh p5m*.apk
 
       # Release definitivo, so em tag. Fica na lista de releases para sempre,
@@ -272,7 +335,7 @@ jobs:
       # alguem de fora le, e ela e em ingles.
       - name: Publicar release versionado
         if: steps.version.outputs.tagged == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: P5M ${{ steps.version.outputs.version }}
           files: p5m-${{ steps.version.outputs.version }}.apk
@@ -287,6 +350,10 @@ jobs:
             PC: `adb install -r p5m-${{ steps.version.outputs.version }}.apk`.
 
             It shows up in your library under **Unknown Sources**, as "P5M".
+
+            Coming from a `dev` build? Uninstall it first. Tagged releases are
+            signed with a different key, and Android refuses to install one
+            over the other. You will need to sign in to PSN again.
 
             ## Before you start
 
@@ -327,7 +394,7 @@ jobs:
       # Release rolante, so em branch. Sempre o build mais recente, URL fixa.
       - name: Publicar release rolante
         if: steps.version.outputs.tagged == 'false'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: dev
           name: Latest build

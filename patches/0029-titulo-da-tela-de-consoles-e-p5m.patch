@@ -1,0 +1,14 @@
+diff --git a/android/app/src/main/res/values/strings.xml b/android/app/src/main/res/values/strings.xml
+--- a/android/app/src/main/res/values/strings.xml
++++ b/android/app/src/main/res/values/strings.xml
+@@ -1,5 +1,8 @@
+ <resources>
+-    <string name="app_name">Chiaki</string>
+-    <string name="title_main">Chiaki 千秋</string>
++    <!-- O nome que aparece no topo da tela de consoles. Trocado porque este
++         app nao e o Chiaki: o credito ao upstream vive no NOTICE.md e na
++         LICENSE, que e onde a AGPL o pede, e nao numa barra de titulo. -->
++    <string name="app_name">P5M</string>
++    <string name="title_main">P5M</string>
+     <string name="title_settings">Settings</string>
+     <string name="alert_message_standby_wakeup">The Console is currently in standby mode. Do you want to send a Wakeup packet instead of trying to connect immediately?</string>

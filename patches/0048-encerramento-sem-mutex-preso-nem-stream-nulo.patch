@@ -1,0 +1,114 @@
+--- a/android/app/src/main/cpp/audio-decoder.c
++++ b/android/app/src/main/cpp/audio-decoder.c
+@@ -152,10 +152,15 @@
+ 		}
+ 		if(codec_buf_index >= 0)
+ 		{
+-			if(decoder->settings_cb)
++			// P5M: quem vai ser chamado e o frame_cb, entao e ele que se confere.
++			// Os dois nascem juntos no JNI, mas um ponteiro de funcao nulo aqui e
++			// queda com pc = 0, sem nada no diario que diga de onde veio.
++			size_t codec_buf_size = 0;
++			uint8_t *codec_buf = decoder->frame_cb
++					? AMediaCodec_getOutputBuffer(codec, (size_t)codec_buf_index, &codec_buf_size)
++					: NULL;
++			if(codec_buf)
+ 			{
+-				size_t codec_buf_size;
+-				uint8_t *codec_buf = AMediaCodec_getOutputBuffer(codec, (size_t)codec_buf_index, &codec_buf_size);
+ 				size_t samples_count = info.size / sizeof(int16_t);
+ 				//CHIAKI_LOGD(decoder->log, "Got %llu samples => %f ms of audio", (unsigned long long)samples_count, 1000.0f * (float)(samples_count / 2) / (float)decoder->audio_header.rate);
+ 				decoder->frame_cb((int16_t *)codec_buf, samples_count, decoder->cb_user);
+@@ -299,7 +304,12 @@
+ 		if(codec_buf_index < 0)
+ 		{
+ 			CHIAKI_LOGE(decoder->log, "Failed to get input audio buffer");
+-			return;
++			// P5M: o return que estava aqui saia com o codec_mutex preso. A
++			// thread do takion morria dona dele, e o shutdown_codec do
++			// encerramento, que o pede sem prazo, travava para sempre: era o
++			// "Session release: audio decoder" sem passo seguinte, sempre com
++			// este erro meio segundo antes.
++			goto beach;
+ 		}
+ 
+ 		size_t codec_buf_size;
+--- a/android/app/src/main/cpp/audio-output.cpp
++++ b/android/app/src/main/cpp/audio-output.cpp
+@@ -153,16 +153,22 @@
+ 		->setCallback(&ao->stream_callback);
+ 
+ 	auto result = builder.openManagedStream(ao->stream);
+-	if(result == oboe::Result::OK)
++	if(result == oboe::Result::OK && ao->stream)
+ 		CHIAKI_LOGI(ao->log, "Audio Output opened Oboe stream");
+ 	else
+-		CHIAKI_LOGE(ao->log, "Audio Output failed to open Oboe stream: %s", oboe::convertToText(result));
++	{
++		// P5M: sem stream nao ha o que iniciar. Seguir adiante chamava
++		// start() num ponteiro nulo, na thread do takion e com o mutex do
++		// receptor de audio preso: a sessao inteira caia por falta de som.
++		CHIAKI_LOGE(ao->log, "Audio Output failed to open Oboe stream: %s; the session goes on without sound",
++				oboe::convertToText(result));
++		return;
++	}
+ 
+ 	// P5M: o que foi *concedido*, e nao o que foi pedido. O Oboe cai para o
+ 	// compartilhado sozinho quando o exclusivo nao esta disponivel, e sem esta
+ 	// linha nao havia como saber por qual caminho o som estava saindo -- que e
+ 	// exatamente a duvida que este trecho existe para responder.
+-	if(result == oboe::Result::OK && ao->stream)
+ 	{
+ 		__android_log_print(ANDROID_LOG_INFO, "P5MVR",
+ 				"Audio: %s, %s, %d channels at %d Hz, burst of %d frames",
+--- a/lib/src/takionsendbuffer.c
++++ b/lib/src/takionsendbuffer.c
+@@ -68,8 +68,13 @@
+ 
+ CHIAKI_EXPORT void chiaki_takion_send_buffer_fini(ChiakiTakionSendBuffer *send_buffer)
+ {
++	// P5M: o aviso de parada vai sob o mutex. Sem ele, a thread podia testar
++	// o predicado, ver a fila vazia e dormir sem prazo logo depois deste
++	// sinal: o aviso se perdia e o join abaixo esperava para sempre.
++	chiaki_mutex_lock(&send_buffer->mutex);
+ 	send_buffer->should_stop = true;
+ 	ChiakiErrorCode err = chiaki_cond_signal(&send_buffer->cond);
++	chiaki_mutex_unlock(&send_buffer->mutex);
+ 	assert(err == CHIAKI_ERR_SUCCESS);
+ 	err = chiaki_thread_join(&send_buffer->thread, NULL);
+ 	assert(err == CHIAKI_ERR_SUCCESS);
+--- a/lib/src/remote/rudpsendbuffer.c
++++ b/lib/src/remote/rudpsendbuffer.c
+@@ -77,8 +77,13 @@
+ 
+ CHIAKI_EXPORT void chiaki_rudp_send_buffer_fini(ChiakiRudpSendBuffer *send_buffer)
+ {
++	// P5M: o aviso de parada vai sob o mutex. Sem ele, a thread podia testar
++	// o predicado, ver a fila vazia e dormir sem prazo logo depois deste
++	// sinal: o aviso se perdia e o join abaixo esperava para sempre.
++	chiaki_mutex_lock(&send_buffer->mutex);
+ 	send_buffer->should_stop = true;
+ 	ChiakiErrorCode err = chiaki_cond_signal(&send_buffer->cond);
++	chiaki_mutex_unlock(&send_buffer->mutex);
+ 	assert(err == CHIAKI_ERR_SUCCESS);
+ 	err = chiaki_thread_join(&send_buffer->thread, NULL);
+ 	assert(err == CHIAKI_ERR_SUCCESS);
+--- a/lib/src/session.c
++++ b/lib/src/session.c
+@@ -472,7 +472,15 @@
+ 		memcpy(info.psn_account_id, session->connect_info.psn_account_id, CHIAKI_PSN_ACCOUNT_ID_SIZE);
+ 		info.rudp = session->rudp;
+ 		info.target = session->connect_info.ps5 ? CHIAKI_TARGET_PS5_1 : CHIAKI_TARGET_PS4_10;
+-		chiaki_regist_start(&regist, session->log, &info, regist_cb, session);
++		// P5M: sem o registro de pe, o stop e o fini abaixo rodavam sobre uma
++		// estrutura nunca iniciada -- join numa thread de lixo.
++		ChiakiErrorCode regist_err = chiaki_regist_start(&regist, session->log, &info, regist_cb, session);
++		if(regist_err != CHIAKI_ERR_SUCCESS)
++		{
++			CHIAKI_LOGE(session->log, "Session could not start the PSN registration: %s", chiaki_error_string(regist_err));
++			session->quit_reason = CHIAKI_QUIT_REASON_PSN_REGIST_FAILED;
++			QUIT(quit);
++		}
+ 		chiaki_cond_timedwait_pred(&session->state_cond, &session->state_mutex, 10000, session_check_state_pred_regist, session);
+ 		chiaki_regist_stop(&regist);
+ 		chiaki_regist_fini(&regist);

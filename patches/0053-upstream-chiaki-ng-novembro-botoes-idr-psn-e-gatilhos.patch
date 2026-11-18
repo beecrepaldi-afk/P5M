@@ -1,0 +1,1330 @@
+diff --git a/lib/include/chiaki/ctrl.h b/lib/include/chiaki/ctrl.h
+index 38747c26..9d17f45d 100644
+--- a/lib/include/chiaki/ctrl.h
++++ b/lib/include/chiaki/ctrl.h
+@@ -58,6 +58,8 @@ typedef struct chiaki_ctrl_t
+ 	uint64_t crypt_counter_local;
+ 	uint64_t crypt_counter_remote;
+ 	uint32_t keyboard_text_counter;
++	// when the last heartbeat reply was sent, 0 until the console first asks for one
++	uint64_t heartbeat_rep_last_ms;
+ } ChiakiCtrl;
+ 
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_ctrl_init(ChiakiCtrl *ctrl, struct chiaki_session_t *session);
+diff --git a/lib/include/chiaki/feedback.h b/lib/include/chiaki/feedback.h
+index be663845..3d805aa3 100644
+--- a/lib/include/chiaki/feedback.h
++++ b/lib/include/chiaki/feedback.h
+@@ -86,6 +86,19 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_feedback_history_buffer_format(ChiakiFeedba
+  */
+ CHIAKI_EXPORT void chiaki_feedback_history_buffer_push(ChiakiFeedbackHistoryBuffer *feedback_history_buffer, ChiakiFeedbackHistoryEvent *event);
+ 
++typedef void (*ChiakiFeedbackHistoryEventPushedCallback)(void *user);
++
++/**
++ * Push the events for the change from state_prev to state_now, in the order a real controller produces them:
++ * button releases, then touch changes, then button presses.
++ * event_pushed is called after each push: the console applies only one new event per history packet,
++ * so every event needs a packet of its own.
++ * @return true if any event was pushed
++ */
++CHIAKI_EXPORT bool chiaki_feedback_history_buffer_record_state(ChiakiFeedbackHistoryBuffer *feedback_history_buffer, ChiakiLog *log,
++		const ChiakiControllerState *state_prev, const ChiakiControllerState *state_now,
++		ChiakiFeedbackHistoryEventPushedCallback event_pushed, void *event_pushed_user);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/lib/include/chiaki/feedbacksender.h b/lib/include/chiaki/feedbacksender.h
+index d50ee573..ca1bd41b 100644
+--- a/lib/include/chiaki/feedbacksender.h
++++ b/lib/include/chiaki/feedbacksender.h
+@@ -23,19 +23,22 @@ typedef struct chiaki_feedback_sender_t
+ 
+ 	ChiakiSeqNum16 state_seq_num;
+ 
++	// Sequence number the next history event takes; a packet carries the number of its newest event
+ 	ChiakiSeqNum16 history_seq_num;
+ 	ChiakiFeedbackHistoryBuffer history_buf;
+ 	uint8_t history_packets[CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE][CHIAKI_FEEDBACK_HISTORY_PACKET_BUF_SIZE];
+ 	size_t history_packet_sizes[CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE];
++	uint8_t history_packet_event_counts[CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE];
++	ChiakiSeqNum16 history_packet_seq_nums[CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE];
+ 	size_t history_packet_begin;
+ 	size_t history_packet_len;
+-	// The last history packet goes out again a couple of times: nothing
+-	// follows a release until the next button change, so one lost packet
+-	// would leave the button held on the console.
+-	uint8_t history_last[CHIAKI_FEEDBACK_HISTORY_PACKET_BUF_SIZE];
++	// Last history packet sent, repeated a few times while nothing new happens (see feedbacksender.c)
++	uint8_t history_last_packet[CHIAKI_FEEDBACK_HISTORY_PACKET_BUF_SIZE];
+ 	size_t history_last_size;
+-	int history_tail_resends;
+-	uint64_t history_last_ms;
++	uint8_t history_last_event_count;
++	ChiakiSeqNum16 history_last_seq_num;
++	uint64_t history_last_sent_ms;
++	unsigned int history_tail_resends;
+ 
+ 	bool should_stop;
+ 	ChiakiControllerState controller_state_prev;
+diff --git a/lib/include/chiaki/takion.h b/lib/include/chiaki/takion.h
+index 11b05a44..73cbe767 100644
+--- a/lib/include/chiaki/takion.h
++++ b/lib/include/chiaki/takion.h
+@@ -168,6 +168,12 @@ typedef struct chiaki_takion_t
+ 	uint16_t p5m_fec_last_unit, p5m_fec_units_total, p5m_fec_units_fec;
+ 	uint32_t p5m_fec_received;
+ 	ChiakiTakionSendBuffer send_buffer;
++	/**
++	 * send_buffer only exists from the end of the handshake until the receive loop ends.
++	 * Senders may only push into it while send_buffer_active is true.
++	 */
++	bool send_buffer_active;
++	ChiakiMutex send_buffer_active_mutex;
+ 
+ 	ChiakiTakionCallback cb;
+ 	void *cb_user;
+@@ -285,8 +291,9 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_feedback_state(ChiakiTakion *ta
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_mic_packet(ChiakiTakion *takion, uint8_t *audio_packet, size_t packet_size, bool ps5);
+ /**
+  * Thread-safe while Takion is running.
++ * @param event_count number of history events contained in payload
+  */
+-CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_feedback_history(ChiakiTakion *takion, ChiakiSeqNum16 seq_num, uint8_t *payload, size_t payload_size);
++CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_feedback_history(ChiakiTakion *takion, ChiakiSeqNum16 seq_num, uint8_t event_count, uint8_t *payload, size_t payload_size);
+ 
+ #define CHIAKI_TAKION_V9_AV_HEADER_SIZE_VIDEO 0x17
+ #define CHIAKI_TAKION_V9_AV_HEADER_SIZE_AUDIO 0x12
+diff --git a/lib/include/chiaki/takionsendbuffer.h b/lib/include/chiaki/takionsendbuffer.h
+index 8ddecc01..a8b3ef19 100644
+--- a/lib/include/chiaki/takionsendbuffer.h
++++ b/lib/include/chiaki/takionsendbuffer.h
+@@ -16,6 +16,10 @@ extern "C" {
+ 
+ typedef struct chiaki_takion_t ChiakiTakion;
+ 
++// Unacknowledged reliable packets kept for resending: enough for every packet within the
++// console's receive window, so a burst sent during loss is resent rather than sent once untracked
++#define CHIAKI_TAKION_SEND_BUFFER_SIZE 1024
++
+ typedef struct chiaki_takion_send_buffer_packet_t ChiakiTakionSendBufferPacket;
+ 
+ typedef struct chiaki_takion_send_buffer_t
+diff --git a/lib/include/chiaki/videoreceiver.h b/lib/include/chiaki/videoreceiver.h
+index a340b5d5..64623114 100644
+--- a/lib/include/chiaki/videoreceiver.h
++++ b/lib/include/chiaki/videoreceiver.h
+@@ -37,6 +37,7 @@ typedef struct chiaki_video_receiver_t
+ 	ChiakiBitstream bitstream;
+ 	ChiakiMutex waiting_for_idr_mutex;
+ 	bool waiting_for_idr;
++	uint64_t idr_request_last_ms; // when the IDR being waited for was last requested
+ 	ChiakiMutex frames_lost_mutex;
+ } ChiakiVideoReceiver;
+ 
+diff --git a/lib/src/audiosender.c b/lib/src/audiosender.c
+index 8819c99e..02c8569b 100644
+--- a/lib/src/audiosender.c
++++ b/lib/src/audiosender.c
+@@ -74,34 +74,28 @@ CHIAKI_EXPORT void chiaki_audio_sender_opus_data(ChiakiAudioSender *audio_sender
+     if(is_ps5)
+         ps5_packet = 1;
+ 
+-    if(!audio_sender->frameb)
++    // Each packet carries the new frame, then the two before it, oldest first, so the console can
++    // fill a lost packet from the next one. The history starts as two copies of the first frame.
++    if(!audio_sender->framea || !audio_sender->frameb)
+     {
+-        audio_sender->frameb = malloc(audio_sender->buf_size_per_unit);
+-        if(!audio_sender->frameb)
+-        {
+-            CHIAKI_LOGE(audio_sender->log, "Error allocating audio frameb");
+-            return;
+-        }
+-        memcpy(audio_sender->frameb, opus_sender, opus_sender_size);
+-        return;
+-    }
+-    if(!audio_sender->framea)
+-    {
+-        audio_sender->framea = malloc(audio_sender->buf_size_per_unit);
+         if(!audio_sender->framea)
++            audio_sender->framea = malloc(audio_sender->buf_size_per_unit);
++        if(!audio_sender->frameb)
++            audio_sender->frameb = malloc(audio_sender->buf_size_per_unit);
++        if(!audio_sender->framea || !audio_sender->frameb)
+         {
+-            CHIAKI_LOGE(audio_sender->log, "Error allocating audio framea");
++            CHIAKI_LOGE(audio_sender->log, "Error allocating audio frame history");
+             return;
+         }
+         memcpy(audio_sender->framea, opus_sender, opus_sender_size);
+-        return;
++        memcpy(audio_sender->frameb, opus_sender, opus_sender_size);
+     }
+-    memcpy(audio_sender->frame_buf, audio_sender->frameb, audio_sender->buf_size_per_unit);
+-    memcpy(audio_sender->frame_buf + audio_sender->buf_size_per_unit, audio_sender->framea, audio_sender->buf_size_per_unit);
+-    memcpy(audio_sender->frame_buf + 2 * audio_sender->buf_size_per_unit, opus_sender, opus_sender_size);
++    // frameb is two frames back and framea one frame back
+     memcpy(audio_sender->frame_buf, opus_sender, opus_sender_size);
+-    memcpy(audio_sender->framea, opus_sender, opus_sender_size);
++    memcpy(audio_sender->frame_buf + audio_sender->buf_size_per_unit, audio_sender->frameb, audio_sender->buf_size_per_unit);
++    memcpy(audio_sender->frame_buf + 2 * audio_sender->buf_size_per_unit, audio_sender->framea, audio_sender->buf_size_per_unit);
+     memcpy(audio_sender->frameb, audio_sender->framea, audio_sender->buf_size_per_unit);
++    memcpy(audio_sender->framea, opus_sender, opus_sender_size);
+ 
+     uint32_t filled_packet_size = audio_sender->frame_buf_size + 19 + ps5_packet;
+ 
+diff --git a/lib/src/ctrl.c b/lib/src/ctrl.c
+index 5de4c63d..febcfcde 100644
+--- a/lib/src/ctrl.c
++++ b/lib/src/ctrl.c
+@@ -34,6 +34,17 @@
+ 
+ #define CTRL_EXPECT_TIMEOUT 5000
+ 
++// How long receiving over PSN may keep failing, with no packet read cleanly in between,
++// before the ctrl channel is given up. A single bad packet must not end it: without ctrl
++// the console stops hearing heartbeat replies and ends the session.
++#define CTRL_RUDP_ERROR_LIMIT_MS 10000
++#define CTRL_RUDP_ERROR_RETRY_MS 50
++
++// The console ends the session when no heartbeat reply reaches it for 30 seconds. Over PSN a
++// reply can be lost after its retries run out, so once the console has asked for one, a reply
++// is also sent on this interval without being asked.
++#define CTRL_RUDP_HEARTBEAT_REP_INTERVAL_MS 4950
++
+ typedef enum ctrl_message_type_t {
+ 	CTRL_MESSAGE_TYPE_SESSION_ID = 0x33,
+ 	CTRL_MESSAGE_TYPE_HEARTBEAT_REQ = 0xfe,
+@@ -148,6 +159,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_ctrl_init(ChiakiCtrl *ctrl, ChiakiSession *
+ 	ctrl->cant_displayb = false;
+ 	ctrl->msg_queue = NULL;
+ 	ctrl->keyboard_text_counter = 0;
++	ctrl->heartbeat_rep_last_ms = 0;
+ 	ctrl->sock = CHIAKI_INVALID_SOCKET;
+ 
+ 	err = chiaki_stop_pipe_init(&ctrl->stop_pipe);
+@@ -423,6 +435,7 @@ static void *ctrl_thread_func(void *user)
+ 
+ 	CHIAKI_LOGI(ctrl->session->log, "Ctrl connected");
+ 
++	uint64_t rudp_error_since_ms = 0; // 0 while receiving cleanly
+ 	while(true)
+ 	{
+ 		bool overflow = false;
+@@ -462,15 +475,33 @@ static void *ctrl_thread_func(void *user)
+ 		}
+ 		else
+ 		{
++			uint64_t timeout_ms = UINT64_MAX;
++			if(ctrl->session->rudp && ctrl->heartbeat_rep_last_ms)
++			{
++				uint64_t since_ms = chiaki_time_now_monotonic_ms() - ctrl->heartbeat_rep_last_ms;
++				timeout_ms = since_ms < CTRL_RUDP_HEARTBEAT_REP_INTERVAL_MS ? CTRL_RUDP_HEARTBEAT_REP_INTERVAL_MS - since_ms : 0;
++			}
+ 			chiaki_stop_pipe_reset(&ctrl->notif_pipe);
+ 			chiaki_mutex_unlock(&ctrl->notif_mutex);
+ 			if(ctrl->session->rudp)
+-				err = chiaki_rudp_stop_pipe_select_single(ctrl->session->rudp, &ctrl->notif_pipe, UINT64_MAX);
++				err = chiaki_rudp_stop_pipe_select_single(ctrl->session->rudp, &ctrl->notif_pipe, timeout_ms);
+ 			else
+-				err = chiaki_stop_pipe_select_single(&ctrl->notif_pipe, ctrl->sock, false, UINT64_MAX);
++				err = chiaki_stop_pipe_select_single(&ctrl->notif_pipe, ctrl->sock, false, timeout_ms);
++			chiaki_mutex_lock(&ctrl->notif_mutex);
++		}
++
++		if(ctrl->session->rudp && ctrl->heartbeat_rep_last_ms && !ctrl->should_stop
++			&& chiaki_time_now_monotonic_ms() - ctrl->heartbeat_rep_last_ms >= CTRL_RUDP_HEARTBEAT_REP_INTERVAL_MS)
++		{
++			chiaki_mutex_unlock(&ctrl->notif_mutex);
++			ctrl_message_send(ctrl, CTRL_MESSAGE_TYPE_HEARTBEAT_REP, NULL, 0);
+ 			chiaki_mutex_lock(&ctrl->notif_mutex);
++			ctrl->heartbeat_rep_last_ms = chiaki_time_now_monotonic_ms();
+ 		}
+ 
++		if(err == CHIAKI_ERR_TIMEOUT)
++			continue;
++
+ 		if(err == CHIAKI_ERR_CANCELED)
+ 		{
+ 			while(ctrl->msg_queue)
+@@ -515,27 +546,46 @@ static void *ctrl_thread_func(void *user)
+ 		CHIAKI_SSIZET_TYPE received = 0;
+ 		if(ctrl->session->rudp)
+ 		{
+-			RudpMessage message;
++			RudpMessage message = { 0 };
+ 			uint16_t remote_counter = 0;
+ 			uint16_t ack_counter = 0;
+ 			err = chiaki_rudp_recv_only(ctrl->session->rudp, sizeof(ctrl->rudp_recv_buf) - ctrl->recv_buf_size, &message);
+ 			if(err != CHIAKI_ERR_SUCCESS)
+ 			{
+-				CHIAKI_LOGE(ctrl->session->log, "Failed to receive Rudp ctrl packet");
+-				ctrl_failed(ctrl, CHIAKI_QUIT_REASON_CTRL_UNKNOWN);
+-				break;
+-			}
+-			if(message.data_size < 4)
+-			{
+-				CHIAKI_LOGE(ctrl->session->log, "Rudp ctrl message response too small");
+-				chiaki_rudp_print_message(ctrl->session->rudp, &message);
+-				ctrl_failed(ctrl, CHIAKI_QUIT_REASON_CTRL_UNKNOWN);
+-				break;
++				chiaki_rudp_message_pointers_free(&message);
++				uint64_t now_ms = chiaki_time_now_monotonic_ms();
++				if(!rudp_error_since_ms)
++				{
++					CHIAKI_LOGW(ctrl->session->log, "Failed to receive Rudp ctrl packet, skipping it");
++					rudp_error_since_ms = now_ms;
++					continue;
++				}
++				if(now_ms - rudp_error_since_ms >= CTRL_RUDP_ERROR_LIMIT_MS)
++				{
++					CHIAKI_LOGE(ctrl->session->log, "Failed to receive Rudp ctrl packets for %d ms, giving up", CTRL_RUDP_ERROR_LIMIT_MS);
++					ctrl_failed(ctrl, CHIAKI_QUIT_REASON_CTRL_UNKNOWN);
++					break;
++				}
++				// a socket stuck in an error state stays readable and logs every failed receive, so
++				// pause between repeated errors instead of spinning; a message to send or a stop
++				// request still wakes the loop at once
++				chiaki_mutex_unlock(&ctrl->notif_mutex);
++				chiaki_stop_pipe_sleep(&ctrl->notif_pipe, CTRL_RUDP_ERROR_RETRY_MS);
++				chiaki_mutex_lock(&ctrl->notif_mutex);
++				continue;
+ 			}
++			rudp_error_since_ms = 0;
+ 			remote_counter = message.remote_counter;
+ 			while(true)
+ 			{
+-				switch(message.subtype) // wrong but works ...
++				// Every frame of a packet is checked on its own: one carrying less than the
++				// 2 byte counter and 2 byte ack counter is skipped.
++				if(message.data_size < 4 && message.subtype != 0xC0)
++				{
++					CHIAKI_LOGW(ctrl->session->log, "Rudp ctrl frame too small, skipping it");
++					chiaki_rudp_print_message(ctrl->session->rudp, &message);
++				}
++				else switch(message.subtype) // wrong but works ...
+ 				{
+ 					case 0x12:
+ 					case 0x26:
+@@ -546,7 +596,7 @@ static void *ctrl_thread_func(void *user)
+ 						chiaki_rudp_send_ack_message(ctrl->session->rudp, remote_counter);
+ 						int offset = rudp_packet_type_data_offset(message.subtype);
+ 						// ctrl message header is 8 bytes
+-						if((message.data_size - offset) < 8)
++						if(message.data_size < (size_t)offset + 8)
+ 							break;
+ 						// check if message is ctrl message by making sure the payload size (size of message - 8 byte header is correct)
+ 						uint32_t ctrl_payload_size = ntohl(*(uint32_t*)(message.data + offset));
+@@ -566,12 +616,11 @@ static void *ctrl_thread_func(void *user)
+ 						break;
+ 					default:
+ 						CHIAKI_LOGI(ctrl->session->log, "Received message of unknown type: 0x%04x", message.type);
+-						chiaki_rudp_ack_packet(ctrl->session->rudp, ack_counter);
++						// no ack counter is read from an unknown frame, so it retires none of our packets
+ 						chiaki_rudp_send_ack_message(ctrl->session->rudp, remote_counter);
+-						// we already checked before if data size was at least 4
+ 						int offset2 = 4;
+ 						// ctrl message header is 8 bytes
+-						if((message.data_size - offset2) < 8)
++						if(message.data_size < (size_t)offset2 + 8)
+ 							break;
+ 						uint32_t ctrl_payload_size2 = ntohl(*(uint32_t*)(message.data + offset2));
+ 						if((message.data_size - offset2 - 8) == ctrl_payload_size2)
+@@ -639,7 +688,8 @@ static ChiakiErrorCode ctrl_message_send(ChiakiCtrl *ctrl, uint16_t type, const
+ 
+ 	CHIAKI_LOGV(ctrl->session->log, "Ctrl sending message type %x, size %llx\n",
+ 			(unsigned int)type, (unsigned long long)payload_size);
+-	if(payload)
++	// The login PIN reply carries the PIN in plain text, so keep it out of even verbose logs
++	if(payload && type != CTRL_MESSAGE_TYPE_LOGIN_PIN_REP)
+ 		chiaki_log_hexdump(ctrl->session->log, CHIAKI_LOG_VERBOSE, payload, payload_size);
+ 
+ 	uint8_t *enc = NULL;
+@@ -946,6 +996,7 @@ static void ctrl_message_received_heartbeat_req(ChiakiCtrl *ctrl, uint8_t *paylo
+ 
+ 	CHIAKI_LOGI(ctrl->session->log, "Ctrl received Heartbeat, sending reply");
+ 	ctrl_message_send(ctrl, CTRL_MESSAGE_TYPE_HEARTBEAT_REP, NULL, 0);
++	ctrl->heartbeat_rep_last_ms = chiaki_time_now_monotonic_ms();
+ }
+ 
+ static void ctrl_message_received_switch_to_stream_connection(ChiakiCtrl *ctrl, uint8_t *payload, size_t payload_size)
+@@ -1129,7 +1180,8 @@ typedef struct ctrl_response_t
+ /*
+  * P5M: cabecalhos que o app oficial (9.5.0) manda ao PS5 e o chiaki nao.
+  *
+- * RP-PadProcNo e sempre 3 no oficial; RP-ReqMoreInfo e 1 (0x1001 so no modo
++ * RP-PadProcNo e sempre 3 no oficial (e desde a dev.244 sai sempre daqui
++ * tambem); RP-ReqMoreInfo e 1 (0x1001 so no modo
+  * GCM, que nao usamos). Em troca o console responderia com a qualidade do
+  * Wi-Fi dele (RP-Rssi-Dbm/Percent), o tipo do aparelho (RP-Device), o botao
+  * de confirmar (RP-Enterkey) e um RP-Vmode de sentido ainda desconhecido.
+@@ -1348,7 +1400,12 @@ static ChiakiErrorCode ctrl_connect(ChiakiCtrl *ctrl)
+ 			have_streaming_type ? "RP-StreamingType: " : "",
+ 			have_streaming_type ? streaming_type_b64 : "",
+ 			have_streaming_type ? "\r\n" : "",
+-			mais_info ? "RP-PadProcNo: 3\r\nRP-ReqMoreInfo: 1\r\n" : "");
++			// P5M (dev.244): RP-PadProcNo vai sempre ao PS5, como no oficial e no
++			// chiaki-ng desde 27ab96fd: sem ele o console manda alguns efeitos de
++			// gatilho adaptativo (o arco do L2 no Saros) num formato que o controle
++			// nao aplica. Na sonda, so o RP-ReqMoreInfo continua opcional.
++			!chiaki_target_is_ps5(session->target) ? ""
++				: mais_info ? "RP-PadProcNo: 3\r\nRP-ReqMoreInfo: 1\r\n" : "RP-PadProcNo: 3\r\n");
+ 	if(request_len < 0 || request_len >= sizeof(send_buf))
+ 		goto error;
+ 
+diff --git a/lib/src/feedback.c b/lib/src/feedback.c
+index 9b7b5e98..31178c49 100644
+--- a/lib/src/feedback.c
++++ b/lib/src/feedback.c
+@@ -206,3 +206,92 @@ CHIAKI_EXPORT void chiaki_feedback_history_buffer_push(ChiakiFeedbackHistoryBuff
+ 		feedback_history_buffer->len = feedback_history_buffer->size;
+ 	feedback_history_buffer->events[feedback_history_buffer->begin] = *event;
+ }
++
++typedef struct history_recorder_t
++{
++	ChiakiFeedbackHistoryBuffer *buffer;
++	ChiakiLog *log;
++	ChiakiFeedbackHistoryEventPushedCallback event_pushed;
++	void *event_pushed_user;
++	bool recorded;
++} HistoryRecorder;
++
++static void history_recorder_push(HistoryRecorder *recorder, ChiakiFeedbackHistoryEvent *event)
++{
++	chiaki_feedback_history_buffer_push(recorder->buffer, event);
++	recorder->recorded = true;
++	if(recorder->event_pushed)
++		recorder->event_pushed(recorder->event_pushed_user);
++}
++
++static void history_recorder_buttons(HistoryRecorder *recorder, uint64_t buttons_prev, uint64_t buttons_now, bool pressed)
++{
++	for(uint8_t i=0; i<CHIAKI_CONTROLLER_BUTTONS_COUNT; i++)
++	{
++		uint64_t button_id = 1 << i;
++		bool prev = buttons_prev & button_id;
++		bool now = buttons_now & button_id;
++		if(prev == now || now != pressed)
++			continue;
++		ChiakiFeedbackHistoryEvent event;
++		ChiakiErrorCode err = chiaki_feedback_history_event_set_button(&event, button_id, now ? 0xff : 0);
++		if(err != CHIAKI_ERR_SUCCESS)
++		{
++			CHIAKI_LOGE(recorder->log, "Feedback Sender failed to format button history event for button id %llu", (unsigned long long)button_id);
++			continue;
++		}
++		history_recorder_push(recorder, &event);
++	}
++}
++
++static void history_recorder_analog(HistoryRecorder *recorder, uint64_t button, uint8_t state_prev, uint8_t state_now)
++{
++	if(state_prev == state_now)
++		return;
++	ChiakiFeedbackHistoryEvent event;
++	ChiakiErrorCode err = chiaki_feedback_history_event_set_button(&event, button, state_now);
++	if(err != CHIAKI_ERR_SUCCESS)
++	{
++		CHIAKI_LOGE(recorder->log, "Feedback Sender failed to format button history event for %s",
++				button == CHIAKI_CONTROLLER_ANALOG_BUTTON_L2 ? "L2" : "R2");
++		return;
++	}
++	history_recorder_push(recorder, &event);
++}
++
++CHIAKI_EXPORT bool chiaki_feedback_history_buffer_record_state(ChiakiFeedbackHistoryBuffer *feedback_history_buffer, ChiakiLog *log,
++		const ChiakiControllerState *state_prev, const ChiakiControllerState *state_now,
++		ChiakiFeedbackHistoryEventPushedCallback event_pushed, void *event_pushed_user)
++{
++	HistoryRecorder recorder = { feedback_history_buffer, log, event_pushed, event_pushed_user, false };
++
++	// Releases go before touch changes: when a touchpad click and its finger are released
++	// in one state change, the finger must not lift while the click is still held.
++	history_recorder_buttons(&recorder, state_prev->buttons, state_now->buttons, false);
++
++	for(size_t i=0; i<CHIAKI_CONTROLLER_TOUCHES_MAX; i++)
++	{
++		if(state_prev->touches[i].id != state_now->touches[i].id && state_prev->touches[i].id >= 0)
++		{
++			ChiakiFeedbackHistoryEvent event;
++			chiaki_feedback_history_event_set_touchpad(&event, false, (uint8_t)state_prev->touches[i].id,
++					state_prev->touches[i].x, state_prev->touches[i].y);
++			history_recorder_push(&recorder, &event);
++		}
++		else if(state_now->touches[i].id >= 0
++				&& (state_prev->touches[i].id != state_now->touches[i].id
++					|| state_prev->touches[i].x != state_now->touches[i].x
++					|| state_prev->touches[i].y != state_now->touches[i].y))
++		{
++			ChiakiFeedbackHistoryEvent event;
++			chiaki_feedback_history_event_set_touchpad(&event, true, (uint8_t)state_now->touches[i].id,
++					state_now->touches[i].x, state_now->touches[i].y);
++			history_recorder_push(&recorder, &event);
++		}
++	}
++
++	history_recorder_buttons(&recorder, state_prev->buttons, state_now->buttons, true);
++	history_recorder_analog(&recorder, CHIAKI_CONTROLLER_ANALOG_BUTTON_L2, state_prev->l2_state, state_now->l2_state);
++	history_recorder_analog(&recorder, CHIAKI_CONTROLLER_ANALOG_BUTTON_R2, state_prev->r2_state, state_now->r2_state);
++	return recorder.recorded;
++}
+diff --git a/lib/src/feedbacksender.c b/lib/src/feedbacksender.c
+index cca2bae0..817544a3 100644
+--- a/lib/src/feedbacksender.c
++++ b/lib/src/feedbacksender.c
+@@ -9,13 +9,27 @@
+ #define FEEDBACK_STATE_TIMEOUT_MAX_MS 200 // maximum time to wait between sending 2 packets
+ 
+ #define FEEDBACK_HISTORY_BUFFER_SIZE 0x10
+-#define FEEDBACK_HISTORY_RESEND_EVENT_COUNT 0x4
+-#define FEEDBACK_HISTORY_TAIL_RESENDS 3
+-#define FEEDBACK_HISTORY_TAIL_RESEND_MS 30
++// Number of most recent events repeated in every history packet.
++// Analog L2/R2 produce one event per value change, so with only 4 a button release
++// (e.g. L1/R1) could drop out of the window within one or two packets.
++#define FEEDBACK_HISTORY_RESEND_EVENT_COUNT 0x8
++
++// Every history event takes the next sequence number and a packet carries the number of its
++// newest event. The console keeps the last number it applied and takes only as many of a
++// packet's events as the number moved, so it applies each event once and a repeat of a packet
++// it already has changes nothing.
++//
++// History packets are sent once over UDP without acknowledgement. If the packet carrying
++// the last change (typically a button release) is lost and nothing else changes afterwards,
++// the console never sees it and the button stays held. So after the newest history packet,
++// if nothing new is queued, the same packet is sent again with the same sequence number at
++// these offsets (ms after it was sent).
++static const uint64_t feedback_history_tail_ms[] = { 20, 50, 100, 200 };
++#define FEEDBACK_HISTORY_TAIL_COUNT (sizeof(feedback_history_tail_ms) / sizeof(feedback_history_tail_ms[0]))
+ 
+ static void *feedback_sender_thread_func(void *user);
+ static void feedback_sender_send_state(ChiakiFeedbackSender *feedback_sender, const ChiakiControllerState *state);
+-static void feedback_sender_send_history_packet(ChiakiFeedbackSender *feedback_sender, const uint8_t *buf, size_t buf_size);
++static void feedback_sender_send_history_packet(ChiakiFeedbackSender *feedback_sender, ChiakiSeqNum16 seq_num, uint8_t event_count, const uint8_t *buf, size_t buf_size);
+ static void feedback_sender_flush_history_locked(ChiakiFeedbackSender *feedback_sender);
+ static void feedback_sender_record_history(ChiakiFeedbackSender *feedback_sender, const ChiakiControllerState *state_prev, const ChiakiControllerState *state_now);
+ 
+@@ -33,12 +47,14 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_feedback_sender_init(ChiakiFeedbackSender *
+ 	feedback_sender->history_seq_num = 0;
+ 	feedback_sender->history_packet_begin = 0;
+ 	feedback_sender->history_packet_len = 0;
+-	feedback_sender->history_last_size = 0;
+-	feedback_sender->history_tail_resends = 0;
+-	feedback_sender->history_last_ms = 0;
+ 	feedback_sender->should_stop = false;
+ 	feedback_sender->controller_state_changed = false;
+ 	feedback_sender->history_dirty = false;
++	feedback_sender->history_last_size = 0;
++	feedback_sender->history_last_event_count = 0;
++	feedback_sender->history_last_seq_num = 0;
++	feedback_sender->history_last_sent_ms = 0;
++	feedback_sender->history_tail_resends = FEEDBACK_HISTORY_TAIL_COUNT;
+ 	ChiakiErrorCode err = chiaki_feedback_history_buffer_init(&feedback_sender->history_buf, FEEDBACK_HISTORY_BUFFER_SIZE);
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 		return err;
+@@ -93,7 +109,6 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_feedback_sender_set_controller_state(Chiaki
+ 
+ 	feedback_sender->controller_state = *state;
+ 	feedback_sender_record_history(feedback_sender, &feedback_sender->controller_state_history_prev, &feedback_sender->controller_state);
+-	feedback_sender_flush_history_locked(feedback_sender);
+ 	feedback_sender->controller_state_history_prev = feedback_sender->controller_state;
+ 	feedback_sender->controller_state_changed = true;
+ 
+@@ -149,11 +164,11 @@ static void feedback_sender_send_state(ChiakiFeedbackSender *feedback_sender, co
+ 		CHIAKI_LOGE(feedback_sender->log, "FeedbackSender failed to send Feedback State");
+ }
+ 
+-static void feedback_sender_send_history_packet(ChiakiFeedbackSender *feedback_sender, const uint8_t *buf, size_t buf_size)
++static void feedback_sender_send_history_packet(ChiakiFeedbackSender *feedback_sender, ChiakiSeqNum16 seq_num, uint8_t event_count, const uint8_t *buf, size_t buf_size)
+ {
+ 	//CHIAKI_LOGD(feedback_sender->log, "Feedback History:");
+ 	//chiaki_log_hexdump(feedback_sender->log, CHIAKI_LOG_DEBUG, buf, buf_size);
+-	chiaki_takion_send_feedback_history(feedback_sender->takion, feedback_sender->history_seq_num++, (uint8_t *)buf, buf_size);
++	chiaki_takion_send_feedback_history(feedback_sender->takion, seq_num, event_count, (uint8_t *)buf, buf_size);
+ }
+ 
+ static void feedback_sender_flush_history_locked(ChiakiFeedbackSender *feedback_sender)
+@@ -173,15 +188,24 @@ static void feedback_sender_flush_history_locked(ChiakiFeedbackSender *feedback_
+ 		CHIAKI_LOGE(feedback_sender->log, "Feedback Sender failed to format history buffer");
+ 		return;
+ 	}
++	uint8_t event_count = (uint8_t)feedback_sender->history_buf.len;
++	// the newest event in the packet took the number before the next one
++	ChiakiSeqNum16 seq_num = (ChiakiSeqNum16)(feedback_sender->history_seq_num - 1);
+ 
+ 	if(feedback_sender->history_packet_len < CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE)
+ 	{
+ 		feedback_sender->history_packet_sizes[packet_index] = packet_size;
++		feedback_sender->history_packet_event_counts[packet_index] = event_count;
++		feedback_sender->history_packet_seq_nums[packet_index] = seq_num;
+ 		feedback_sender->history_packet_len++;
+ 	}
+ 	else
+ 	{
++		// dropping the oldest queued packet keeps the numbering: the next packet's number still
++		// moves by every event since the last packet sent
+ 		feedback_sender->history_packet_sizes[feedback_sender->history_packet_begin] = packet_size;
++		feedback_sender->history_packet_event_counts[feedback_sender->history_packet_begin] = event_count;
++		feedback_sender->history_packet_seq_nums[feedback_sender->history_packet_begin] = seq_num;
+ 		memcpy(
+ 			feedback_sender->history_packets[feedback_sender->history_packet_begin],
+ 			feedback_sender->history_packets[packet_index],
+@@ -196,82 +220,18 @@ static void feedback_sender_flush_history_locked(ChiakiFeedbackSender *feedback_
+ 	feedback_sender->history_dirty = false;
+ }
+ 
+-static void feedback_sender_record_history(ChiakiFeedbackSender *feedback_sender, const ChiakiControllerState *state_prev, const ChiakiControllerState *state_now)
++static void feedback_sender_history_event_pushed(void *user)
+ {
+-	for(size_t i=0; i<CHIAKI_CONTROLLER_TOUCHES_MAX; i++)
+-	{
+-		if(state_prev->touches[i].id != state_now->touches[i].id && state_prev->touches[i].id >= 0)
+-		{
+-			ChiakiFeedbackHistoryEvent event;
+-			chiaki_feedback_history_event_set_touchpad(&event, false, (uint8_t)state_prev->touches[i].id,
+-					state_prev->touches[i].x, state_prev->touches[i].y);
+-			chiaki_feedback_history_buffer_push(&feedback_sender->history_buf, &event);
+-			feedback_sender->history_dirty = true;
+-			feedback_sender_flush_history_locked(feedback_sender);
+-		}
+-		else if(state_now->touches[i].id >= 0
+-				&& (state_prev->touches[i].id != state_now->touches[i].id
+-					|| state_prev->touches[i].x != state_now->touches[i].x
+-					|| state_prev->touches[i].y != state_now->touches[i].y))
+-		{
+-			ChiakiFeedbackHistoryEvent event;
+-			chiaki_feedback_history_event_set_touchpad(&event, true, (uint8_t)state_now->touches[i].id,
+-					state_now->touches[i].x, state_now->touches[i].y);
+-			chiaki_feedback_history_buffer_push(&feedback_sender->history_buf, &event);
+-			feedback_sender->history_dirty = true;
+-			feedback_sender_flush_history_locked(feedback_sender);
+-		}
+-	}
+-
+-	uint64_t buttons_prev = state_prev->buttons;
+-	uint64_t buttons_now = state_now->buttons;
+-	for(uint8_t i=0; i<CHIAKI_CONTROLLER_BUTTONS_COUNT; i++)
+-	{
+-		uint64_t button_id = 1 << i;
+-		bool prev = buttons_prev & button_id;
+-		bool now = buttons_now & button_id;
+-		if(prev != now)
+-		{
+-			ChiakiFeedbackHistoryEvent event;
+-			ChiakiErrorCode err = chiaki_feedback_history_event_set_button(&event, button_id, now ? 0xff : 0);
+-			if(err != CHIAKI_ERR_SUCCESS)
+-			{
+-				CHIAKI_LOGE(feedback_sender->log, "Feedback Sender failed to format button history event for button id %llu", (unsigned long long)button_id);
+-				continue;
+-			}
+-			chiaki_feedback_history_buffer_push(&feedback_sender->history_buf, &event);
+-			feedback_sender->history_dirty = true;
+-			feedback_sender_flush_history_locked(feedback_sender);
+-		}
+-	}
+-
+-	if(state_prev->l2_state != state_now->l2_state)
+-	{
+-		ChiakiFeedbackHistoryEvent event;
+-		ChiakiErrorCode err = chiaki_feedback_history_event_set_button(&event, CHIAKI_CONTROLLER_ANALOG_BUTTON_L2, state_now->l2_state);
+-		if(err == CHIAKI_ERR_SUCCESS)
+-		{
+-			chiaki_feedback_history_buffer_push(&feedback_sender->history_buf, &event);
+-			feedback_sender->history_dirty = true;
+-			feedback_sender_flush_history_locked(feedback_sender);
+-		}
+-		else
+-			CHIAKI_LOGE(feedback_sender->log, "Feedback Sender failed to format button history event for L2");
+-	}
++	ChiakiFeedbackSender *feedback_sender = user;
++	feedback_sender->history_seq_num++;
++	feedback_sender->history_dirty = true;
++	feedback_sender_flush_history_locked(feedback_sender);
++}
+ 
+-	if(state_prev->r2_state != state_now->r2_state)
+-	{
+-		ChiakiFeedbackHistoryEvent event;
+-		ChiakiErrorCode err = chiaki_feedback_history_event_set_button(&event, CHIAKI_CONTROLLER_ANALOG_BUTTON_R2, state_now->r2_state);
+-		if(err == CHIAKI_ERR_SUCCESS)
+-		{
+-			chiaki_feedback_history_buffer_push(&feedback_sender->history_buf, &event);
+-			feedback_sender->history_dirty = true;
+-			feedback_sender_flush_history_locked(feedback_sender);
+-		}
+-		else
+-			CHIAKI_LOGE(feedback_sender->log, "Feedback Sender failed to format button history event for R2");
+-	}
++static void feedback_sender_record_history(ChiakiFeedbackSender *feedback_sender, const ChiakiControllerState *state_prev, const ChiakiControllerState *state_now)
++{
++	chiaki_feedback_history_buffer_record_state(&feedback_sender->history_buf, feedback_sender->log, state_prev, state_now,
++			feedback_sender_history_event_pushed, feedback_sender);
+ }
+ 
+ static bool state_cond_check(void *user)
+@@ -299,12 +259,13 @@ static void *feedback_sender_thread_func(void *user)
+ 			uint64_t next_timeout = FEEDBACK_STATE_TIMEOUT_MAX_MS;
+ 			if(now_ms - last_feedback_state_ms < FEEDBACK_STATE_TIMEOUT_MAX_MS)
+ 				next_timeout = FEEDBACK_STATE_TIMEOUT_MAX_MS - (now_ms - last_feedback_state_ms);
+-			if(feedback_sender->history_tail_resends > 0)
++			// wake up in time for the next tail resend of the last history packet
++			if(feedback_sender->history_tail_resends < FEEDBACK_HISTORY_TAIL_COUNT)
+ 			{
+-				uint64_t since = now_ms - feedback_sender->history_last_ms;
+-				uint64_t tail = since < FEEDBACK_HISTORY_TAIL_RESEND_MS ? FEEDBACK_HISTORY_TAIL_RESEND_MS - since : 0;
+-				if(tail < next_timeout)
+-					next_timeout = tail;
++				uint64_t due_ms = feedback_sender->history_last_sent_ms + feedback_history_tail_ms[feedback_sender->history_tail_resends];
++				uint64_t until_due = due_ms > now_ms ? due_ms - now_ms : 0;
++				if(until_due < next_timeout)
++					next_timeout = until_due;
+ 			}
+ 
+ 			err = chiaki_cond_timedwait_pred(&feedback_sender->state_cond, &feedback_sender->state_mutex, next_timeout, state_cond_check, feedback_sender);
+@@ -325,6 +286,8 @@ static void *feedback_sender_thread_func(void *user)
+ 		bool send_feedback_history = false;
+ 		uint8_t history_buf[CHIAKI_FEEDBACK_HISTORY_PACKET_BUF_SIZE];
+ 		size_t history_buf_size = 0;
++		uint8_t history_event_count = 0;
++		ChiakiSeqNum16 history_packet_seq_num = 0;
+ 
+ 		if(feedback_sender->controller_state_changed)
+ 		{
+@@ -341,23 +304,31 @@ static void *feedback_sender_thread_func(void *user)
+ 		{
+ 			size_t packet_index = feedback_sender->history_packet_begin;
+ 			history_buf_size = feedback_sender->history_packet_sizes[packet_index];
++			history_event_count = feedback_sender->history_packet_event_counts[packet_index];
++			history_packet_seq_num = feedback_sender->history_packet_seq_nums[packet_index];
+ 			memcpy(history_buf, feedback_sender->history_packets[packet_index], history_buf_size);
+ 			feedback_sender->history_packet_begin = (feedback_sender->history_packet_begin + 1)
+ 				% CHIAKI_FEEDBACK_HISTORY_PACKET_QUEUE_SIZE;
+ 			feedback_sender->history_packet_len--;
+ 			send_feedback_history = true;
+-			memcpy(feedback_sender->history_last, history_buf, history_buf_size);
++			// remember it for tail resends; a new packet restarts the schedule
++			memcpy(feedback_sender->history_last_packet, history_buf, history_buf_size);
+ 			feedback_sender->history_last_size = history_buf_size;
+-			feedback_sender->history_tail_resends = FEEDBACK_HISTORY_TAIL_RESENDS;
+-			feedback_sender->history_last_ms = now_ms;
++			feedback_sender->history_last_event_count = history_event_count;
++			feedback_sender->history_last_seq_num = history_packet_seq_num;
++			feedback_sender->history_last_sent_ms = now_ms;
++			feedback_sender->history_tail_resends = 0;
+ 		}
+-		else if(feedback_sender->history_tail_resends > 0
+-				&& now_ms - feedback_sender->history_last_ms >= FEEDBACK_HISTORY_TAIL_RESEND_MS)
++		else if(feedback_sender->history_last_size > 0
++			&& feedback_sender->history_tail_resends < FEEDBACK_HISTORY_TAIL_COUNT
++			&& now_ms >= feedback_sender->history_last_sent_ms + feedback_history_tail_ms[feedback_sender->history_tail_resends])
+ 		{
++			// nothing new since the last history packet: send it again with the same sequence number
+ 			history_buf_size = feedback_sender->history_last_size;
+-			memcpy(history_buf, feedback_sender->history_last, history_buf_size);
+-			feedback_sender->history_tail_resends--;
+-			feedback_sender->history_last_ms = now_ms;
++			history_event_count = feedback_sender->history_last_event_count;
++			history_packet_seq_num = feedback_sender->history_last_seq_num;
++			memcpy(history_buf, feedback_sender->history_last_packet, history_buf_size);
++			feedback_sender->history_tail_resends++;
+ 			send_feedback_history = true;
+ 		}
+ 		chiaki_mutex_unlock(&feedback_sender->state_mutex);
+@@ -366,7 +337,7 @@ static void *feedback_sender_thread_func(void *user)
+ 			feedback_sender_send_state(feedback_sender, &state_now);
+ 
+ 		if(send_feedback_history)
+-			feedback_sender_send_history_packet(feedback_sender, history_buf, history_buf_size);
++			feedback_sender_send_history_packet(feedback_sender, history_packet_seq_num, history_event_count, history_buf, history_buf_size);
+ 
+ 		err = chiaki_mutex_lock(&feedback_sender->state_mutex);
+ 		if(err != CHIAKI_ERR_SUCCESS)
+diff --git a/lib/src/http.c b/lib/src/http.c
+index d5901a0b..28143fc0 100644
+--- a/lib/src/http.c
++++ b/lib/src/http.c
+@@ -140,9 +140,13 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_recv_http_header(int sock, char *buf, size_
+ 	static const int transitions_n[] = { 0, 2, 0, 4 };
+ 	uint64_t deadline_ms = timeout_ms == UINT64_MAX ? UINT64_MAX : chiaki_time_now_monotonic_ms() + timeout_ms;
+ 
++	char *start = buf;
+ 	*received_size = 0;
+ 	while(true)
+ 	{
++		if(*received_size >= buf_size)
++			return CHIAKI_ERR_BUF_TOO_SMALL;
++
+ 		if(stop_pipe)
+ 		{
+ 			uint64_t wait_timeout_ms = UINT64_MAX;
+@@ -161,7 +165,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_recv_http_header(int sock, char *buf, size_
+ 		CHIAKI_SSIZET_TYPE received;
+ 		do
+ 		{
+-			received = recv(sock, buf, (int)buf_size, 0);
++			received = recv(sock, start + *received_size, (int)(buf_size - *received_size), 0);
+ #if _WIN32
+ 		} while(false);
+ #else
+@@ -182,6 +186,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_recv_http_header(int sock, char *buf, size_
+ 			return received == 0 ? CHIAKI_ERR_DISCONNECTED : CHIAKI_ERR_NETWORK;
+ 
+ 		*received_size += received;
++		buf = start + (*received_size - received);
+ 		for(; received > 0; buf++, received--)
+ 		{
+ 			switch(*buf)
+@@ -227,7 +232,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_send_recv_http_header_psn(ChiakiRudp rudp,
+ 	static const int transitions_n[] = { 0, 2, 0, 4 };
+ 
+ 	*received_size = 0;
+-	int received;
++	size_t received;
+ 	RudpMessage message;
+ 	ChiakiErrorCode err;
+ 	err = chiaki_rudp_send_recv(rudp, &message, (uint8_t *)send_buf, send_buf_size, *remote_counter, SESSION_MESSAGE, CTRL_MESSAGE, 2, 3);
+@@ -237,12 +242,18 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_send_recv_http_header_psn(ChiakiRudp rudp,
+ 		return err;
+ 	}
+ 	received = message.data_size - 2;
++	if(received > buf_size)
++	{
++		CHIAKI_LOGE(log, "Http session message response of %zu bytes doesn't fit in %zu", received, buf_size);
++		chiaki_rudp_message_pointers_free(&message);
++		return CHIAKI_ERR_BUF_TOO_SMALL;
++	}
+ 	memcpy(buf, message.data + 2, received);
+ 	*remote_counter = message.remote_counter;
+ 	chiaki_rudp_message_pointers_free(&message);
+ 
+-	if(received <= 0)
+-		return received == 0 ? CHIAKI_ERR_DISCONNECTED : CHIAKI_ERR_NETWORK;
++	if(received == 0)
++		return CHIAKI_ERR_DISCONNECTED;
+ 
+ 	*received_size += received;
+ 	for(; received > 0; buf++, received--)
+@@ -266,10 +277,12 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_send_recv_http_header_psn(ChiakiRudp rudp,
+ 		}
+ 	}
+ 
+-	if(nl_state == 4)
++	if(nl_state != 4)
+ 	{
+-		*header_size = *received_size - received;
++		CHIAKI_LOGE(log, "Http session message response has no complete header");
++		return CHIAKI_ERR_INVALID_RESPONSE;
+ 	}
++	*header_size = *received_size - received;
+ 
+ 	return CHIAKI_ERR_SUCCESS;
+ }
+diff --git a/lib/src/opusencoder.c b/lib/src/opusencoder.c
+index 3d2c3db8..79283668 100644
+--- a/lib/src/opusencoder.c
++++ b/lib/src/opusencoder.c
+@@ -59,6 +59,15 @@ CHIAKI_EXPORT void chiaki_opus_encoder_header(ChiakiAudioHeader *header, ChiakiO
+ 		return;
+ 	}
+ 
++	// The sender only sends 40-byte frames, so encode at the constant bitrate that fills one
++	// exactly; with the default variable bitrate most quieter frames came out smaller and were dropped
++	opus_int32 bitrate = header->frame_size ? (opus_int32)(40 * 8 * header->rate / header->frame_size) : 32000;
++	if(opus_encoder_ctl(encoder->opus_encoder, OPUS_SET_BITRATE(bitrate)) != OPUS_OK
++		|| opus_encoder_ctl(encoder->opus_encoder, OPUS_SET_VBR(0)) != OPUS_OK
++		|| opus_encoder_ctl(encoder->opus_encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC)) != OPUS_OK
++		|| opus_encoder_ctl(encoder->opus_encoder, OPUS_SET_PHASE_INVERSION_DISABLED(1)) != OPUS_OK)
++		CHIAKI_LOGW(encoder->log, "ChiakiOpusEncoder failed to configure opus encoder");
++
+ 	CHIAKI_LOGI(encoder->log, "ChiakiOpusEncoder initialized");
+ 
+ 	size_t opus_frame_buf_size_required = 40;
+diff --git a/lib/src/regist.c b/lib/src/regist.c
+index 88f30014..00c8484a 100644
+--- a/lib/src/regist.c
++++ b/lib/src/regist.c
+@@ -27,10 +27,12 @@ typedef uint32_t in_addr_t;
+ 
+ #define SEARCH_REQUEST_SLEEP_MS 100
+ #define REGIST_SEARCH_TIMEOUT_MS 3000
++#define REGIST_SEARCH_RESEND_MS 500
+ #define REGIST_REPONSE_TIMEOUT_MS 3000
+ 
+ static void *regist_thread_func(void *user);
+ static ChiakiErrorCode regist_search(ChiakiRegist *regist, struct addrinfo *addrinfos, struct sockaddr *recv_addr, socklen_t *recv_addr_size);
++static int regist_search_send(ChiakiRegist *regist, chiaki_socket_t sock, const char *src, struct sockaddr *send_addr, socklen_t send_addr_len);
+ static chiaki_socket_t regist_search_connect(ChiakiRegist *regist, struct addrinfo *addrinfos, struct sockaddr *send_addr, socklen_t *send_addr_len);
+ static ChiakiErrorCode regist_request_connect(ChiakiRegist *regist, const struct sockaddr *addr, size_t addr_len, chiaki_socket_t *sock_out);
+ static ChiakiErrorCode regist_recv_response(ChiakiRegist *regist, ChiakiRegisteredHost *host, chiaki_socket_t sock, ChiakiRPCrypt *rpcrypt, uint16_t remote_counter, char *send_buf, size_t send_buf_size);
+@@ -363,7 +365,7 @@ static void *regist_thread_func(void *user)
+ #ifdef _WIN32
+ 				CHIAKI_LOGE(regist->log, "Regist failed to send request header: %u", WSAGetLastError());
+ #else
+-				CHIAKI_LOGE(regist->log, "Regist failed to send request header: %s", strerror(errno));
++				CHIAKI_LOGE(regist->log, "Regist failed to send request header: " CHIAKI_SOCKET_ERROR_FMT, CHIAKI_SOCKET_ERROR_VALUE);
+ #endif
+ 			}
+ 			goto fail_socket;
+@@ -393,7 +395,7 @@ static void *regist_thread_func(void *user)
+ #ifdef _WIN32
+ 				CHIAKI_LOGE(regist->log, "Regist failed to send payload: %u", WSAGetLastError());
+ #else
+-				CHIAKI_LOGE(regist->log, "Regist failed to send payload: %s", strerror(errno));
++				CHIAKI_LOGE(regist->log, "Regist failed to send payload: " CHIAKI_SOCKET_ERROR_FMT, CHIAKI_SOCKET_ERROR_VALUE);
+ #endif
+ 			}
+ 			goto fail_socket;
+@@ -448,6 +450,13 @@ fail:
+ 	return NULL;
+ }
+ 
++static int regist_search_send(ChiakiRegist *regist, chiaki_socket_t sock, const char *src, struct sockaddr *send_addr, socklen_t send_addr_len)
++{
++	if(regist->info.broadcast)
++		return sendto_broadcast(regist->log, sock, src, strlen(src) + 1, 0, send_addr, send_addr_len);
++	return send(sock, src, strlen(src) + 1, 0);
++}
++
+ static ChiakiErrorCode regist_search(ChiakiRegist *regist, struct addrinfo *addrinfos, struct sockaddr *recv_addr, socklen_t *recv_addr_size)
+ {
+ 	CHIAKI_LOGI(regist->log, "Regist starting search");
+@@ -467,26 +476,40 @@ static ChiakiErrorCode regist_search(ChiakiRegist *regist, struct addrinfo *addr
+ 	size_t res_size = strlen(res);
+ 
+ 	CHIAKI_LOGI(regist->log, "Regist sending search packet");
+-	int r;
+-	if(regist->info.broadcast)
+-		r = sendto_broadcast(regist->log, sock, src, strlen(src) + 1, 0, (struct sockaddr *)&send_addr, send_addr_len);
+-	else
+-		r = send(sock, src, strlen(src) + 1, 0);
++	int r = regist_search_send(regist, sock, src, (struct sockaddr *)&send_addr, send_addr_len);
+ 	if(r < 0)
+ 	{
+-		CHIAKI_LOGE(regist->log, "Regist failed to send search: %s", strerror(errno));
++		CHIAKI_LOGE(regist->log, "Regist failed to send search: " CHIAKI_SOCKET_ERROR_FMT, CHIAKI_SOCKET_ERROR_VALUE);
+ 		err = CHIAKI_ERR_NETWORK;
+ 		goto done;
+ 	}
+ 
+ 	uint64_t timeout_abs_ms = chiaki_time_now_monotonic_ms() + REGIST_SEARCH_TIMEOUT_MS;
++	uint64_t resend_abs_ms = chiaki_time_now_monotonic_ms() + REGIST_SEARCH_RESEND_MS;
+ 	while(true)
+ 	{
+ 		uint64_t now_ms = chiaki_time_now_monotonic_ms();
+ 		if(now_ms > timeout_abs_ms)
+ 			err = CHIAKI_ERR_TIMEOUT;
+ 		else
+-			err = chiaki_stop_pipe_select_single(&regist->stop_pipe, sock, false, timeout_abs_ms - now_ms);
++		{
++			uint64_t wait_ms = timeout_abs_ms - now_ms;
++			if(resend_abs_ms > now_ms && resend_abs_ms - now_ms < wait_ms)
++				wait_ms = resend_abs_ms - now_ms;
++			err = chiaki_stop_pipe_select_single(&regist->stop_pipe, sock, false, wait_ms);
++			if(err == CHIAKI_ERR_TIMEOUT && chiaki_time_now_monotonic_ms() < timeout_abs_ms)
++			{
++				CHIAKI_LOGV(regist->log, "Regist re-sending search packet");
++				if(regist_search_send(regist, sock, src, (struct sockaddr *)&send_addr, send_addr_len) < 0)
++				{
++					CHIAKI_LOGE(regist->log, "Regist failed to send search: %s", strerror(errno));
++					err = CHIAKI_ERR_NETWORK;
++					goto done;
++				}
++				resend_abs_ms = chiaki_time_now_monotonic_ms() + REGIST_SEARCH_RESEND_MS;
++				continue;
++			}
++		}
+ 		if(err != CHIAKI_ERR_SUCCESS)
+ 		{
+ 			if(err == CHIAKI_ERR_TIMEOUT)
+@@ -499,7 +522,16 @@ static ChiakiErrorCode regist_search(ChiakiRegist *regist, struct addrinfo *addr
+ 		if(n <= 0)
+ 		{
+ 			if(n < 0)
+-				CHIAKI_LOGE(regist->log, "Regist failed to receive search response: %s", strerror(errno));
++			{
++#ifdef _WIN32
++				bool refused = WSAGetLastError() == WSAECONNRESET;
++#else
++				bool refused = errno == ECONNREFUSED;
++#endif
++				CHIAKI_LOGE(regist->log, "Regist failed to receive search response: " CHIAKI_SOCKET_ERROR_FMT, CHIAKI_SOCKET_ERROR_VALUE);
++				if(refused)
++					CHIAKI_LOGE(regist->log, "The console refused the registration search, keep its Link Device (PS5) or Add Device (PS4) screen with the code open while registering");
++			}
+ 			else
+ 				CHIAKI_LOGE(regist->log, "Regist failed to receive search response");
+ 			err = CHIAKI_ERR_NETWORK;
+@@ -747,7 +779,7 @@ static ChiakiErrorCode regist_recv_response(ChiakiRegist *regist, ChiakiRegister
+ 		return CHIAKI_ERR_INVALID_RESPONSE;
+ 	}
+ 
+-	if(content_size + header_size > sizeof(buf))
++	if(content_size > sizeof(buf) - header_size)
+ 	{
+ 		CHIAKI_LOGE(regist->log, "Regist response content too big");
+ 		return CHIAKI_ERR_BUF_TOO_SMALL;
+diff --git a/lib/src/remote/holepunch.c b/lib/src/remote/holepunch.c
+index 939cab80..bf8eb403 100644
+--- a/lib/src/remote/holepunch.c
++++ b/lib/src/remote/holepunch.c
+@@ -1444,6 +1444,12 @@ static ChiakiErrorCode http_ps4_session_wakeup(Session *session)
+ 
+     char host_url_starter[128];
+     char host_url[128];
++    if (strlen(user_profile_url) >= sizeof(host_url))
++    {
++        CHIAKI_LOGE(session->log, "http_ps4_session_wakeup: user profile url too long (%zu bytes), rejecting", strlen(user_profile_url));
++        err = CHIAKI_ERR_UNKNOWN;
++        goto cleanup_json;
++    }
+     memcpy(host_url, user_profile_url, strlen(user_profile_url) + 1);
+     // Get just the base url
+     remove_substring(host_url, "https://");
+@@ -6146,6 +6152,12 @@ static ChiakiErrorCode get_stun_servers(Session *session)
+     char *ptr = strtok(response_data.data, "\n");
+     while(ptr != NULL && session->num_stun_servers <= 9)
+     {
++        if (strlen(ptr) >= sizeof(server_strings[0]))
++        {
++            CHIAKI_LOGW(session->log, "get_stun_servers: STUN host line too long (%zu bytes), skipping", strlen(ptr));
++            ptr = strtok(NULL, "\n");
++            continue;
++        }
+         strcpy(server_strings[session->num_stun_servers], ptr);
+         session->num_stun_servers++;
+ 		ptr = strtok(NULL, "\n");
+@@ -6229,6 +6241,13 @@ static ChiakiErrorCode get_stun_servers(Session *session)
+     ptr = strtok(response_data.data, "\n");
+     while(ptr != NULL && session->num_stun_servers_ipv6 <= 9)
+     {
++        // require the leading [ and bound the copy against the row size
++        if (ptr[0] != '[' || strlen(ptr + 1) >= sizeof(server_strings_ipv6[0]))
++        {
++            CHIAKI_LOGW(session->log, "get_stun_servers: IPv6 STUN line malformed or too long, skipping");
++            ptr = strtok(NULL, "\n");
++            continue;
++        }
+         // omit leading [
+         strcpy(server_strings_ipv6[session->num_stun_servers_ipv6], ptr + 1);
+         session->num_stun_servers_ipv6++;
+diff --git a/lib/src/remote/stun.h b/lib/src/remote/stun.h
+index 81e6d7a0..a150b74e 100644
+--- a/lib/src/remote/stun.h
++++ b/lib/src/remote/stun.h
+@@ -565,24 +565,30 @@ static bool stun_get_external_address_from_server(ChiakiLog *log, StunServer *se
+     }
+ 
+     //uint16_t response_attrs_length = ntohs(*(uint16_t*)(&binding_resp[2]));
+-    uint16_t response_pos = STUN_HEADER_SIZE;
++    size_t response_pos = STUN_HEADER_SIZE;
+     // Check we can read 4 bytes of attribute data
+-    while (response_pos < (received - 3))
++    while (response_pos + 4 <= (size_t)received)
+     {
+         uint16_t attr_type = ntohs(*(uint16_t*)(&binding_resp[response_pos]));
+         uint16_t attr_length = ntohs(*(uint16_t*)(&binding_resp[response_pos + 2]));
+         // check that the whole advertised message has been received
+-        if(response_pos > (received - (sizeof(attr_type) + sizeof(attr_length) + attr_length)))
++        if(attr_length > (size_t)received - response_pos - (sizeof(attr_type) + sizeof(attr_length)))
+         {
+             CHIAKI_LOGE(log, "remote/stun.h: Received STUN response with invalid data");
+             return false;
+         }
+         if (attr_type != STUN_ATTRIB_MAPPED_ADDRESS && attr_type != STUN_ATTRIB_XOR_MAPPED_ADDRESS)
+         {
+-            response_pos += sizeof(attr_type) + sizeof(attr_length) + attr_length;
++            // attribute values are padded to a multiple of 4 bytes
++            response_pos += sizeof(attr_type) + sizeof(attr_length) + (((size_t)attr_length + 3) & ~(size_t)3);
+             continue;
+         }
+ 
++        if (attr_length < 8)
++        {
++            CHIAKI_LOGE(log, "remote/stun.h: Received STUN mapped address with invalid length %u", attr_length);
++            return false;
++        }
+         bool xored = attr_type == STUN_ATTRIB_XOR_MAPPED_ADDRESS;
+         uint8_t family = binding_resp[response_pos + 5];
+         if (family == STUN_MAPPED_ADDR_FAMILY_IPV4) {
+diff --git a/lib/src/reorderqueue.c b/lib/src/reorderqueue.c
+index 656c10d8..8e82d428 100644
+--- a/lib/src/reorderqueue.c
++++ b/lib/src/reorderqueue.c
+@@ -184,6 +184,7 @@ CHIAKI_EXPORT void chiaki_reorder_queue_drop(ChiakiReorderQueue *queue, uint64_t
+ 
+ 	if(queue->drop_cb)
+ 		queue->drop_cb(seq_num, entry->user, queue->drop_cb_user);
++	entry->set = false;
+ 
+ 	// reduce count if necessary
+ 	if(index == queue->count - 1)
+diff --git a/lib/src/takion.c b/lib/src/takion.c
+index 5197d049..200f6c07 100644
+--- a/lib/src/takion.c
++++ b/lib/src/takion.c
+@@ -45,7 +45,6 @@
+ #define TAKION_REORDER_QUEUE_SIZE_EXP 4 // => 16 entries
+ #define TAKION_AV_VIDEO_REORDER_QUEUE_SIZE_EXP 6 // => 64 entries
+ #define TAKION_AV_REORDER_TIMEOUT_US 16000 // ~1 frame at 60fps
+-#define TAKION_SEND_BUFFER_SIZE 16
+ 
+ #define TAKION_POSTPONE_PACKETS_SIZE 32
+ 
+@@ -241,6 +240,11 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
+ 		goto error_gkcrypt_local_mutex;
+ 	takion->tag_remote = 0;
+ 
++	takion->send_buffer_active = false;
++	ret = chiaki_mutex_init(&takion->send_buffer_active_mutex, false);
++	if(ret != CHIAKI_ERR_SUCCESS)
++		goto error_seq_num_local_mutex;
++
+ 	takion->enable_crypt = info->enable_crypt;
+ 	takion->postponed_packets = NULL;
+ 	takion->postponed_packets_size = 0;
+@@ -254,7 +258,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_connect(ChiakiTakion *takion, Chiaki
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 	{
+ 		CHIAKI_LOGE(takion->log, "Takion failed to create stop pipe");
+-		goto error_seq_num_local_mutex;
++		goto error_send_buffer_active_mutex;
+ 	}
+ 
+ 	if(sock)
+@@ -584,6 +588,8 @@ error_sock:
+ 	}
+ error_pipe:
+ 	chiaki_stop_pipe_fini(&takion->stop_pipe);
++error_send_buffer_active_mutex:
++	chiaki_mutex_fini(&takion->send_buffer_active_mutex);
+ error_seq_num_local_mutex:
+ 	chiaki_mutex_fini(&takion->seq_num_local_mutex);
+ error_gkcrypt_local_mutex:
+@@ -596,6 +602,7 @@ CHIAKI_EXPORT void chiaki_takion_close(ChiakiTakion *takion)
+ 	chiaki_stop_pipe_stop(&takion->stop_pipe);
+ 	chiaki_thread_join(&takion->thread, NULL);
+ 	chiaki_stop_pipe_fini(&takion->stop_pipe);
++	chiaki_mutex_fini(&takion->send_buffer_active_mutex);
+ 	chiaki_mutex_fini(&takion->seq_num_local_mutex);
+ 	chiaki_mutex_fini(&takion->gkcrypt_local_mutex);
+ }
+@@ -834,6 +841,29 @@ static ChiakiErrorCode takion_send_ext(ChiakiTakion *takion, uint8_t *buf, size_
+ 	return chiaki_takion_send_raw(takion, buf, buf_size);
+ }
+ 
++/**
++ * Push into the send buffer unless the Takion thread has already finalized it.
++ * Takes ownership of buf.
++ */
++static ChiakiErrorCode takion_send_buffer_push(ChiakiTakion *takion, ChiakiSeqNum32 seq_num, uint8_t *buf, size_t buf_size)
++{
++	ChiakiErrorCode err = chiaki_mutex_lock(&takion->send_buffer_active_mutex);
++	if(err != CHIAKI_ERR_SUCCESS)
++	{
++		free(buf);
++		return err;
++	}
++	if(takion->send_buffer_active)
++		chiaki_takion_send_buffer_push(&takion->send_buffer, seq_num, buf, buf_size);
++	else
++	{
++		free(buf);
++		err = CHIAKI_ERR_DISCONNECTED;
++	}
++	chiaki_mutex_unlock(&takion->send_buffer_active_mutex);
++	return err;
++}
++
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_message_data(ChiakiTakion *takion, uint8_t chunk_flags, uint16_t channel, uint8_t *buf, size_t buf_size, ChiakiSeqNum32 *seq_num)
+ {
+ 	// TODO: can we make this more memory-efficient?
+@@ -875,7 +905,9 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_message_data(ChiakiTakion *taki
+ 		return err;
+ 	}
+ 
+-	chiaki_takion_send_buffer_push(&takion->send_buffer, seq_num_val, packet_buf, packet_size);
++	err = takion_send_buffer_push(takion, seq_num_val, packet_buf, packet_size);
++	if(err != CHIAKI_ERR_SUCCESS)
++		return err;
+ 
+ 	if(seq_num)
+ 		*seq_num = seq_num_val;
+@@ -923,7 +955,9 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_message_data_cont(ChiakiTakion
+ 		return err;
+ 	}
+ 
+-	chiaki_takion_send_buffer_push(&takion->send_buffer, seq_num_val, packet_buf, packet_size);
++	err = takion_send_buffer_push(takion, seq_num_val, packet_buf, packet_size);
++	if(err != CHIAKI_ERR_SUCCESS)
++		return err;
+ 
+ 	if(seq_num)
+ 		*seq_num = seq_num_val;
+@@ -1030,7 +1064,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_feedback_state(ChiakiTakion *ta
+ 	buf[0] = TAKION_PACKET_TYPE_FEEDBACK_STATE;
+ 	memset(buf + 1, 0, ext);
+ 	*((chiaki_unaligned_uint16_t *)(buf + 1 + ext)) = htons(seq_num);
+-	buf[3 + ext] = 0; // TODO
++	buf[3 + ext] = 0; // number of states in the packet less one
+ 	*((chiaki_unaligned_uint32_t *)(buf + 4 + ext)) = 0; // key pos
+ 	*((chiaki_unaligned_uint32_t *)(buf + 8 + ext)) = 0; // gmac
+ 	size_t buf_sz;
+@@ -1101,7 +1135,7 @@ beach:
+ 	return err;
+ }
+ 
+-CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_feedback_history(ChiakiTakion *takion, ChiakiSeqNum16 seq_num, uint8_t *payload, size_t payload_size)
++CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_feedback_history(ChiakiTakion *takion, ChiakiSeqNum16 seq_num, uint8_t event_count, uint8_t *payload, size_t payload_size)
+ {
+ 	size_t ext = takion->ext_size;
+ 	size_t buf_size = 0xc + ext + payload_size;
+@@ -1111,7 +1145,9 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_takion_send_feedback_history(ChiakiTakion *
+ 	buf[0] = TAKION_PACKET_TYPE_FEEDBACK_HISTORY;
+ 	memset(buf + 1, 0, ext);
+ 	*((chiaki_unaligned_uint16_t *)(buf + 1 + ext)) = htons(seq_num);
+-	buf[3 + ext] = 0; // TODO
++	// number of events in the payload less one: the console adds one back, so the full count
++	// would make it read past the payload and reject the packet
++	buf[3 + ext] = event_count ? event_count - 1 : 0;
+ 	*((chiaki_unaligned_uint32_t *)(buf + 4 + ext)) = 0; // key pos
+ 	*((chiaki_unaligned_uint32_t *)(buf + 8 + ext)) = 0; // gmac
+ 	memcpy(buf + 0xc + ext, payload, payload_size);
+@@ -1494,8 +1530,11 @@ static void *takion_thread_func(void *user)
+ 	chiaki_reorder_queue_set_drop_cb(&takion->data_queue, takion_data_drop, takion);
+ 
+ 	// The send buffer size MUST be consistent with the acked seqnums array size in takion_handle_packet_message_data_ack()
+-	if(chiaki_takion_send_buffer_init(&takion->send_buffer, takion, TAKION_SEND_BUFFER_SIZE) != CHIAKI_ERR_SUCCESS)
++	if(chiaki_takion_send_buffer_init(&takion->send_buffer, takion, CHIAKI_TAKION_SEND_BUFFER_SIZE) != CHIAKI_ERR_SUCCESS)
+ 		goto error_reoder_queue;
++	chiaki_mutex_lock(&takion->send_buffer_active_mutex);
++	takion->send_buffer_active = true;
++	chiaki_mutex_unlock(&takion->send_buffer_active_mutex);
+ 
+ 
+ 	if(takion->cb)
+@@ -1579,6 +1618,10 @@ static void *takion_thread_func(void *user)
+ 		takion_handle_packet(takion, resized_buf, received_size);
+ 	}
+ 
++	// Other threads (e.g. the heartbeat or an IDR request) may still send data, so stop them from using the send buffer first
++	chiaki_mutex_lock(&takion->send_buffer_active_mutex);
++	takion->send_buffer_active = false;
++	chiaki_mutex_unlock(&takion->send_buffer_active_mutex);
+ 	chiaki_takion_send_buffer_fini(&takion->send_buffer);
+ 
+ 	if(takion->video_queue_initialized)
+@@ -2020,7 +2063,7 @@ static void takion_handle_packet_message_data_ack(ChiakiTakion *takion, uint8_t
+ 	CHIAKI_LOGV(takion->log, "Takion received data ack with cumulative_seq_num = %#x, a_rwnd = %#x, gap_ack_blocks_count = %#x, dup_tsns_count = %#x",
+ 			cumulative_seq_num, a_rwnd, gap_ack_blocks_count, dup_tsns_count);
+ 
+-	ChiakiSeqNum32 acked_seq_nums[TAKION_SEND_BUFFER_SIZE];
++	ChiakiSeqNum32 acked_seq_nums[CHIAKI_TAKION_SEND_BUFFER_SIZE];
+ 	size_t acked_seq_nums_count = 0;
+ 	chiaki_takion_send_buffer_ack(&takion->send_buffer, cumulative_seq_num, acked_seq_nums, &acked_seq_nums_count);
+ 
+diff --git a/lib/src/takionsendbuffer.c b/lib/src/takionsendbuffer.c
+index 58f7452d..1fd6bca1 100644
+--- a/lib/src/takionsendbuffer.c
++++ b/lib/src/takionsendbuffer.c
+@@ -12,7 +12,6 @@
+ #define TAKION_DATA_RESEND_TIMEOUT_MS 200
+ #define TAKION_DATA_RESEND_WAKEUP_TIMEOUT_MS (TAKION_DATA_RESEND_TIMEOUT_MS/2)
+ #define TAKION_DATA_RESEND_TRIES_MAX 25
+-#define TAKION_SEND_BUFFER_SIZE 16
+ 
+ #endif
+ 
+@@ -252,7 +251,7 @@ static void takion_send_buffer_resend(ChiakiTakionSendBuffer *send_buffer)
+ 			if(packet->tries >= TAKION_DATA_RESEND_TRIES_MAX)
+ 			{
+ 				CHIAKI_LOGI(send_buffer->log, "Hit max retries of %d tries... giving up on packet with seqnum %#llx", TAKION_DATA_RESEND_TRIES_MAX, (unsigned long long)packet->seq_num);
+-				ChiakiSeqNum32 ack_seq_nums[TAKION_SEND_BUFFER_SIZE];
++				ChiakiSeqNum32 ack_seq_nums[CHIAKI_TAKION_SEND_BUFFER_SIZE];
+ 				size_t ack_seq_nums_count;
+ 				chiaki_mutex_unlock(&send_buffer->mutex);
+ 				chiaki_takion_send_buffer_ack(send_buffer, packet->seq_num, ack_seq_nums, &ack_seq_nums_count);
+diff --git a/lib/src/videoreceiver.c b/lib/src/videoreceiver.c
+index ae185837..8ec46b25 100644
+--- a/lib/src/videoreceiver.c
++++ b/lib/src/videoreceiver.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
+ 
+ #include <chiaki/videoreceiver.h>
++#include <chiaki/time.h>
+ #include "../include/chiaki/session.h"
+ 
+ #include <string.h>
+@@ -68,6 +69,10 @@ static void p5m_frames_note_flush(ChiakiLog *log, ChiakiFrameProcessorFlushResul
+ 	}
+ }
+ 
++// While waiting for a requested IDR frame, request it again this often, in case the request
++// or the IDR frame itself was lost; otherwise the picture would stay frozen
++#define VIDEO_IDR_RETRY_INTERVAL_MS 1000
++
+ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *video_receiver);
+ 
+ static void add_ref_frame(ChiakiVideoReceiver *video_receiver, int32_t frame)
+@@ -117,6 +122,7 @@ CHIAKI_EXPORT void chiaki_video_receiver_init(ChiakiVideoReceiver *video_receive
+ 	chiaki_bitstream_init(&video_receiver->bitstream, video_receiver->log, video_receiver->session->connect_info.video_profile.codec);
+ 	chiaki_mutex_init(&video_receiver->waiting_for_idr_mutex, false);
+ 	video_receiver->waiting_for_idr = false;
++	video_receiver->idr_request_last_ms = 0;
+ 	chiaki_mutex_init(&video_receiver->frames_lost_mutex, false);
+ }
+ 
+@@ -133,9 +139,34 @@ CHIAKI_EXPORT void chiaki_video_receiver_set_waiting_for_idr(ChiakiVideoReceiver
+ {
+ 	chiaki_mutex_lock(&video_receiver->waiting_for_idr_mutex);
+ 	video_receiver->waiting_for_idr = waiting_for_idr;
++	if(waiting_for_idr)
++		video_receiver->idr_request_last_ms = chiaki_time_now_monotonic_ms();
+ 	chiaki_mutex_unlock(&video_receiver->waiting_for_idr_mutex);
+ }
+ 
++/**
++ * While waiting for an IDR frame, request it again once VIDEO_IDR_RETRY_INTERVAL_MS has passed
++ * since it was last requested.
++ */
++static void video_receiver_retry_idr_request(ChiakiVideoReceiver *video_receiver)
++{
++	chiaki_mutex_lock(&video_receiver->waiting_for_idr_mutex);
++	uint64_t now_ms = chiaki_time_now_monotonic_ms();
++	bool due = video_receiver->waiting_for_idr
++		&& now_ms - video_receiver->idr_request_last_ms >= VIDEO_IDR_RETRY_INTERVAL_MS;
++	if(due)
++		video_receiver->idr_request_last_ms = now_ms;
++	chiaki_mutex_unlock(&video_receiver->waiting_for_idr_mutex);
++	if(!due)
++		return;
++
++	ChiakiErrorCode err = stream_connection_send_idr_request(&video_receiver->session->stream_connection);
++	if(err == CHIAKI_ERR_SUCCESS)
++		CHIAKI_LOGI(video_receiver->log, "Still waiting for IDR frame, requested it again");
++	else
++		CHIAKI_LOGW(video_receiver->log, "Still waiting for IDR frame and the request could not be sent again: %s", chiaki_error_string(err));
++}
++
+ CHIAKI_EXPORT bool chiaki_video_receiver_get_waiting_for_idr(ChiakiVideoReceiver *video_receiver)
+ {
+ 	bool waiting_for_idr;
+@@ -304,6 +335,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+ 				else
+ 				{
+ 					CHIAKI_LOGW(video_receiver->log, "Video FEC failure, already waiting for requested IDR");
++					video_receiver_retry_idr_request(video_receiver);
+ 				}
+ 				ChiakiEvent event = { 0 };
+ 				event.type = CHIAKI_EVENT_VIDEO_FEC_FAILURE;
+@@ -338,6 +370,7 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
+ 			else
+ 			{
+ 				CHIAKI_LOGV(video_receiver->log, "Skipping P-frame %d while waiting for IDR", (int)video_receiver->frame_index_cur);
++				video_receiver_retry_idr_request(video_receiver);
+ 				video_receiver->frame_index_prev = video_receiver->frame_index_cur;
+ 				return CHIAKI_ERR_SUCCESS;
+ 			}

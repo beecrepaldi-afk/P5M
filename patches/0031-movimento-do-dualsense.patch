@@ -1,0 +1,122 @@
+diff --git a/android/app/src/main/cpp/chiaki-jni.c b/android/app/src/main/cpp/chiaki-jni.c
+index 641f5bd..e800961 100644
+--- a/android/app/src/main/cpp/chiaki-jni.c
++++ b/android/app/src/main/cpp/chiaki-jni.c
+@@ -187,6 +187,7 @@ typedef struct android_chiaki_session_t
+ 	jmethodID java_session_event_led_color_meth;
+ 	jmethodID java_session_event_player_index_meth;
+ 	jmethodID java_session_event_led_brightness_meth;
++	jmethodID java_session_event_motion_reset_meth;
+ 	jfieldID java_controller_state_buttons;
+ 	jfieldID java_controller_state_l2_state;
+ 	jfieldID java_controller_state_r2_state;
+@@ -350,6 +351,13 @@ static void android_chiaki_event_cb(ChiakiEvent *event, void *user)
+ 							  session->java_session_event_led_brightness_meth,
+ 							  (jint)event->p5m_led_brightness);
+ 			break;
++		// O console pede para zerar a orientacao do controle (o jogo
++		// recentralizou a mira, por exemplo). Quem calcula a orientacao e o
++		// Kotlin, com os sensores do proprio DualSense.
++		case CHIAKI_EVENT_MOTION_RESET:
++			E->CallVoidMethod(env, session->java_session,
++							  session->java_session_event_motion_reset_meth);
++			break;
+ 		default:
+ 			break;
+ 	}
+@@ -825,6 +833,7 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject
+ 	session->java_session_event_led_color_meth = E->GetMethodID(env, session->java_session_class, "eventLedColor", "(III)V");
+ 	session->java_session_event_player_index_meth = E->GetMethodID(env, session->java_session_class, "eventPlayerIndex", "(I)V");
+ 	session->java_session_event_led_brightness_meth = E->GetMethodID(env, session->java_session_class, "eventLedBrightness", "(I)V");
++	session->java_session_event_motion_reset_meth = E->GetMethodID(env, session->java_session_class, "eventMotionReset", "()V");
+ 
+ 	// O sink de haptica so pode ser ligado depois dos method ids: o callback
+ 	// usa java_session_event_rumble_meth, e a trilha pode comecar a chegar
+diff --git a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+index 2cd5a14..199644a 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+@@ -411,6 +411,8 @@ data class LedColorEvent(val red: Int, val green: Int, val blue: Int): Event()
+ data class PlayerIndexEvent(val index: Int): Event()
+ // P5M: brilho dos indicadores escolhido no PS5, 0 a 2.
+ data class LedBrightnessEvent(val level: Int): Event()
++/** O console pediu para zerar a orientacao do controle. */
++object MotionResetEvent: Event()
+ 
+ class CreateError(val errorCode: ErrorCode): Exception("Failed to create a native object: $errorCode")
+ 
+@@ -518,6 +520,11 @@ class Session(connectInfo: ConnectInfo, logFile: String?, logVerbose: Boolean)
+ 		event(LedBrightnessEvent(level and 0xFF))
+ 	}
+ 
++	private fun eventMotionReset()
++	{
++		event(MotionResetEvent)
++	}
++
+ 	fun setSurface(surface: Surface?)
+ 	{
+ 		// P5M: depois do dispose o ponteiro e zero, e o lado nativo o
+diff --git a/android/app/src/main/java/com/metallic/chiaki/session/StreamInput.kt b/android/app/src/main/java/com/metallic/chiaki/session/StreamInput.kt
+index 183e341..c778ad2 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/session/StreamInput.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/session/StreamInput.kt
+@@ -73,6 +73,30 @@ class StreamInput(val context: Context, val preferences: Preferences)
+ 	private val p5mCalibragemDir by lazy { io.github.gblandro.p5m.StickPrefs(context).right }
+ 
+ 	private val sensorControllerState = ControllerState() // from Motion Sensors
++
++	/**
++	 * P5M: o movimento do proprio DualSense, lido pelo app.
++	 *
++	 * O `observe` do chiaki registra os sensores padrao do aparelho -- num
++	 * celular, o celular e o controle. No Quest seria o headset: a cabeca do
++	 * jogador girando a mira. Quem chama isto le os sensores do controle e ja
++	 * entrega aceleracao em g, giro em rad/s e a orientacao fundida.
++	 */
++	fun p5mMovimento(gx: Float, gy: Float, gz: Float, ax: Float, ay: Float, az: Float,
++			ox: Float, oy: Float, oz: Float, ow: Float)
++	{
++		sensorControllerState.gyroX = gx
++		sensorControllerState.gyroY = gy
++		sensorControllerState.gyroZ = gz
++		sensorControllerState.accelX = ax
++		sensorControllerState.accelY = ay
++		sensorControllerState.accelZ = az
++		sensorControllerState.orientX = ox
++		sensorControllerState.orientY = oy
++		sensorControllerState.orientZ = oz
++		sensorControllerState.orientW = ow
++		controllerStateUpdated()
++	}
+ 	private var keyControllerState = ControllerState() // from KeyEvents
+ 	private var motionControllerState = ControllerState() // from MotionEvents
+ 	var touchControllerState = ControllerState()
+@@ -162,8 +186,11 @@ class StreamInput(val context: Context, val preferences: Preferences)
+ 	fun observe(lifecycleOwner: LifecycleOwner)
+ 	{
+ 		lifecycleOwner.lifecycle.addObserver(gamepadLifecycleObserver)
+-		if(preferences.motionEnabled)
+-			lifecycleOwner.lifecycle.addObserver(motionLifecycleObserver)
++		// P5M: sem o motionLifecycleObserver. Ele registra os sensores padrao
++		// do aparelho, que no Quest sao os do headset; o movimento vem do
++		// DualSense, por p5mMovimento (MovimentoDualSense). O observe() em si
++		// continua obrigatorio: e ele que liga o monitor de controles, e sem
++		// ele um controle religado perdia analogicos e direcional (dev.204-206).
+ 	}
+ 
+ 	private fun controllerStateUpdated()
+diff --git a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
+index 42b62ec..c433a9f 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/stream/StreamActivity.kt
+@@ -63,6 +63,9 @@ class StreamActivity : AppCompatActivity(), View.OnSystemUiVisibilityChangeListe
+ 		})[StreamViewModel::class.java]
+ 
+ 		viewModel.input.observe(this)
++		// P5M: o movimento do proprio DualSense, e nao os sensores do headset
++		// -- ver MovimentoDualSense e o observe() do StreamInput.
++		lifecycle.addObserver(io.github.gblandro.p5m.MovimentoDualSense(this, viewModel.input))
+ 
+ 		binding = ActivityStreamBinding.inflate(layoutInflater)
+ 		setContentView(binding.root)

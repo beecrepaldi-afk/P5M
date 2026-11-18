@@ -74,6 +74,10 @@ object DisplayMode
 	 */
 	private var streamsAlive = 0
 
+	private var wifiDaJanela: WifiLowLatency? = null
+	private fun wifiJanela(a: android.app.Activity): WifiLowLatency =
+		wifiDaJanela ?: WifiLowLatency(a.applicationContext).also { wifiDaJanela = it }
+
 	/**
 	 * Conta quantas telas de stream estao vivas.
 	 *
@@ -98,10 +102,24 @@ object DisplayMode
 			{
 				if(isStream(a)) streamsAlive = (streamsAlive - 1).coerceAtLeast(0)
 			}
-			override fun onActivityStarted(a: android.app.Activity) {}
+			// O modo janela tambem pede o Wi-Fi de baixa latencia; o imersivo
+			// ja pede o dele na VrStreamActivity. Em 18/11/2026 uma sessao em
+			// janela, sem o lock, travou 164 ms de video e 169 ms de audio no
+			// instante de um scan de Wi-Fi do servico de localizacao da Meta
+			// (`startScan uid=10005`, atraso no Takion de ate 148 ms); na sessao
+			// imersiva seguinte, com o lock, nenhum scan apareceu.
+			override fun onActivityStarted(a: android.app.Activity)
+			{
+				if(a is com.metallic.chiaki.stream.StreamActivity)
+					wifiJanela(a).acquire()
+			}
 			override fun onActivityResumed(a: android.app.Activity) {}
 			override fun onActivityPaused(a: android.app.Activity) {}
-			override fun onActivityStopped(a: android.app.Activity) {}
+			override fun onActivityStopped(a: android.app.Activity)
+			{
+				if(a is com.metallic.chiaki.stream.StreamActivity)
+					wifiJanela(a).release()
+			}
 			override fun onActivitySaveInstanceState(a: android.app.Activity, b: android.os.Bundle) {}
 		})
 	}
@@ -148,6 +166,9 @@ object DisplayMode
 		// do chiaki, no momento em que monta o stream do Oboe. Ver AudioRoute.
 		AudioRoute.setPrefersSystemMixer(mode == WINDOW)
 
+		// Antes do perfil: codec, 10 bits e vibracao dependem do console.
+		StreamQualityPrefs.sessaoPs4 = !connectInfo.ps5
+		StreamQualityPrefs.sessao3d = mode == IMMERSIVE && StreamQualityPrefs(context).syntheticStereo
 		val quality = StreamQualityPrefs(context)
 		val profile = quality.videoProfile()
 
@@ -161,14 +182,28 @@ object DisplayMode
 		Log.i(TAG, "Opening the stream in ${label(mode)} mode, profile " +
 				"${profile.width}x${profile.height}@${profile.maxFPS} " +
 				"${profile.codec} ${profile.bitrate}kbps, rumble " +
-				(if(quality.hapticRumble) "haptic (DualSense)" else "classic (DualShock 4)"))
+				StreamQualityPrefs.RUMBLE_NAMES[quality.rumbleNaSessao] +
+				(if(quality.anunciarDualSense()) " (announced as DualSense)" else " (announced as DualShock 4)") +
+				(if(StreamQualityPrefs.sessaoPs4) ", PS4: 8-bit H.264, no haptics or adaptive triggers" else "") +
+				(if(quality.tenBit && StreamQualityPrefs.sessao3d && !StreamQualityPrefs.sessaoPs4)
+					", 3D: native 8-bit" else "") +
+				(if(profile.bitrate < quality.bitrateKbps) ", bitrate lowered by auto bitrate" else ""))
+
+		// Depois do marcador, para a linha das sondas cair na sessão certa.
+		SondasDeProtocolo.aplicar(context)
+
+		// O desligado vale para as duas telas, e e escrito aqui pelo mesmo
+		// motivo: o Rumble do modo janela nasce dentro do codigo do chiaki, por
+		// patch, e nao ha como passar a preferencia ate la sem regerar patch.
+		Rumble.desligado = quality.rumbleNaSessao == StreamQualityPrefs.RUMBLE_DESLIGADO
+		Rumble.vigiarTrilha = quality.rumbleNaSessao == StreamQualityPrefs.RUMBLE_MOTOR
 
 		// Aqui, e não em cada tela que abre um stream: as duas passam por este
 		// ponto -- a lista local do chiaki e a conexão remota pela PSN -- e uma
 		// preferência que valesse só numa delas seria pior que não existir.
 		context.startActivity(Intent(context, target).apply {
 			putExtra(com.metallic.chiaki.stream.StreamActivity.EXTRA_CONNECT_INFO,
-					connectInfo.copy(videoProfile = profile, dualsense = quality.hapticRumble))
+					connectInfo.copy(videoProfile = profile, dualsense = quality.anunciarDualSense()))
 			(context as? Activity)?.let {
 				putExtra(StreamReturn.EXTRA_ACTIVITY, it.javaClass.name)
 				putExtra(StreamReturn.EXTRA_TASK, it.taskId)

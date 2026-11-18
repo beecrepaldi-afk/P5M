@@ -1,0 +1,16 @@
+diff --git a/android/app/src/main/java/com/metallic/chiaki/common/ManualHost.kt b/android/app/src/main/java/com/metallic/chiaki/common/ManualHost.kt
+index 7065610..1299e4e 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/common/ManualHost.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/common/ManualHost.kt
+@@ -8,6 +8,11 @@ import io.reactivex.Completable
+ import io.reactivex.Flowable
+ import io.reactivex.Single
+ 
++// P5M: a chave estrangeira para registered_host nao tem indice, e o Room
++// avisa em toda build. A tabela guarda um ou dois consoles, entao o indice nao
++// ganha nada, e cria-lo mudaria o esquema (banco na versao 3 e migracao) --
++// risco de o app nao abrir e perder o registro na PSN por causa de um aviso.
++@SuppressWarnings(RoomWarnings.MISSING_INDEX_ON_FOREIGN_KEY_CHILD)
+ @Entity(tableName = "manual_host",
+ 	foreignKeys = [
+ 	ForeignKey(

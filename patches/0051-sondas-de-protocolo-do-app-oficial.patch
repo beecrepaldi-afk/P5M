@@ -1,0 +1,216 @@
+diff --git a/lib/src/ctrl.c b/lib/src/ctrl.c
+--- a/lib/src/ctrl.c
++++ b/lib/src/ctrl.c
+@@ -7,6 +7,7 @@
+ #include <chiaki/time.h>
+ 
+ #include "utils.h"
++#include "p5m_sonda.h"
+ 
+ #include <stdlib.h>
+ #include <string.h>
+@@ -1120,8 +1121,34 @@
+ 	uint8_t rp_server_type[0x10];
+ 	bool rp_prohibit;
+ 	bool success;
++	// P5M: o que o PS5 diz de si quando o pedido leva RP-ReqMoreInfo (ver
++	// p5m_ctrl_mais_info). Texto cru, so para o diario.
++	char p5m_extras[384];
+ } CtrlResponse;
+ 
++/*
++ * P5M: cabecalhos que o app oficial (9.5.0) manda ao PS5 e o chiaki nao.
++ *
++ * RP-PadProcNo e sempre 3 no oficial; RP-ReqMoreInfo e 1 (0x1001 so no modo
++ * GCM, que nao usamos). Em troca o console responderia com a qualidade do
++ * Wi-Fi dele (RP-Rssi-Dbm/Percent), o tipo do aparelho (RP-Device), o botao
++ * de confirmar (RP-Enterkey) e um RP-Vmode de sentido ainda desconhecido.
++ * Desligado por padrao: e uma sonda, ligada no Diagnostico.
++ */
++static bool p5m_ctrl_mais_info(ChiakiSession *session)
++{
++	return chiaki_target_is_ps5(session->target) && p5m_sonda("p5m_probe_ctrl_more_info") > 0;
++}
++
++static void p5m_guardar_extra(CtrlResponse *response, const char *chave, const char *valor)
++{
++	size_t usado = strlen(response->p5m_extras);
++	if(usado + 4 >= sizeof(response->p5m_extras))
++		return;
++	snprintf(response->p5m_extras + usado, sizeof(response->p5m_extras) - usado,
++			"%s%s=%s", usado ? ", " : "", chave, valor);
++}
++
+ static void parse_ctrl_response(CtrlResponse *response, ChiakiHttpResponse *http_response)
+ {
+ 	memset(response, 0, sizeof(CtrlResponse));
+@@ -1150,6 +1177,17 @@
+ 		}
+ 		else if(strcmp(header->key, "RP-Prohibit") == 0)
+ 			response->rp_prohibit = atoi(header->value) == 1;
++		else if(strcmp(header->key, "RP-Rssi-Dbm") == 0
++				|| strcmp(header->key, "RP-Rssi-Percent") == 0
++				|| strcmp(header->key, "RP-Device") == 0
++				|| strcmp(header->key, "RP-Enterkey") == 0
++				|| strcmp(header->key, "RP-Vmode") == 0
++				|| strcmp(header->key, "RP-ReqMoreInfo") == 0)
++			p5m_guardar_extra(response, header->key + 3, header->value);
++		else if(strncmp(header->key, "RP-", 3) == 0 && strcmp(header->key, "RP-Server-IPv4") != 0)
++			// Cabecalho que nem o chiaki nem a lista acima conhecem: so o nome,
++			// o valor pode ser cifrado ou pessoal. O IPv4 fica de fora de tudo.
++			p5m_guardar_extra(response, header->key + 3, "?");
+ 	}
+ }
+ 
+@@ -1286,6 +1324,7 @@
+ 			"RP-ConPath: 1\r\n"
+ 			"%s%s%s"
+ 			"%s%s%s"
++			"%s"
+ 			"\r\n";
+ 
+ 	const char *path;
+@@ -1297,7 +1336,9 @@
+ 		path = "/sie/ps4/rp/sess/ctrl";
+ 	const char *rp_version = chiaki_rp_version_string(session->target);
+ 	int port = session->holepunch_session ? chiaki_get_ps_ctrl_port(session->holepunch_session) : SESSION_CTRL_PORT;
+-	char send_buf[512];
++	bool mais_info = p5m_ctrl_mais_info(session);
++	// P5M: 1024 em vez de 512, porque a sonda acrescenta cabecalhos ao pedido.
++	char send_buf[1024];
+ 	int request_len = snprintf(send_buf, sizeof(send_buf), request_fmt,
+ 			path, session->connect_info.hostname, port, auth_b64,
+ 			rp_version ? rp_version : "", did_b64, ostype_b64,
+@@ -1306,7 +1347,8 @@
+ 			have_bitrate ? "\r\n" : "",
+ 			have_streaming_type ? "RP-StreamingType: " : "",
+ 			have_streaming_type ? streaming_type_b64 : "",
+-			have_streaming_type ? "\r\n" : "");
++			have_streaming_type ? "\r\n" : "",
++			mais_info ? "RP-PadProcNo: 3\r\nRP-ReqMoreInfo: 1\r\n" : "");
+ 	if(request_len < 0 || request_len >= sizeof(send_buf))
+ 		goto error;
+ 
+@@ -1320,7 +1362,9 @@
+ 	}
+ 
+ 	bool ctrl_request_retry = false;
+-	char buf[512];
++	// P5M: a resposta cresce com a sonda de RP-ReqMoreInfo; um cabecalho que
++	// nao coubesse aqui derrubaria a sessao inteira.
++	char buf[1024];
+ 	size_t header_size;
+ 	size_t received_size;
+ 
+@@ -1420,6 +1464,10 @@
+ 		goto error;
+ 	}
+ 	chiaki_http_response_fini(&http_response);
++	if(mais_info || response.p5m_extras[0])
++		CHIAKI_LOGE(session->log, "P5M: ctrl response extras (more info %s): %s",
++				mais_info ? "asked" : "not asked",
++				response.p5m_extras[0] ? response.p5m_extras : "none");
+ 
+ 	if(response.server_type_valid)
+ 	{
+@@ -1468,6 +1516,14 @@
+ 
+ 	// if we already got more data than the header, put the rest in the buffer.
+ 	ctrl->recv_buf_size = received_size - header_size;
++	if(ctrl->recv_buf_size > sizeof(ctrl->recv_buf))
++	{
++		// P5M: com o buf de 1024 a sobra pode passar do recv_buf (512).
++		CHIAKI_LOGE(session->log, "P5M: ctrl got %zu bytes after the header, more than the %zu it can keep",
++				(size_t)ctrl->recv_buf_size, sizeof(ctrl->recv_buf));
++		err = CHIAKI_ERR_BUF_TOO_SMALL;
++		goto error;
++	}
+ 	if(ctrl->recv_buf_size > 0)
+ 		memcpy(ctrl->recv_buf, buf + header_size, ctrl->recv_buf_size);
+ 
+diff --git a/lib/src/launchspec.c b/lib/src/launchspec.c
+--- a/lib/src/launchspec.c
++++ b/lib/src/launchspec.c
+@@ -4,6 +4,8 @@
+ #include <chiaki/session.h>
+ #include <chiaki/base64.h>
+ 
++#include "p5m_sonda.h"
++
+ #include <stdio.h>
+ 
+ static const char launchspec_fmt[] =
+@@ -85,8 +87,17 @@
+ 	else
+ 		extras[0] = extras[1] = extras[2] = "";
+ 
++	// P5M: o app oficial (9.5.0) tem tres valores para maxFps: 30, 60 e 999,
++	// este ultimo o "sem teto" que ele pede quando o quadro e variavel. A
++	// sonda pede o mesmo, para ver se o PS5 passa de 60 num jogo de 120 Hz.
++	// O decodificador e o resto do chiaki continuam com o max_fps do perfil.
++	unsigned int max_fps = launch_spec->max_fps;
++	int sonda_fps = p5m_sonda("p5m_probe_max_fps");
++	if(sonda_fps > 0)
++		max_fps = (unsigned int)sonda_fps;
++
+ 	int written = snprintf(buf, buf_size, launchspec_fmt,
+-			launch_spec->width, launch_spec->height, launch_spec->max_fps,
++			launch_spec->width, launch_spec->height, max_fps,
+ 			launch_spec->bw_kbps_sent, launch_spec->mtu, launch_spec->rtt,
+ 			extras[0], extras[1], extras[2], handshake_key_b64);
+ 	if(written < 0 || written >= buf_size)
+diff --git a/lib/src/streamconnection.c b/lib/src/streamconnection.c
+--- a/lib/src/streamconnection.c
++++ b/lib/src/streamconnection.c
+@@ -1109,6 +1109,15 @@
+ 	launch_spec_json_size += 1; // we also want the trailing 0
+ 
+ 	CHIAKI_LOGV(stream_connection->log, "LaunchSpec: %s", launch_spec_buf.json);
++	{
++		// P5M: o que foi pedido ao console vai ao diario, para uma sonda de
++		// launchSpec ser conferida pela linha e nao pela suposicao. Corta antes
++		// do handshakeKey, que e segredo da sessao; o resto e constante ou vem
++		// do perfil.
++		const char *chave = strstr(launch_spec_buf.json, "\"handshakeKey\"");
++		int visivel = chave ? (int)(chave - launch_spec_buf.json) : launch_spec_json_size - 1;
++		CHIAKI_LOGE(stream_connection->log, "P5M: launchSpec sent: %.*s", visivel, launch_spec_buf.json);
++	}
+ 
+ 	uint8_t launch_spec_json_enc[LAUNCH_SPEC_JSON_BUF_SIZE];
+ 	memset(launch_spec_json_enc, 0, (size_t)launch_spec_json_size);
+diff --git a/lib/src/p5m_sonda.h b/lib/src/p5m_sonda.h
+new file mode 100644
+--- /dev/null
++++ b/lib/src/p5m_sonda.h
+@@ -0,0 +1,31 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++
++#ifndef P5M_SONDA_H
++#define P5M_SONDA_H
++
++/*
++ * P5M: sondas de protocolo escolhidas no Diagnostico (dev.242).
++ *
++ * Quem guarda a escolha e a libp5m-vr.so, que nao e ligada a libchiaki -- o
++ * chiaki nao conhece o projeto de fora (mesmo arranjo do gancho de audio do
++ * patch 0005). O simbolo e procurado em tempo de execucao; sem ele, ou fora
++ * do Android, a sonda vale 0 e o protocolo segue exatamente como o do chiaki.
++ */
++#ifdef __ANDROID__
++#include <dlfcn.h>
++
++static inline int p5m_sonda(const char *nome)
++{
++	void *lib = dlopen("libp5m-vr.so", RTLD_NOW | RTLD_NOLOAD);
++	if(!lib)
++		return 0;
++	int (*fn)(void) = (int (*)(void))dlsym(lib, nome);
++	int valor = fn ? fn() : 0;
++	dlclose(lib);
++	return valor;
++}
++#else
++static inline int p5m_sonda(const char *nome) { (void)nome; return 0; }
++#endif
++
++#endif // P5M_SONDA_H

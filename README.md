@@ -70,6 +70,11 @@ Other things it does:
   MQSR doesn't apply.
 - Fake 3D. The app guesses depth from the flat picture and builds a second eye
   out of it. It's a guess and you can tell, but the sense of depth is real.
+- The DualSense behaves like it does on the PS5: adaptive triggers, the
+  lightbar colour the game picks, your player LEDs, and the trigger and
+  vibration intensity you chose in the PS5 settings. Triggers turn off and on
+  mid-game from the settings panel (R3). Immersive mode only for now, and new
+  enough that it hasn't been tested with many games yet.
 - Remote Play over PSN, for when you're not home.
 - Diagnostics you can read inside the headset, because your Quest is never
   sitting next to your PC when something breaks.
@@ -120,15 +125,12 @@ Writing this out because a beta that hides it wastes your time:
   and the compositor starts dropping frames on a long session.
 - **Frame pacing wobbles.** Most ten second windows deliver 590-something of
   600 frames on time. Some drop to half that, in bursts. I don't know why yet.
-- **You can't type the PIN in immersive mode.** If your console asks for a
-  login PIN, register it once from the 2D panel first.
 - **Quest Touch controllers do nothing.** You need a real gamepad.
 - **The touchpad click is only tested on the DualSense.** The driver hands the
   touchpad over as a separate mouse device rather than a gamepad button, and
   that is where the app now listens. Other pads may route it somewhere else. If
   your game won't open its map, the settings panel has the click on the PS
   button, and the log will say how your controller sends it.
-- **Bitrate is stuck at 25 Mbps.** No setting for it yet.
 - **Haptic rumble mode buzzes** at moments the game never asked for. Classic
   mode is the default and it's the better one right now.
 

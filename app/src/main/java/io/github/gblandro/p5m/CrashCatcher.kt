@@ -27,6 +27,7 @@ class P5MApp: Application()
 	override fun onCreate()
 	{
 		super.onCreate()
+		contexto = applicationContext
 		// Antes de startTraceCapture, e antes de qualquer linha escrita nesta
 		// execucao: quem zera o diario tem de fazer isso com o diario ainda
 		// parado, senao apaga o comeco da propria sessao que esta abrindo.
@@ -35,8 +36,15 @@ class P5MApp: Application()
 		PilhaNativa.instalar(this)
 		DisplayMode.watchStreamActivities(this)
 		Trace.rotateOnNewVersion(this)
+		Trace.iniciarDetalhe(this)
 		registrarMortesAnteriores(this)
 		startTraceCapture()
+		LogServer.iniciarAoVivo(this)
+		// Nominal, como a do Bluetooth: ver DualSenseHid.ISENCOES.
+		try { org.lsposed.hiddenapibypass.HiddenApiBypass.addHiddenApiExemptions(*DualSenseHid.ISENCOES) }
+		catch(e: Throwable) { Trace.log(this, "Hidden API exemptions failed at start: ${e.javaClass.simpleName}") }
+		// Depois das isencoes: a ponte HID que ele abre precisa delas.
+		EnlaceAtivo.instalar(this)
 		// Antes de qualquer coisa que fale HTTPS pelo curl. O libcurl que vai
 		// dentro deste APK nasce sem nenhuma raiz em que confiar, e sem isto
 		// toda chamada da libchiaki à PSN é recusada no aperto de mão. Fica no
@@ -60,6 +68,9 @@ class P5MApp: Application()
 			{
 				Log.e("P5MVR", "Failed to write the crash", e)
 			}
+			// O diario grava numa fila; o que explica a queda sao justamente as
+			// ultimas linhas, e o processo morre logo abaixo.
+			Trace.flush()
 			// Encadeia no handler original: o processo ainda precisa morrer
 			// como morreria normalmente.
 			previous?.uncaughtException(thread, error)
@@ -99,13 +110,40 @@ class P5MApp: Application()
 			override fun run()
 			{
 				Trace.captureNativeLines(this@P5MApp)
-				handler.postDelayed(this, TRACE_INTERVAL_MS)
+				// Com alguem seguindo o diario ao vivo, as linhas do chiaki
+				// chegam em 2 s em vez de 10: e o atraso que importa a quem le.
+				handler.postDelayed(this, if(LogServer.seguindo()) 2_000L else TRACE_INTERVAL_MS)
 			}
 		}
 
+		// Controle do menu nas telas 2D, e o aviso de volta do stream que faz o
+		// menu pedir o foco de volta (FocoDoRetorno, dev.219).
 		registerActivityLifecycleCallbacks(object: Application.ActivityLifecycleCallbacks
 		{
 			private var visible = 0
+			// true enquanto a ultima activity de stream vista ainda nao foi
+			// sucedida por uma activity 2D: a proxima que resumir e uma volta.
+			//
+			// Guardado tambem em disco. Quando o encerramento do stream trava,
+			// o sistema mata o processo e o reabre (dev.224), e o processo novo
+			// nao sabia que vinha de um stream: o menu ficava sem o foco e sem
+			// o DualSense. Quem abre com a marca ainda de pe trata a primeira
+			// tela 2D como volta.
+			private val marca = getSharedPreferences("p5m-stream", MODE_PRIVATE)
+			private var streamActive = marca.getBoolean(KEY_EM_CURSO, false).also {
+				if(it) Trace.log(this@P5MApp, "Menu focus: the previous process ended during a stream; " +
+						"the first menu screen counts as a return")
+			}
+
+			private fun marcarStream(emCurso: Boolean)
+			{
+				if(marca.getBoolean(KEY_EM_CURSO, false) != emCurso)
+					marca.edit().putBoolean(KEY_EM_CURSO, emCurso).apply()
+			}
+
+			private fun isStreamActivity(activity: Activity) =
+				activity is com.metallic.chiaki.stream.StreamActivity ||
+				activity is com.metallic.chiaki.stream.VrStreamActivity
 
 			override fun onActivityStarted(activity: Activity)
 			{
@@ -128,19 +166,65 @@ class P5MApp: Application()
 				}
 			}
 
-			override fun onActivityCreated(activity: Activity, state: Bundle?) = Unit
-			override fun onActivityResumed(activity: Activity) = Unit
+			override fun onActivityCreated(activity: Activity, state: Bundle?)
+			{
+				// Um listener de foco de janela
+				// que nao depende do Window.Callback estar instalado, preso
+				// ao decorView desta instancia de activity (uma vez so, nao
+				// duplica entre resumes). Cobre o caso de a janela ganhar
+				// foco antes de onActivityPostResumed rodar, ou depois de um
+				// retorno do stream em que ele nao roda de novo.
+				if(!isStreamActivity(activity))
+					activity.window?.decorView?.viewTreeObserver
+						?.addOnWindowFocusChangeListener { hasFocus ->
+							if(hasFocus) MenuController.ensureInstalledAndFocus(activity)
+						}
+			}
+
+			override fun onActivityResumed(activity: Activity)
+			{
+				if(isStreamActivity(activity)) { streamActive = true; marcarStream(true); return }
+				if(streamActive)
+				{
+					streamActive = false
+					marcarStream(false)
+					MenuController.noteStreamReturn(activity)
+				}
+			}
+
 			// AppCompat pode substituir o callback durante o resume. API 29+
 			// oferece este ponto depois que a activity concluiu a retomada.
 			override fun onActivityPostResumed(activity: Activity) = MenuController.attach(activity)
-			override fun onActivityPaused(activity: Activity) = MenuController.detach(activity)
+
+			override fun onActivityPaused(activity: Activity)
+			{
+				if(isStreamActivity(activity))
+					streamActive = true
+				MenuController.detach(activity)
+			}
+
 			override fun onActivitySaveInstanceState(activity: Activity, out: Bundle) = Unit
-			override fun onActivityDestroyed(activity: Activity) = Unit
+
+			override fun onActivityDestroyed(activity: Activity)
+			{
+				// Cobre a activity de stream que morre sem passar por
+				// onPause antes (destruicao direta).
+				if(isStreamActivity(activity)) streamActive = true
+			}
 		})
 	}
 
 	companion object
 	{
+		/**
+		 * O contexto do processo, para quem nasce sem um. E o `Rumble` do modo
+		 * janela, construido dentro do chiaki por patch: passar o contexto ate
+		 * la exigiria regerar o patch, e ele so precisa disto para abrir a
+		 * ponte HID de um controle que nao expoe motor ao Android.
+		 */
+		@Volatile var contexto: Context? = null
+			private set
+
 		/**
 		 * Escreve no diário por que os processos anteriores morreram.
 		 *
@@ -222,6 +306,7 @@ class P5MApp: Application()
 		}
 
 		private const val TRACE_INTERVAL_MS = 10_000L
+		private const val KEY_EM_CURSO = "stream-in-progress"
 		private const val FILE_NAME = "ultimo_crash.txt"
 		private const val FILE_ANTERIOR = "ultimo_crash_anterior.txt"
 

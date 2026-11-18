@@ -9,12 +9,12 @@ import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.View
-import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -51,6 +51,15 @@ import kotlin.math.sqrt
  * zero", um controle que trava e para de reportar sairia daqui com zona morta
  * mínima e um veredito de aprovação. Por isso silêncio total é resposta
  * separada: mantém o valor que já havia e diz que não leu nada.
+ *
+ * ## A volta ao centro (dev.226)
+ *
+ * O tremor parado não basta: o analógico não volta sempre ao mesmo ponto
+ * quando é solto, e a diferença entre uma soltura e outra passava da zona
+ * morta -- o boneco seguia andando. Por isso a medição tem uma segunda fase:
+ * empurrar os analógicos até a borda e soltar, várias vezes. Cada ponto onde o
+ * analógico assenta vira um repouso; o centro é a média deles e a zona morta
+ * cobre o mais distante.
  */
 class StickCalibrationActivity: Activity()
 {
@@ -81,7 +90,7 @@ class StickCalibrationActivity: Activity()
 	private lateinit var desenho: Mira
 	private lateinit var leitura: TextView
 	private lateinit var veredito: TextView
-	private lateinit var botaoMedir: Button
+	private lateinit var botaoMedir: TextView
 	private lateinit var rotuloEsq: TextView
 	private lateinit var rotuloDir: TextView
 
@@ -96,6 +105,58 @@ class StickCalibrationActivity: Activity()
 	private var ry = Float.NaN
 
 	private var medindo = false
+
+	/**
+	 * Os pontos onde um analógico assentou depois de solto, na segunda fase.
+	 *
+	 * Assentar é ficar abaixo de [ASSENTADO] por [ASSENTAR_MS] depois de ter
+	 * passado de [EMPURRADO]. O tempo é contado pelo tique, e não por evento:
+	 * um analógico parado não manda evento nenhum, e esperar o próximo para
+	 * decidir que ele parou seria esperar para sempre.
+	 */
+	private class Solturas
+	{
+		var empurrado = false
+		var assentandoDesde = 0L
+		var ultimoX = 0f
+		var ultimoY = 0f
+		val pontos = ArrayList<Pair<Float, Float>>()
+
+		fun amostra(x: Float, y: Float, agora: Long)
+		{
+			ultimoX = x
+			ultimoY = y
+			val m = sqrt(x * x + y * y)
+			when
+			{
+				m > EMPURRADO -> { empurrado = true; assentandoDesde = 0L }
+				m >= ASSENTADO -> assentandoDesde = 0L
+				empurrado && assentandoDesde == 0L -> assentandoDesde = agora
+			}
+		}
+
+		fun tique(agora: Long)
+		{
+			if(assentandoDesde != 0L && agora - assentandoDesde >= ASSENTAR_MS)
+			{
+				pontos.add(ultimoX to ultimoY)
+				empurrado = false
+				assentandoDesde = 0L
+			}
+		}
+	}
+
+	private var soltando = false
+	private var solturasEsq = Solturas()
+	private var solturasDir = Solturas()
+
+	override fun onDestroy()
+	{
+		super.onDestroy()
+		// O tique da medicao se reagenda sozinho; sair no meio dela o deixava
+		// rodando sobre views soltas ate o prazo acabar.
+		ui.removeCallbacksAndMessages(null)
+	}
 	private var esq = Amostras()
 	private var dir = Amostras()
 	private var fimEm = 0L
@@ -104,28 +165,22 @@ class StickCalibrationActivity: Activity()
 	{
 		super.onCreate(savedInstanceState)
 
+		// O visual de todas as telas, em Estilo (dev.213).
 		val root = LinearLayout(this).apply {
 			orientation = LinearLayout.VERTICAL
-			gravity = Gravity.CENTER_HORIZONTAL
-			setBackgroundColor(Color.parseColor("#101014"))
-			setPadding(64, 48, 64, 48)
+			setPadding(dp(24), dp(20), dp(24), dp(16))
 		}
 
-		root.addView(TextView(this).apply {
-			text = "Stick calibration"
-			setTextColor(Color.WHITE)
-			setTextSize(TypedValue.COMPLEX_UNIT_SP, 28f)
-			gravity = Gravity.CENTER
-			setTypeface(typeface, Typeface.BOLD)
-		})
+		root.addView(Estilo.marca(this, "Stick calibration", 26f).apply { setPadding(0, 0, 0, dp(12)) })
 
 		root.addView(hint("The right deadzone depends on your controller, not on "
-				+ "taste. Put the controller down, press Measure, and do not touch "
-				+ "the sticks until it finishes."))
+				+ "taste. Press Measure. First keep your hands off the sticks; then "
+				+ "push each stick to the edge in different directions and let go, "
+				+ "again and again, until it finishes."))
 
 		desenho = Mira(this)
 		root.addView(desenho, LinearLayout.LayoutParams(
-			LinearLayout.LayoutParams.MATCH_PARENT, 420))
+			LinearLayout.LayoutParams.MATCH_PARENT, dp(220)))
 
 		val linhaRotulos = LinearLayout(this).apply {
 			orientation = LinearLayout.HORIZONTAL
@@ -137,23 +192,23 @@ class StickCalibrationActivity: Activity()
 		root.addView(linhaRotulos)
 
 		leitura = TextView(this).apply {
-			setTextColor(Color.parseColor("#9aa0a6"))
+			setTextColor(Estilo.SECUNDARIO)
 			setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
 			gravity = Gravity.CENTER
 			typeface = Typeface.MONOSPACE
-			setPadding(0, 16, 0, 8)
+			setPadding(0, dp(8), 0, dp(4))
 		}
 		root.addView(leitura)
 
 		veredito = TextView(this).apply {
-			setTextColor(Color.parseColor("#9aa0a6"))
+			setTextColor(Estilo.SECUNDARIO)
 			setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
 			gravity = Gravity.CENTER
-			setPadding(0, 8, 0, 16)
+			setPadding(0, dp(4), 0, dp(8))
 		}
 		root.addView(veredito)
 
-		botaoMedir = bigButton("Measure (${MEDICAO_MS / 1000} s)") { comecarMedicao() }
+		botaoMedir = bigButton("Measure (${(MEDICAO_MS + SOLTURAS_MS) / 1000} s)") { comecarMedicao() }
 		root.addView(botaoMedir)
 
 		// Ajuste na mão por cima da medição: um analógico que treme só de vez
@@ -176,9 +231,11 @@ class StickCalibrationActivity: Activity()
 			desenho.invalidate()
 		})
 
-		root.addView(bigButton("Back") { finish() })
+		// Sem botao "Back": Circle volta, como em todas as outras telas.
+		root.addView(Estilo.ajudaDoControle(this))
 
 		setContentView(ScrollView(this).apply {
+			background = Estilo.fundoDaTela()
 			addView(root, LinearLayout.LayoutParams(
 				LinearLayout.LayoutParams.MATCH_PARENT,
 				LinearLayout.LayoutParams.WRAP_CONTENT))
@@ -234,6 +291,12 @@ class StickCalibrationActivity: Activity()
 			esq.add(x, y)
 			dir.add(z, rz)
 		}
+		if(soltando)
+		{
+			val agora = SystemClock.uptimeMillis()
+			solturasEsq.amostra(x, y, agora)
+			solturasDir.amostra(z, rz, agora)
+		}
 	}
 
 	// ---------------------------------------------------------- a medicao
@@ -243,6 +306,8 @@ class StickCalibrationActivity: Activity()
 		medindo = true
 		esq = Amostras()
 		dir = Amostras()
+		solturasEsq = Solturas()
+		solturasDir = Solturas()
 		fimEm = System.currentTimeMillis() + MEDICAO_MS
 		botaoMedir.isEnabled = false
 		veredito.text = ""
@@ -252,23 +317,41 @@ class StickCalibrationActivity: Activity()
 	private fun tique()
 	{
 		val faltam = fimEm - System.currentTimeMillis()
+		if(soltando)
+		{
+			val agora = SystemClock.uptimeMillis()
+			solturasEsq.tique(agora)
+			solturasDir.tique(agora)
+		}
 		if(faltam <= 0)
 		{
+			if(medindo)
+			{
+				// Primeira fase feita: agora as solturas.
+				medindo = false
+				soltando = true
+				fimEm = System.currentTimeMillis() + SOLTURAS_MS
+				ui.postDelayed({ tique() }, 100)
+				return
+			}
 			terminarMedicao()
 			return
 		}
-		botaoMedir.text = "Measuring… ${(faltam / 1000) + 1} s — hands off"
-		ui.postDelayed({ tique() }, 200)
+		botaoMedir.text = if(medindo) "Measuring… ${(faltam / 1000) + 1} s — hands off"
+			else "Push each stick to the edge and let go, again and again… " +
+					"${(faltam / 1000) + 1} s  (L ${solturasEsq.pontos.size}, R ${solturasDir.pontos.size})"
+		ui.postDelayed({ tique() }, 100)
 	}
 
 	private fun terminarMedicao()
 	{
 		medindo = false
+		soltando = false
 		botaoMedir.isEnabled = true
-		botaoMedir.text = "Measure (${MEDICAO_MS / 1000} s)"
+		botaoMedir.text = "Measure (${(MEDICAO_MS + SOLTURAS_MS) / 1000} s)"
 
-		val recadoEsq = concluir("Left", esq) { prefs.left = it }
-		val recadoDir = concluir("Right", dir) { prefs.right = it }
+		val recadoEsq = concluir("Left", esq, solturasEsq) { prefs.left = it }
+		val recadoDir = concluir("Right", dir, solturasDir) { prefs.right = it }
 		veredito.text = "$recadoEsq\n$recadoDir"
 		atualizarRotulos()
 		desenho.invalidate()
@@ -288,28 +371,36 @@ class StickCalibrationActivity: Activity()
 	 *   isso deixaria o controle sem metade do curso, e a causa ficaria
 	 *   escondida numa tela que ninguém abre duas vezes.
 	 */
-	private fun concluir(lado: String, a: Amostras, gravar: (StickPrefs.Calibragem) -> Unit): String
+	private fun concluir(lado: String, a: Amostras, s: Solturas,
+			gravar: (StickPrefs.Calibragem) -> Unit): String
 	{
 		if(a.n == 0)
 			return "$lado: no reading — the stick sent nothing. Either it is "
 					.plus("perfectly still, or it stopped reporting. Kept as it was.")
 
-		val cx = a.somaX / a.n
-		val cy = a.somaY / a.n
+		val parado = a.somaX / a.n to a.somaY / a.n
 		var pior = 0f
 		for(i in a.xs.indices)
 		{
-			val dx = a.xs[i] - cx
-			val dy = a.ys[i] - cy
+			val dx = a.xs[i] - parado.first
+			val dy = a.ys[i] - parado.second
 			val d = sqrt(dx * dx + dy * dy)
 			if(d > pior)
 				pior = d
 		}
 
-		// Folga sobre o pior visto: cinco segundos não são a vida inteira do
-		// controle, e uma zona morta que passa raspando pelo tremor medido
-		// falha no primeiro tremor um pouco maior.
-		val zona = (pior * FOLGA + MARGEM).coerceAtLeast(MINIMA)
+		// O centro é a média de todos os repousos: o da fase parada e cada
+		// ponto onde o analógico assentou depois de solto.
+		val repousos = s.pontos + parado
+		val cx = repousos.sumOf { it.first.toDouble() }.toFloat() / repousos.size
+		val cy = repousos.sumOf { it.second.toDouble() }.toFloat() / repousos.size
+		val espalhamento = repousos.maxOf { sqrt((it.first - cx) * (it.first - cx) +
+				(it.second - cy) * (it.second - cy)) }
+
+		// Folga sobre o pior visto: alguns segundos não são a vida inteira do
+		// controle, e uma zona morta que passa raspando pelo medido falha no
+		// primeiro tremor ou na primeira soltura um pouco maior.
+		val zona = (maxOf(pior, espalhamento) * FOLGA + MARGEM).coerceAtLeast(StickPrefs.MIN_DEADZONE)
 
 		if(abs(cx) > StickPrefs.MAX_CENTER || abs(cy) > StickPrefs.MAX_CENTER ||
 				zona > StickPrefs.MAX_DEADZONE)
@@ -320,16 +411,19 @@ class StickCalibrationActivity: Activity()
 		gravar(StickPrefs.Calibragem(cx, cy, zona))
 		val desvio = sqrt(cx * cx + cy * cy)
 		Trace.log(this, "Stick calibration $lado: rest ${pct(desvio)}, "
-				+ "jitter ${pct(pior)}, deadzone ${pct(zona)} (${a.n} samples)")
-		return "$lado: rest ${pct(desvio)} off center, jitter ${pct(pior)} → "
-				.plus("deadzone ${pct(zona)}  (${a.n} samples)")
+				+ "jitter ${pct(pior)}, return spread ${pct(espalhamento)} over ${s.pontos.size} "
+				+ "release(s), deadzone ${pct(zona)} (${a.n} samples)")
+		val poucas = if(s.pontos.size < 3) "\n  Only ${s.pontos.size} release(s) seen; " +
+				"measure again, pushing and letting go more times." else ""
+		return "$lado: rest ${pct(desvio)} off center, jitter ${pct(pior)}, returns within "
+				.plus("${pct(espalhamento)} → deadzone ${pct(zona)}$poucas")
 	}
 
 	private fun ajustar(esquerdo: Boolean, delta: Float)
 	{
 		val atual = if(esquerdo) prefs.left else prefs.right
 		val novo = atual.copy(
-			deadzone = (atual.deadzone + delta).coerceIn(0f, StickPrefs.MAX_DEADZONE))
+			deadzone = (atual.deadzone + delta).coerceIn(StickPrefs.MIN_DEADZONE, StickPrefs.MAX_DEADZONE))
 		if(esquerdo) prefs.left = novo else prefs.right = novo
 		veredito.text = "${if(esquerdo) "Left" else "Right"} deadzone set by hand to "
 				.plus(pct(novo.deadzone))
@@ -369,26 +463,28 @@ class StickCalibrationActivity: Activity()
 	 */
 	private inner class Mira(context: android.content.Context): View(context)
 	{
+		// Cores da mesma paleta do lancador: cartao para o fundo do aro,
+		// pressionado para a borda, destaque para a zona morta.
 		private val fundo = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-			color = Color.parseColor("#1a1a22")
+			color = Color.argb(34, 255, 255, 255)
 		}
 		private val borda = Paint(Paint.ANTI_ALIAS_FLAG).apply {
 			style = Paint.Style.STROKE
 			strokeWidth = 2f
-			color = Color.parseColor("#3a3a46")
+			color = Color.argb(80, 255, 255, 255)
 		}
 		private val anel = Paint(Paint.ANTI_ALIAS_FLAG).apply {
 			style = Paint.Style.STROKE
 			strokeWidth = 4f
-			color = Color.parseColor("#e5a33d")
+			color = Estilo.DESTAQUE
 		}
 		private val centro = Paint(Paint.ANTI_ALIAS_FLAG).apply {
 			style = Paint.Style.STROKE
 			strokeWidth = 3f
-			color = Color.parseColor("#5c8ce0")
+			color = Estilo.AZUL_CLARO
 		}
 		private val ponto = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-			color = Color.parseColor("#e8eaed")
+			color = Estilo.TEXTO
 		}
 
 		override fun onDraw(canvas: Canvas)
@@ -435,42 +531,48 @@ class StickCalibrationActivity: Activity()
 	private fun pct(v: Float) = "%.1f%%".format(java.util.Locale.US, v * 100f)
 
 	private fun colunaTexto() = TextView(this).apply {
-		setTextColor(Color.parseColor("#9aa0a6"))
-		setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+		setTextColor(Estilo.SECUNDARIO)
+		setTextSize(TypedValue.COMPLEX_UNIT_SP, Estilo.TAM_APOIO)
 		gravity = Gravity.CENTER
 		layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT)
 			.apply { weight = 1f }
 	}
 
-	private fun hint(texto: String) = TextView(this).apply {
-		text = texto
-		setTextColor(Color.parseColor("#9aa0a6"))
-		setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-		gravity = Gravity.CENTER
-		setPadding(0, 8, 0, 16)
+	private fun hint(texto: String) = Estilo.apoio(this, texto).apply {
+		setPadding(dp(4), dp(4), dp(4), dp(10))
 	}
 
-	private fun bigButton(label: String, onClick: () -> Unit) = Button(this).apply {
-		text = label
-		setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
-		setOnClickListener { onClick() }
+	/** Cartao de linha inteira, o mesmo de todas as telas. */
+	private fun bigButton(label: String, onClick: () -> Unit) = Estilo.botao(this, label, onClick).apply {
+		gravity = Gravity.CENTER
 		layoutParams = LinearLayout.LayoutParams(
 			LinearLayout.LayoutParams.MATCH_PARENT,
 			LinearLayout.LayoutParams.WRAP_CONTENT
-		).apply { setMargins(0, 12, 0, 12) }
+		).apply { setMargins(0, dp(6), 0, dp(6)) }
 	}
 
-	private fun smallButton(label: String, onClick: () -> Unit) = Button(this).apply {
-		text = label
-		setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
-		setOnClickListener { onClick() }
+	/** Cartao menor, para os quatro ajustes finos numa fileira. */
+	private fun smallButton(label: String, onClick: () -> Unit) = Estilo.botao(this, label, onClick).apply {
+		gravity = Gravity.CENTER
 		layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT)
-			.apply { weight = 1f }
+			.apply { weight = 1f; marginStart = dp(4); marginEnd = dp(4) }
 	}
+
+	private fun dp(valor: Int): Int = Estilo.dp(this, valor)
 
 	private companion object
 	{
 		const val MEDICAO_MS = 5_000L
+
+		/** Segunda fase: empurrar e soltar, várias vezes. */
+		const val SOLTURAS_MS = 10_000L
+
+		// Empurrado é passar da metade do curso; assentado é ficar abaixo de
+		// um quarto dele por 300 ms. O quarto é generoso de propósito: o
+		// repouso de um controle gasto passa de 20%, e ele tem de contar.
+		const val EMPURRADO = 0.5f
+		const val ASSENTADO = 0.25f
+		const val ASSENTAR_MS = 300L
 
 		/** Um passo do ajuste manual: 1% do curso. */
 		const val PASSO = 0.01f
@@ -482,8 +584,5 @@ class StickCalibrationActivity: Activity()
 		const val FOLGA = 1.3f
 		const val MARGEM = 0.01f
 
-		// Piso: abaixo disto a zona morta não paga o custo de existir, e
-		// qualquer ruído de quantização do driver passaria direto.
-		const val MINIMA = 0.02f
 	}
 }

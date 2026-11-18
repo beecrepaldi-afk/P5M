@@ -1,0 +1,34 @@
+diff --git a/android/app/src/main/cpp/video-decoder.c b/android/app/src/main/cpp/video-decoder.c
+index 65c6f1d..e636e0a 100644
+--- a/android/app/src/main/cpp/video-decoder.c
++++ b/android/app/src/main/cpp/video-decoder.c
+@@ -684,6 +684,29 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
+ 			// set_render_to_surface, que nenhuma escrita na Surface esta em
+ 			// curso. Sem isso a afirmacao seria sobre o futuro e nao sobre o
+ 			// presente, e o encerramento da sessao OpenXR precisa do presente.
++			// P5M (patch 0057): um quadro por passada da tela.
++			//
++			// A Surface do caminho com shader descarta o quadro da fila quando
++			// chega outro antes de a tela pegar o primeiro. Em jogo pesado a
++			// rede entrega quadros em rajada e so ~46 dos 60 por segundo
++			// chegavam a tela. Aqui a entrega espera (no maximo uma passada) a
++			// tela pegar o anterior; quem decide e a camada de video, que sabe
++			// o que ja foi pego. Fora do mutex: a espera nao segura o
++			// encerramento.
++			if(info.size != 0)
++			{
++				static void (*esperar_tela)(uint64_t) = NULL;
++				static bool procurado_espera = false;
++				if(!procurado_espera)
++				{
++					procurado_espera = true;
++					void *p5m = dlopen("libp5m-vr.so", RTLD_NOW);
++					if(p5m)
++						esperar_tela = (void (*)(uint64_t))dlsym(p5m, "p5m_video_wait_for_display");
++				}
++				if(esperar_tela)
++					esperar_tela((uint64_t)info.presentationTimeUs);
++			}
+ 			chiaki_mutex_lock(&decoder->render_mutex);
+ 			bool render = info.size != 0 && decoder->render_to_surface;
+ 			AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, render);

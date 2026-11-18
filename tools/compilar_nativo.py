@@ -99,6 +99,10 @@ def stubs_android():
     for m in chamados:
         if m.startswith("GetStringUTFChars"):
             metodos.append(f"\ttemplate<class...A> const char *{m}(A...) {{ return nullptr; }}")
+        elif m == "GetDirectBufferAddress":
+            metodos.append(f"\ttemplate<class...A> void *{m}(A...) {{ return nullptr; }}")
+        elif m == "GetDirectBufferCapacity":
+            metodos.append(f"\ttemplate<class...A> jlong {m}(A...) {{ return 0; }}")
         elif m.startswith(devolve_ponteiro) and not m.startswith(("GetArrayLength", "GetEnv")):
             metodos.append(f"\ttemplate<class...A> jobject {m}(A...) {{ return nullptr; }}")
         else:
@@ -116,6 +120,11 @@ def stubs_android():
 #include <signal.h>
 #undef SIGSTKSZ
 #define SIGSTKSZ 32768
+#ifdef __APPLE__
+// O macOS nao tem gettid (o bionic e a glibc tem). So a declaracao, para a
+// checagem de sintaxe no Mac nao acusar um erro que a build nao teria.
+extern "C" int gettid(void);
+#endif
 #ifdef _WIN32
 // Declaracoes POSIX usadas pelo Android e ausentes no CRT do Windows.
 // So verificam tipos e sintaxe: nao representam o layout/ABI do bionic.
@@ -202,6 +211,10 @@ template<class...A> inline int AndroidBitmap_unlockPixels(A...) { return 0; }
     for m in chamados:
         if m.startswith("GetStringUTFChars"):
             metodos.append(f"\ttemplate<class...A> const char *{m}(A...) {{ return nullptr; }}")
+        elif m == "GetDirectBufferAddress":
+            metodos.append(f"\ttemplate<class...A> void *{m}(A...) {{ return nullptr; }}")
+        elif m == "GetDirectBufferCapacity":
+            metodos.append(f"\ttemplate<class...A> jlong {m}(A...) {{ return 0; }}")
         elif m.startswith(devolve_ponteiro) and not m.startswith(("GetArrayLength", "GetEnv")):
             metodos.append(f"\ttemplate<class...A> jobject {m}(A...) {{ return nullptr; }}")
         else:

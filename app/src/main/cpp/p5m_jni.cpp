@@ -4,6 +4,8 @@
 #include <jni.h>
 #include <android/bitmap.h>
 #include <android/surface_texture_jni.h>
+#include <atomic>
+#include "profundidade_neural.h"
 #include "spatializer.h"
 #include "tone_mapper.h"
 #include "xr_session.h"
@@ -57,6 +59,11 @@ JNIEXPORT jstring JNICALL JNI_FCN(nativeLastError)(JNIEnv *env, jobject, jlong p
 	if(!ptr)
 		return env->NewStringUTF("");
 	return env->NewStringUTF(Handle(ptr)->LastError());
+}
+
+JNIEXPORT jboolean JNICALL JNI_FCN(nativeSessionEnded)(JNIEnv *, jobject, jlong ptr)
+{
+	return ptr && Handle(ptr)->SessionEnded() ? JNI_TRUE : JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL JNI_FCN(nativeStart)(JNIEnv *, jobject, jlong ptr)
@@ -152,6 +159,11 @@ JNIEXPORT void JNICALL JNI_FCN(nativeSetWideColor)(JNIEnv *, jobject, jlong ptr,
 		Handle(ptr)->SetWideColor(wide == JNI_TRUE);
 }
 
+JNIEXPORT void JNICALL JNI_FCN(nativeSetBenchTruth)(JNIEnv *, jobject, jboolean enabled)
+{
+	p5m::DefinirVerdadeDoBanco(enabled == JNI_TRUE);
+}
+
 JNIEXPORT void JNICALL JNI_FCN(nativeSetVerticalFlip)(JNIEnv *, jobject, jlong ptr,
 		jboolean enabled)
 {
@@ -159,11 +171,11 @@ JNIEXPORT void JNICALL JNI_FCN(nativeSetVerticalFlip)(JNIEnv *, jobject, jlong p
 		Handle(ptr)->SetVerticalFlip(enabled == JNI_TRUE);
 }
 
-JNIEXPORT void JNICALL JNI_FCN(nativeSetStereoMode)(JNIEnv *, jobject, jlong ptr,
-		jint mode, jboolean synthetic)
+JNIEXPORT void JNICALL JNI_FCN(nativeSetSyntheticStereo)(JNIEnv *, jobject, jlong ptr,
+		jboolean on)
 {
 	if(ptr)
-		Handle(ptr)->SetStereoMode((int)mode, synthetic == JNI_TRUE);
+		Handle(ptr)->SetSyntheticStereo(on == JNI_TRUE);
 }
 
 JNIEXPORT void JNICALL JNI_FCN(nativeSetStereoTuning)(JNIEnv *, jobject, jlong ptr,
@@ -198,7 +210,7 @@ JNIEXPORT void JNICALL JNI_FCN(nativeSetHudBitmap)(JNIEnv *env, jobject, jlong p
 		return;
 	}
 	Handle(ptr)->SetHudBitmap(static_cast<const uint8_t *>(pixels), (int32_t)info.width,
-			(int32_t)info.height);
+			(int32_t)info.height, (int32_t)info.stride);
 	AndroidBitmap_unlockPixels(env, bitmap);
 }
 
@@ -209,12 +221,26 @@ JNIEXPORT void JNICALL JNI_FCN(nativeSetHudVisible)(JNIEnv *, jobject, jlong ptr
 		Handle(ptr)->SetHudVisible(visible == JNI_TRUE);
 }
 
+JNIEXPORT void JNICALL JNI_FCN(nativeSetStereoPopOut)(JNIEnv *, jobject, jlong ptr,
+		jboolean on)
+{
+	if(ptr)
+		Handle(ptr)->SetStereoPopOut(on == JNI_TRUE);
+}
+
+JNIEXPORT void JNICALL JNI_FCN(nativeSetHudBelowScreen)(JNIEnv *, jobject, jlong ptr,
+		jboolean below)
+{
+	if(ptr)
+		Handle(ptr)->SetHudBelowScreen(below == JNI_TRUE);
+}
+
 JNIEXPORT jfloat JNICALL JNI_FCN(nativeSelectDisplayRefreshRate)(JNIEnv *, jobject, jlong ptr,
-		jint sourceFps)
+		jint sourceFps, jint maxHz)
 {
 	if(!ptr)
 		return 0.0f;
-	return Handle(ptr)->SelectDisplayRefreshRate(sourceFps);
+	return Handle(ptr)->SelectDisplayRefreshRate(sourceFps, maxHz);
 }
 
 JNIEXPORT void JNICALL JNI_FCN(nativeSetPassthrough)(JNIEnv *, jobject, jlong ptr, jboolean enabled)
@@ -363,6 +389,84 @@ JNIEXPORT void JNICALL JNI_FCN(nativeDestroy)(JNIEnv *, jobject, jlong ptr)
 	auto *mapper = reinterpret_cast<p5m::ToneMapper *>(ptr);
 	mapper->Destroy();
 	delete mapper;
+}
+
+// --- Profundidade neural (ProfundidadeNeural.kt) ---
+//
+// A thread da rede chama estas quatro; a thread de quadros fala com o mesmo
+// objeto por dentro da ToneMapper. Os buffers sao os diretos que o LiteRT usa
+// como entrada e saida, entao a conversao escreve direto onde o modelo le.
+
+#undef JNI_FCN
+#define JNI_FCN(name) Java_io_github_gblandro_p5m_ProfundidadeNeural_##name
+
+JNIEXPORT void JNICALL JNI_FCN(nativeLigar)(JNIEnv *, jobject)
+{
+	p5m::ProfundidadeNeural::Instance().Ligar();
+}
+
+JNIEXPORT void JNICALL JNI_FCN(nativeDesligar)(JNIEnv *, jobject)
+{
+	p5m::ProfundidadeNeural::Instance().Desligar();
+}
+
+JNIEXPORT jboolean JNICALL JNI_FCN(nativeEsperarEntrada)(JNIEnv *env, jobject, jobject buffer)
+{
+	using p5m::ProfundidadeNeural;
+	const jlong precisa = (jlong)ProfundidadeNeural::kLargura * ProfundidadeNeural::kAltura * 3 * 4;
+	auto *destino = static_cast<float *>(env->GetDirectBufferAddress(buffer));
+	if(!destino || env->GetDirectBufferCapacity(buffer) < precisa)
+	{
+		LOGE("Neural depth: input buffer is not a direct %lld-byte buffer", (long long)precisa);
+		return JNI_FALSE;
+	}
+	return ProfundidadeNeural::Instance().EsperarEntrada(destino) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL JNI_FCN(nativePublicarSaida)(JNIEnv *env, jobject, jobject buffer,
+		jboolean ok)
+{
+	using p5m::ProfundidadeNeural;
+	const jlong precisa = (jlong)ProfundidadeNeural::kLargura * ProfundidadeNeural::kAltura * 4;
+	auto *origem = static_cast<const float *>(env->GetDirectBufferAddress(buffer));
+	const bool cabe = origem && env->GetDirectBufferCapacity(buffer) >= precisa;
+	ProfundidadeNeural::Instance().PublicarSaida(cabe ? origem : nullptr, cabe && ok == JNI_TRUE);
+}
+
+
+// Sondas de protocolo (dev.242). A libchiaki procura estes dois simbolos com
+// dlsym (lib/src/p5m_sonda.h, patch 0051) a cada sessao; atomicos porque quem
+// escreve e a thread do Kotlin e quem le e a do stream.
+static std::atomic<int> g_sonda_max_fps{0};
+static std::atomic<int> g_sonda_mais_info{0};
+static std::atomic<int> g_takion_v12{0};
+
+__attribute__((visibility("default"))) int p5m_probe_max_fps(void)
+{
+	return g_sonda_max_fps.load(std::memory_order_relaxed);
+}
+
+__attribute__((visibility("default"))) int p5m_probe_ctrl_more_info(void)
+{
+	return g_sonda_mais_info.load(std::memory_order_relaxed);
+}
+
+// Diferente das sondas, a Takion v20 vem ligada (como no Mac): o simbolo diz
+// quando ela foi desligada, para a ausencia da lib valer "ligada".
+__attribute__((visibility("default"))) int p5m_takion_v12(void)
+{
+	return g_takion_v12.load(std::memory_order_relaxed);
+}
+
+#undef JNI_FCN
+#define JNI_FCN(name) Java_io_github_gblandro_p5m_SondasDeProtocolo_##name
+
+JNIEXPORT void JNICALL JNI_FCN(nativeDefinir)(JNIEnv *, jobject, jint max_fps,
+		jboolean mais_info, jboolean takion_v20)
+{
+	g_sonda_max_fps.store(max_fps, std::memory_order_relaxed);
+	g_sonda_mais_info.store(mais_info == JNI_TRUE ? 1 : 0, std::memory_order_relaxed);
+	g_takion_v12.store(takion_v20 == JNI_TRUE ? 0 : 1, std::memory_order_relaxed);
 }
 
 } // extern "C"

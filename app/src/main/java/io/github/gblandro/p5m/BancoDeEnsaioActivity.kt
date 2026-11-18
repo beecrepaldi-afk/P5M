@@ -57,8 +57,25 @@ class BancoDeEnsaioActivity: Activity()
 
 		// Caminho direto e SDR: é o caminho que se quer medir. Com shader a
 		// medida incluiria uma passada de GPU nossa, que é outra pergunta.
-		bridge.setRenderPath(0, false)
-		val destino = bridge.createVideoSurface(LARGURA, ALTURA)
+		//
+		// Com `--ez framegen true` a pergunta é outra: o caminho com shader e a
+		// previsão de quadros, contra o cenário de 12 s cuja verdade (quadro
+		// real ou repetição) vai no pts e é conferida no nativo.
+		// `--ez cenario true` sozinho: o mesmo cenario no caminho com shader, sem
+		// previsao -- como o jogo fica com o framegen desligado.
+		val framegen = intent.getBooleanExtra("framegen", false)
+		val cenario = framegen || intent.getBooleanExtra("cenario", false)
+		if(cenario)
+			Trace.log(this, "Bench: 30 fps scenario (pan, still with noise, drops), frame generation " +
+					if(framegen) "on" else "off")
+		bridge.setRenderPath(if(cenario) 1 else 0, false)
+		val destino = if(cenario)
+		{
+			bridge.createVideoSurface(LARGURA, ALTURA)
+			bridge.createToneMappedSurface()
+		}
+		else
+			bridge.createVideoSurface(LARGURA, ALTURA)
 		if(destino == null)
 		{
 			desistir("The video swapchain could not be created.\n${bridge.lastError}")
@@ -71,9 +88,10 @@ class BancoDeEnsaioActivity: Activity()
 		bridge.setScreenParams(prefs.radius, prefs.centralAngle, 0f,
 				prefs.heightOffset, prefs.curvature)
 		val cinema = ScreenPrefs.CINEMA_GRADE[prefs.cinema]
-		bridge.setQuality(0, 0f, 1f, cinema[0], cinema[1], cinema[2], 1f, false)
+		bridge.setQuality(0, 0f, 1f, cinema[0], cinema[1], cinema[2], 1f, framegen)
+		bridge.setBenchTruth(cenario)
 		bridge.setPassthrough(prefs.passthroughEnabled && bridge.isPassthroughSupported)
-		bridge.selectDisplayRefreshRate(FPS)
+		bridge.selectDisplayRefreshRate(FPS, StreamQualityPrefs(this).panelMaxHz)
 
 		bridge.start()
 		bridge.recenter()
@@ -82,26 +100,35 @@ class BancoDeEnsaioActivity: Activity()
 		// Na thread principal isso seria um ANR; aqui a sessão OpenXR já está
 		// rodando, então o usuário vê o passthrough enquanto espera.
 		thread(name = "ensaio-preparo") {
-			val f = FonteSintetica(LARGURA, ALTURA, FPS)
+			val f = if(cenario) FonteSintetica(LARGURA, ALTURA, FPS, 12, cenario = true)
+				else FonteSintetica(LARGURA, ALTURA, FPS)
 			if(!f.preparar())
 			{
 				handler.post { desistir("Could not generate the source.\n${f.ultimoErro}") }
 				return@thread
 			}
 			Trace.log(this, "Bench loop: ${f.quadrosPreparados} frames")
-			if(!f.iniciar(destino))
-			{
-				handler.post { desistir("Could not play back the source.\n${f.ultimoErro}") }
-				return@thread
+			// Daqui em diante na thread principal, a mesma do onDestroy: quem
+			// saiu durante a preparação já derrubou a sessão e a Surface, e
+			// iniciar a fonte assim escreveria nela morta e deixaria um
+			// decodificador que ninguém mais para.
+			handler.post {
+				if(isDestroyed)
+					return@post
+				if(!f.iniciar(destino))
+				{
+					desistir("Could not play back the source.\n${f.ultimoErro}")
+					return@post
+				}
+				fonte = f
+				// A camada só pode ser submetida depois de a Surface ter
+				// conteúdo: antes disso o compositor recebe uma textura vazia.
+				// Mesma razão e mesma espera do caminho real.
+				handler.postDelayed({
+					xr?.setVideoLayerEnabled(true)
+					Trace.log(this, "Video layer released; measuring")
+				}, ATRASO_CAMADA_MS)
 			}
-			fonte = f
-			// A camada só pode ser submetida depois de a Surface ter conteúdo:
-			// antes disso o compositor recebe uma textura vazia. Mesma razão e
-			// mesma espera do caminho real.
-			handler.postDelayed({
-				xr?.setVideoLayerEnabled(true)
-				Trace.log(this, "Video layer released; measuring")
-			}, ATRASO_CAMADA_MS)
 		}
 	}
 
@@ -138,6 +165,7 @@ class BancoDeEnsaioActivity: Activity()
 		// Nesta ordem: a fonte para e fecha a janela de medição enquanto a
 		// sessão nativa ainda existe. Destruir a ponte primeiro puxaria a
 		// Surface debaixo do decodificador.
+		handler.removeCallbacksAndMessages(null)
 		fonte?.parar()
 		fonte = null
 		xr?.destroy()

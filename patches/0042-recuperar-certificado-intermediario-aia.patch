@@ -1,0 +1,1487 @@
+diff --git a/lib/CMakeLists.txt b/lib/CMakeLists.txt
+index af56a2c..ba0a79b 100644
+--- a/lib/CMakeLists.txt
++++ b/lib/CMakeLists.txt
+@@ -85,10 +85,16 @@ set(SOURCE_FILES
+ 		src/opusencoder.c
+ 		src/orientation.c
+ 		src/bitstream.c
++		src/aia.c
++		src/aia.h
+ 		src/remote/holepunch.c
+ 		src/remote/rudp.c
+ 		src/remote/rudpsendbuffer.c)
+ 
++if(NOT CHIAKI_LIB_ENABLE_MBEDTLS)
++	list(APPEND SOURCE_FILES src/aia_openssl.c)
++endif()
++
+ if(CHIAKI_ENABLE_FFMPEG_DECODER)
+ 	list(APPEND HEADER_FILES include/chiaki/ffmpegdecoder.h)
+ 	list(APPEND SOURCE_FILES src/ffmpegdecoder.c)
+@@ -112,6 +118,9 @@ if(CHIAKI_LIB_ENABLE_OPUS)
+ endif()
+ 
+ add_library(chiaki-lib ${HEADER_FILES} ${SOURCE_FILES} ${CHIAKI_LIB_PROTO_SOURCE_FILES} ${CHIAKI_LIB_PROTO_HEADER_FILES})
++if(WIN32 AND NOT CHIAKI_USE_SYSTEM_CURL AND NOT CHIAKI_LIB_ENABLE_MBEDTLS)
++	target_compile_definitions(chiaki-lib PRIVATE CHIAKI_CURL_SCHANNEL_AIA=1)
++endif()
+ configure_file(config.h.in include/chiaki/config.h)
+ target_include_directories(chiaki-lib PUBLIC "${CMAKE_CURRENT_BINARY_DIR}/include")
+ 
+@@ -124,6 +133,9 @@ set_target_properties(chiaki-lib PROPERTIES OUTPUT_NAME chiaki)
+ 
+ if(WIN32)
+ 	target_link_libraries(chiaki-lib wsock32 ws2_32 bcrypt iphlpapi)
++	if(NOT CHIAKI_LIB_ENABLE_MBEDTLS)
++		target_link_libraries(chiaki-lib crypt32)
++	endif()
+ endif()
+ 
+ if(APPLE AND NOT IOS AND NOT TVOS)
+diff --git a/lib/include/chiaki/remote/holepunch.h b/lib/include/chiaki/remote/holepunch.h
+index 407d5d8..c7cc772 100644
+--- a/lib/include/chiaki/remote/holepunch.h
++++ b/lib/include/chiaki/remote/holepunch.h
+@@ -205,6 +205,9 @@ CHIAKI_EXPORT ChiakiHolepunchSession chiaki_holepunch_session_init(
+ CHIAKI_EXPORT void chiaki_holepunch_session_force_port_guessing(
+     ChiakiHolepunchSession session, bool enabled);
+ 
++CHIAKI_EXPORT void chiaki_holepunch_session_set_ws_fqdn_override(
++    ChiakiHolepunchSession session, const char *fqdn);
++
+     /**
+  *
+  * Sets the number of ports to use for port guessing NAT traversal.
+diff --git a/lib/src/aia.c b/lib/src/aia.c
+new file mode 100644
+index 0000000..3fdfa3c
+--- /dev/null
++++ b/lib/src/aia.c
+@@ -0,0 +1,466 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++#include "aia.h"
++#include <chiaki/config.h>
++
++#include <chiaki/thread.h>
++#include <chiaki/time.h>
++#include <chiaki/sock.h>
++#ifndef _WIN32
++#include <netinet/in.h>
++#include <sys/socket.h>
++#endif
++
++#include <curl/curl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define AIA_PEM_BEGIN "-----BEGIN CERTIFICATE-----"
++#define AIA_MAX_HOPS 4
++
++bool chiaki_aia_should_stop(const ChiakiAiaControl *control)
++{
++	return control && ((control->canceled && control->canceled(control->user)) ||
++		(control->deadline_ms && chiaki_time_now_monotonic_ms() >= control->deadline_ms));
++}
++
++bool chiaki_aia_public_ipv4(uint32_t a)
++{
++	return !((a >> 24) == 0 || (a >> 24) == 10 || (a >> 24) == 127 ||
++		(a >> 22) == (0x64400000U >> 22) ||
++		(a >> 16) == 0xa9fe || (a >> 20) == (0xac100000U >> 20) ||
++		(a >> 16) == 0xc0a8 ||
++		(a >> 8) == 0xc00000 || (a >> 8) == 0xc00002 || (a >> 8) == 0xc05863 ||
++		(a >> 15) == (0xc6120000U >> 15) || (a >> 8) == 0xc63364 ||
++		(a >> 8) == 0xcb0071 || a >= 0xe0000000U);
++}
++
++static curl_socket_t aia_open_socket(void *user, curlsocktype purpose, struct curl_sockaddr *address)
++{
++	if(chiaki_aia_should_stop(user) || purpose != CURLSOCKTYPE_IPCXN || address->family != AF_INET)
++		return CURL_SOCKET_BAD;
++	const struct sockaddr_in *addr = (const struct sockaddr_in *)&address->addr;
++	if(!chiaki_aia_public_ipv4(ntohl(addr->sin_addr.s_addr)))
++		return CURL_SOCKET_BAD;
++	return socket(address->family, address->socktype, address->protocol);
++}
++
++static int aia_transfer_progress(void *user, curl_off_t dt, curl_off_t dn, curl_off_t ut, curl_off_t un)
++{
++	(void)dt; (void)dn; (void)ut; (void)un;
++	return chiaki_aia_should_stop(user) ? 1 : 0;
++}
++
++bool chiaki_aia_configure_transfer(CURL *curl, const ChiakiAiaControl *control)
++{
++	if(chiaki_aia_should_stop(control))
++		return false;
++	uint64_t timeout = 10000;
++	if(control && control->deadline_ms) {
++		uint64_t now = chiaki_time_now_monotonic_ms();
++		if(now >= control->deadline_ms)
++			return false;
++		if(control->deadline_ms - now < timeout)
++			timeout = control->deadline_ms - now;
++	}
++	// Direct IPv4 connections allow checking every resolved destination, including redirects.
++	return curl_easy_setopt(curl, CURLOPT_PROXY, "") == CURLE_OK &&
++		curl_easy_setopt(curl, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4) == CURLE_OK &&
++		curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https") == CURLE_OK &&
++		curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https") == CURLE_OK &&
++		curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, aia_open_socket) == CURLE_OK &&
++		curl_easy_setopt(curl, CURLOPT_OPENSOCKETDATA, control) == CURLE_OK &&
++		curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L) == CURLE_OK &&
++		curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, aia_transfer_progress) == CURLE_OK &&
++		curl_easy_setopt(curl, CURLOPT_XFERINFODATA, control) == CURLE_OK &&
++		curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, (long)timeout) == CURLE_OK;
++}
++
++static ChiakiMutex aia_blob_mutex;
++static char *aia_blob = NULL;
++static size_t aia_blob_size = 0;
++static uint32_t aia_blob_gen = 0;
++
++ChiakiErrorCode chiaki_aia_init(void)
++{
++	return chiaki_mutex_init(&aia_blob_mutex, false);
++}
++
++void chiaki_aia_fini(void)
++{
++	chiaki_aia_blob_reset();
++	chiaki_mutex_fini(&aia_blob_mutex);
++}
++
++bool chiaki_aia_blob_add_pem(const char *pem, size_t pem_len)
++{
++	if(!pem || pem_len < sizeof(AIA_PEM_BEGIN) - 1)
++		return false;
++
++	if(memcmp(pem, AIA_PEM_BEGIN, sizeof(AIA_PEM_BEGIN) - 1) != 0)
++		return false;
++
++	chiaki_mutex_lock(&aia_blob_mutex);
++
++	char *grown = (char *)realloc(aia_blob, aia_blob_size + pem_len + 2);
++	if(!grown)
++	{
++		chiaki_mutex_unlock(&aia_blob_mutex);
++		return false;
++	}
++
++	memcpy(grown + aia_blob_size, pem, pem_len);
++	size_t added = pem_len;
++	if(pem[pem_len - 1] != '\n')
++		grown[aia_blob_size + added++] = '\n';
++	grown[aia_blob_size + added] = 0;
++
++	aia_blob = grown;
++	aia_blob_size += added;
++	aia_blob_gen++;
++
++	chiaki_mutex_unlock(&aia_blob_mutex);
++	return true;
++}
++
++char *chiaki_aia_blob_take(size_t *len_out)
++{
++	chiaki_mutex_lock(&aia_blob_mutex);
++
++	char *copy = NULL;
++	if(aia_blob && aia_blob_size)
++	{
++		copy = (char *)malloc(aia_blob_size + 1);
++		if(copy)
++		{
++			memcpy(copy, aia_blob, aia_blob_size);
++			copy[aia_blob_size] = 0;
++			if(len_out)
++				*len_out = aia_blob_size;
++		}
++	}
++	if(!copy && len_out)
++		*len_out = 0;
++
++	chiaki_mutex_unlock(&aia_blob_mutex);
++	return copy;
++}
++
++char *chiaki_aia_blob_with_ca(FILE *ca_file, size_t *len_out)
++{
++	*len_out = 0;
++	size_t issuers_len = 0;
++	char *issuers = chiaki_aia_blob_take(&issuers_len);
++	if(!issuers)
++		return NULL;
++	if(!ca_file) {
++		*len_out = issuers_len;
++		return issuers;
++	}
++
++	char *bundle = NULL;
++	size_t size = 0;
++	char chunk[4096];
++	size_t n;
++	while((n = fread(chunk, 1, sizeof(chunk), ca_file)) > 0) {
++		if(size > SIZE_MAX - n)
++			goto error;
++		char *grown = realloc(bundle, size + n);
++		if(!grown)
++			goto error;
++		bundle = grown;
++		memcpy(bundle + size, chunk, n);
++		size += n;
++	}
++	if(ferror(ca_file) || issuers_len > SIZE_MAX - 2 || size > SIZE_MAX - issuers_len - 2)
++		goto error;
++	char *grown = realloc(bundle, size + issuers_len + 2);
++	if(!grown)
++		goto error;
++	bundle = grown;
++	bundle[size++] = '\n';
++	memcpy(bundle + size, issuers, issuers_len);
++	size += issuers_len;
++	bundle[size] = 0;
++	free(issuers);
++	*len_out = size;
++	return bundle;
++error:
++	free(bundle);
++	free(issuers);
++	return NULL;
++}
++
++size_t chiaki_aia_blob_len(void)
++{
++	chiaki_mutex_lock(&aia_blob_mutex);
++	size_t len = aia_blob_size;
++	chiaki_mutex_unlock(&aia_blob_mutex);
++	return len;
++}
++
++uint32_t chiaki_aia_blob_generation(void)
++{
++	chiaki_mutex_lock(&aia_blob_mutex);
++	uint32_t gen = aia_blob_gen;
++	chiaki_mutex_unlock(&aia_blob_mutex);
++	return gen;
++}
++
++void chiaki_aia_blob_reset(void)
++{
++	chiaki_mutex_lock(&aia_blob_mutex);
++	free(aia_blob);
++	aia_blob = NULL;
++	aia_blob_size = 0;
++	aia_blob_gen++;
++	chiaki_mutex_unlock(&aia_blob_mutex);
++}
++
++#ifndef CHIAKI_LIB_ENABLE_MBEDTLS
++static void aia_free_all(uint8_t **certs, size_t count)
++{
++	for(size_t i = 0; i < count; i++)
++		free(certs[i]);
++}
++
++static ChiakiErrorCode aia_recover_with_store(
++	const uint8_t *leaf_der, size_t leaf_len,
++	ChiakiAiaFetch fetch, void *fetch_user,
++	const uint8_t *const *roots, const size_t *root_lens, size_t root_count,
++	char **pem_out, size_t *pem_len_out, ChiakiLog *log, void *trust_store)
++{
++	if(!leaf_der || leaf_len == 0 || !fetch || !pem_out)
++		return CHIAKI_ERR_INVALID_DATA;
++
++	*pem_out = NULL;
++	if(pem_len_out)
++		*pem_len_out = 0;
++
++	uint8_t *found[AIA_MAX_HOPS];
++	size_t found_lens[AIA_MAX_HOPS];
++	size_t found_count = 0;
++
++	const uint8_t *current = leaf_der;
++	size_t current_len = leaf_len;
++	bool complete = false;
++
++	char *leaf_desc = chiaki_aia_cert_describe(leaf_der, leaf_len);
++	CHIAKI_LOGI(log, "aia: walking from %s", leaf_desc ? leaf_desc : "(unreadable certificate)");
++	free(leaf_desc);
++
++	for(size_t hop = 0; hop <= AIA_MAX_HOPS; hop++)
++	{
++		if(chiaki_aia_verify_with_store(leaf_der, leaf_len,
++				(const uint8_t *const *)found, found_lens, found_count,
++				roots, root_lens, root_count, log, NULL, NULL, trust_store))
++		{
++			complete = true;
++			break;
++		}
++		if(hop == AIA_MAX_HOPS)
++			break;
++
++		char *url = chiaki_aia_issuer_url(current, current_len);
++		if(!url)
++		{
++			CHIAKI_LOGW(log, "aia: certificate names no issuer to fetch, cannot continue");
++			break;
++		}
++
++		if(strncmp(url, "http://", 7) != 0 && strncmp(url, "https://", 8) != 0)
++		{
++			CHIAKI_LOGW(log, "aia: refusing non-http issuer URL");
++			free(url);
++			break;
++		}
++
++		CHIAKI_LOGI(log, "aia: fetching issuer %zu from %s", hop + 1, url);
++		uint8_t *der = NULL;
++		size_t der_len = 0;
++		bool got = fetch(url, &der, &der_len, fetch_user);
++		free(url);
++
++		if(!got || !der || der_len == 0)
++		{
++			CHIAKI_LOGW(log, "aia: issuer fetch failed");
++			free(der);
++			break;
++		}
++
++		char *desc = chiaki_aia_cert_describe(der, der_len);
++		CHIAKI_LOGI(log, "aia:   hop %zu -> %s", hop + 1, desc ? desc : "(unreadable certificate)");
++		free(desc);
++
++		found[found_count] = der;
++		found_lens[found_count] = der_len;
++		found_count++;
++		current = der;
++		current_len = der_len;
++	}
++
++	if(!complete)
++	{
++		CHIAKI_LOGW(log, "aia: could not complete the chain after %zu fetch(es)", found_count);
++		aia_free_all(found, found_count);
++		return CHIAKI_ERR_INVALID_DATA;
++	}
++
++	if(found_count == 0)
++	{
++		CHIAKI_LOGI(log, "aia: chain already complete, nothing to recover");
++		return CHIAKI_ERR_SUCCESS;
++	}
++
++	char *bundle = NULL;
++	size_t bundle_len = 0;
++	bool verified = chiaki_aia_verify_with_store(leaf_der, leaf_len,
++		(const uint8_t *const *)found, found_lens, found_count,
++		roots, root_lens, root_count, log, &bundle, &bundle_len, trust_store);
++
++	aia_free_all(found, found_count);
++
++	if(!verified || !bundle || bundle_len == 0)
++	{
++		free(bundle);
++		return CHIAKI_ERR_MEMORY;
++	}
++
++	CHIAKI_LOGI(log, "aia: path complete after %zu hop(s), %zu byte bundle", found_count, bundle_len);
++	*pem_out = bundle;
++	if(pem_len_out)
++		*pem_len_out = bundle_len;
++	return CHIAKI_ERR_SUCCESS;
++}
++
++ChiakiErrorCode chiaki_aia_recover_with(
++	const uint8_t *leaf_der, size_t leaf_len,
++	ChiakiAiaFetch fetch, void *fetch_user,
++	const uint8_t *const *roots, const size_t *root_lens, size_t root_count,
++	char **pem_out, size_t *pem_len_out, ChiakiLog *log)
++{
++	return aia_recover_with_store(leaf_der, leaf_len, fetch, fetch_user,
++		roots, root_lens, root_count, pem_out, pem_len_out, log, NULL);
++}
++
++typedef struct
++{
++	uint8_t *data;
++	size_t len;
++	bool failed;
++} AiaDownload;
++
++static size_t aia_download_write(void *contents, size_t size, size_t nmemb, void *userp)
++{
++	AiaDownload *dl = (AiaDownload *)userp;
++	size_t total = size * nmemb;
++	if(dl->failed)
++		return 0;
++	if(dl->len + total > 64 * 1024)
++	{
++		dl->failed = true;
++		return 0;
++	}
++	uint8_t *grown = (uint8_t *)realloc(dl->data, dl->len + total);
++	if(!grown)
++	{
++		dl->failed = true;
++		return 0;
++	}
++	memcpy(grown + dl->len, contents, total);
++	dl->data = grown;
++	dl->len += total;
++	return total;
++}
++
++static bool aia_fetch_curl(const char *url, uint8_t **der_out, size_t *der_len_out, void *user)
++{
++	const ChiakiAiaControl *control = user;
++	if(chiaki_aia_should_stop(control))
++		return false;
++	CURL *curl = curl_easy_init();
++	if(!curl)
++		return false;
++
++	AiaDownload dl = { NULL, 0, false };
++	curl_easy_setopt(curl, CURLOPT_URL, url);
++	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, aia_download_write);
++	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &dl);
++	if(!chiaki_aia_configure_transfer(curl, control)) {
++		curl_easy_cleanup(curl);
++		return false;
++	}
++	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
++	curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 3L);
++	curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
++
++	CURLcode res = curl_easy_perform(curl);
++	curl_easy_cleanup(curl);
++
++	if(chiaki_aia_should_stop(control) || res != CURLE_OK || dl.failed || !dl.data || dl.len == 0)
++	{
++		free(dl.data);
++		return false;
++	}
++
++	if(dl.data[0] != 0x30)
++	{
++		uint8_t *der = NULL;
++		size_t der_len = 0;
++		bool converted = chiaki_aia_pem_to_der((const char *)dl.data, dl.len, &der, &der_len);
++		free(dl.data);
++		if(!converted)
++			return false;
++		*der_out = der;
++		*der_len_out = der_len;
++		return true;
++	}
++
++	*der_out = dl.data;
++	*der_len_out = dl.len;
++	return true;
++}
++
++ChiakiErrorCode chiaki_aia_recover(
++	const uint8_t *leaf_der, size_t leaf_len,
++	char **pem_out, size_t *pem_len_out, ChiakiLog *log, const ChiakiAiaControl *control)
++{
++	*pem_out = NULL;
++	if(pem_len_out)
++		*pem_len_out = 0;
++	void *store = chiaki_aia_trust_store(control ? control->connection : NULL);
++	if(!store) {
++		CHIAKI_LOGE(log, "aia: could not load the connection trust store");
++		return CHIAKI_ERR_INVALID_DATA;
++	}
++	ChiakiErrorCode err = aia_recover_with_store(leaf_der, leaf_len, aia_fetch_curl, (void *)control,
++		NULL, NULL, 0, pem_out, pem_len_out, log, store);
++	chiaki_aia_trust_store_free(store);
++	return err;
++}
++#else
++// Fail closed until certificate-chain recovery has an mbedTLS implementation.
++bool chiaki_aia_peek_leaf(const char *host, uint8_t **der_out, size_t *der_len_out, ChiakiLog *log,
++	const ChiakiAiaControl *control)
++{
++	(void)control;
++	(void)host;
++	(void)log;
++	*der_out = NULL;
++	*der_len_out = 0;
++	return false;
++}
++
++ChiakiErrorCode chiaki_aia_recover(
++	const uint8_t *leaf_der, size_t leaf_len,
++	char **pem_out, size_t *pem_len_out, ChiakiLog *log, const ChiakiAiaControl *control)
++{
++	(void)control;
++	(void)leaf_der;
++	(void)leaf_len;
++	(void)log;
++	*pem_out = NULL;
++	*pem_len_out = 0;
++	return CHIAKI_ERR_UNKNOWN;
++}
++#endif
+diff --git a/lib/src/aia.h b/lib/src/aia.h
+new file mode 100644
+index 0000000..046c218
+--- /dev/null
++++ b/lib/src/aia.h
+@@ -0,0 +1,90 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++#ifndef CHIAKI_AIA_H
++#define CHIAKI_AIA_H
++
++#include <chiaki/common.h>
++#include <chiaki/log.h>
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <curl/curl.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++ChiakiErrorCode chiaki_aia_init(void);
++void chiaki_aia_fini(void);
++
++char *chiaki_aia_issuer_url(const uint8_t *cert_der, size_t cert_len);
++
++bool chiaki_aia_path_completes(
++	const uint8_t *leaf_der, size_t leaf_len,
++	const uint8_t *const *candidates, const size_t *candidate_lens, size_t candidate_count,
++	const uint8_t *const *roots, const size_t *root_lens, size_t root_count,
++	ChiakiLog *log);
++
++char *chiaki_aia_cert_describe(const uint8_t *der, size_t der_len);
++
++bool chiaki_aia_verified_pem(
++	const uint8_t *leaf_der, size_t leaf_len,
++	const uint8_t *const *candidates, const size_t *candidate_lens, size_t candidate_count,
++	const uint8_t *const *roots, const size_t *root_lens, size_t root_count,
++	char **pem_out, size_t *pem_len_out, ChiakiLog *log);
++
++char *chiaki_aia_der_to_pem(const uint8_t *der, size_t der_len, size_t *pem_len_out);
++
++bool chiaki_aia_pem_to_der(const char *pem, size_t pem_len, uint8_t **der_out, size_t *der_len_out);
++
++typedef bool (*ChiakiAiaFetch)(const char *url, uint8_t **der_out, size_t *der_len_out, void *user);
++
++ChiakiErrorCode chiaki_aia_recover_with(
++	const uint8_t *leaf_der, size_t leaf_len,
++	ChiakiAiaFetch fetch, void *fetch_user,
++	const uint8_t *const *roots, const size_t *root_lens, size_t root_count,
++	char **pem_out, size_t *pem_len_out, ChiakiLog *log);
++
++typedef struct {
++	bool (*canceled)(void *user);
++	void *user;
++	uint64_t deadline_ms;
++	CURL *connection;
++} ChiakiAiaControl;
++
++void *chiaki_aia_trust_store(CURL *connection);
++void chiaki_aia_trust_store_free(void *store);
++bool chiaki_aia_verify_with_store(
++	const uint8_t *leaf_der, size_t leaf_len,
++	const uint8_t *const *candidates, const size_t *candidate_lens, size_t candidate_count,
++	const uint8_t *const *roots, const size_t *root_lens, size_t root_count,
++	ChiakiLog *log, char **pem_out, size_t *pem_len_out, void *trust_store);
++
++bool chiaki_aia_should_stop(const ChiakiAiaControl *control);
++bool chiaki_aia_configure_transfer(CURL *curl, const ChiakiAiaControl *control);
++bool chiaki_aia_public_ipv4(uint32_t address);
++
++bool chiaki_aia_peek_leaf(const char *host, uint8_t **der_out, size_t *der_len_out, ChiakiLog *log,
++	const ChiakiAiaControl *control);
++
++ChiakiErrorCode chiaki_aia_recover(
++	const uint8_t *leaf_der, size_t leaf_len,
++	char **pem_out, size_t *pem_len_out, ChiakiLog *log, const ChiakiAiaControl *control);
++
++bool chiaki_aia_blob_add_pem(const char *pem, size_t pem_len);
++
++char *chiaki_aia_blob_take(size_t *len_out);
++
++// Combine the configured CA file with cached issuers; NULL means no CA file.
++char *chiaki_aia_blob_with_ca(FILE *ca_file, size_t *len_out);
++
++size_t chiaki_aia_blob_len(void);
++uint32_t chiaki_aia_blob_generation(void);
++void chiaki_aia_blob_reset(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/lib/src/aia_openssl.c b/lib/src/aia_openssl.c
+new file mode 100644
+index 0000000..d3b36f2
+--- /dev/null
++++ b/lib/src/aia_openssl.c
+@@ -0,0 +1,376 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++#include "aia.h"
++
++#include <curl/curl.h>
++#include <stdio.h>
++
++#include <openssl/bio.h>
++#include <openssl/pem.h>
++#include <openssl/x509.h>
++#include <openssl/x509v3.h>
++
++#include <stdlib.h>
++#include <string.h>
++#ifdef _WIN32
++#include <windows.h>
++#include <wincrypt.h>
++#endif
++
++static X509 *aia_der_to_x509(const uint8_t *der, size_t der_len)
++{
++	if(!der || der_len == 0)
++		return NULL;
++	const unsigned char *p = der;
++	return d2i_X509(NULL, &p, (long)der_len);
++}
++
++char *chiaki_aia_issuer_url(const uint8_t *cert_der, size_t cert_len)
++{
++	X509 *cert = aia_der_to_x509(cert_der, cert_len);
++	if(!cert)
++		return NULL;
++
++	char *url = NULL;
++	AUTHORITY_INFO_ACCESS *aia =
++		(AUTHORITY_INFO_ACCESS *)X509_get_ext_d2i(cert, NID_info_access, NULL, NULL);
++	if(aia)
++	{
++		for(int i = 0; i < sk_ACCESS_DESCRIPTION_num(aia) && !url; i++)
++		{
++			ACCESS_DESCRIPTION *ad = sk_ACCESS_DESCRIPTION_value(aia, i);
++			if(!ad || OBJ_obj2nid(ad->method) != NID_ad_ca_issuers)
++				continue;
++			if(!ad->location || ad->location->type != GEN_URI)
++				continue;
++
++			const ASN1_IA5STRING *uri = ad->location->d.uniformResourceIdentifier;
++			int len = ASN1_STRING_length(uri);
++			const unsigned char *data = ASN1_STRING_get0_data(uri);
++			if(len <= 0 || !data)
++				continue;
++			if(memchr(data, 0, (size_t)len))
++				continue;
++
++			url = (char *)malloc((size_t)len + 1);
++			if(url)
++			{
++				memcpy(url, data, (size_t)len);
++				url[len] = 0;
++			}
++		}
++		AUTHORITY_INFO_ACCESS_free(aia);
++	}
++
++	X509_free(cert);
++	return url;
++}
++
++void *chiaki_aia_trust_store(CURL *connection)
++{
++	if(!connection)
++		return NULL;
++	X509_STORE *store = X509_STORE_new();
++	if(!store)
++		return NULL;
++	const char *file = NULL, *path = NULL;
++	if(curl_easy_getinfo(connection, CURLINFO_CAINFO, &file) != CURLE_OK ||
++		curl_easy_getinfo(connection, CURLINFO_CAPATH, &path) != CURLE_OK)
++		goto error;
++#ifdef _WIN32
++	const curl_version_info_data *version = curl_version_info(CURLVERSION_NOW);
++	if(version->ssl_version && strstr(version->ssl_version, "Schannel") && !file) {
++		HCERTSTORE native = CertOpenSystemStoreA(0, "ROOT");
++		if(!native)
++			goto error;
++		PCCERT_CONTEXT cert = NULL;
++		size_t added = 0;
++		while((cert = CertEnumCertificatesInStore(native, cert))) {
++			X509 *root = aia_der_to_x509(cert->pbCertEncoded, cert->cbCertEncoded);
++			if(root) {
++				if(X509_STORE_add_cert(store, root) == 1)
++					added++;
++				X509_free(root);
++			}
++		}
++		CertCloseStore(native, 0);
++		if(!added)
++			goto error;
++		return store;
++	}
++#endif
++	if((!file && !path) || X509_STORE_load_locations(store, file, path) != 1)
++		goto error;
++	return store;
++error:
++	X509_STORE_free(store);
++	return NULL;
++}
++
++void chiaki_aia_trust_store_free(void *store)
++{
++	X509_STORE_free(store);
++}
++
++bool chiaki_aia_verify_with_store(
++	const uint8_t *leaf_der, size_t leaf_len,
++	const uint8_t *const *candidates, const size_t *candidate_lens, size_t candidate_count,
++	const uint8_t *const *roots, const size_t *root_lens, size_t root_count,
++	ChiakiLog *log, char **pem_out, size_t *pem_len_out, void *trust_store)
++{
++	if(pem_out)
++		*pem_out = NULL;
++	if(pem_len_out)
++		*pem_len_out = 0;
++	X509 *leaf = aia_der_to_x509(leaf_der, leaf_len);
++	if(!leaf)
++		return false;
++
++	STACK_OF(X509) *untrusted = sk_X509_new_null();
++	X509_STORE *store = trust_store ? trust_store : X509_STORE_new();
++	X509_STORE_CTX *ctx = X509_STORE_CTX_new();
++	bool ok = false;
++
++	if(!untrusted || !store || !ctx)
++		goto out;
++
++	for(size_t i = 0; i < candidate_count; i++)
++	{
++		X509 *cand = aia_der_to_x509(candidates[i], candidate_lens[i]);
++		if(!cand)
++			continue;
++		if(!sk_X509_push(untrusted, cand))
++		{
++			X509_free(cand);
++			goto out;
++		}
++	}
++
++	if(trust_store) {
++		// The caller supplies the trust source used by the connection.
++	}
++	else if(roots && root_lens && root_count > 0)
++	{
++		size_t added = 0;
++		for(size_t i = 0; i < root_count; i++)
++		{
++			X509 *root = aia_der_to_x509(roots[i], root_lens[i]);
++			if(!root)
++				continue;
++			if(X509_STORE_add_cert(store, root) == 1)
++				added++;
++			X509_free(root);
++		}
++		if(added == 0)
++			goto out;
++	}
++	else if(X509_STORE_set_default_paths(store) != 1)
++	{
++		CHIAKI_LOGE(log, "aia: could not load the system trust store");
++		goto out;
++	}
++
++	if(X509_STORE_CTX_init(ctx, store, leaf, untrusted) != 1)
++		goto out;
++
++	if(X509_verify_cert(ctx) == 1)
++	{
++		ok = true;
++		if(pem_out) {
++			// Export only the verified intermediates, excluding leaf and trust anchor.
++			STACK_OF(X509) *chain = X509_STORE_CTX_get0_chain(ctx);
++			BIO *bio = BIO_new(BIO_s_mem());
++			if(!bio) {
++				ok = false;
++				goto out;
++			}
++			for(int i = 1; i < sk_X509_num(chain) - 1; i++) {
++				if(PEM_write_bio_X509(bio, sk_X509_value(chain, i)) != 1) {
++					ok = false;
++					break;
++				}
++			}
++			char *data = NULL;
++			long len = BIO_get_mem_data(bio, &data);
++			if(ok && len > 0) {
++				*pem_out = malloc((size_t)len + 1);
++				if(*pem_out) {
++					memcpy(*pem_out, data, (size_t)len);
++					(*pem_out)[len] = 0;
++					*pem_len_out = (size_t)len;
++				} else
++					ok = false;
++			}
++			BIO_free(bio);
++		}
++	}
++	else
++	{
++		int err = X509_STORE_CTX_get_error(ctx);
++		CHIAKI_LOGI(log, "aia: path incomplete (x509 err %d): %s",
++			err, X509_verify_cert_error_string(err));
++	}
++
++out:
++	if(ctx)
++		X509_STORE_CTX_free(ctx);
++	if(store && !trust_store)
++		X509_STORE_free(store);
++	if(untrusted)
++		sk_X509_pop_free(untrusted, X509_free);
++	X509_free(leaf);
++	return ok;
++}
++
++bool chiaki_aia_path_completes(
++	const uint8_t *leaf_der, size_t leaf_len,
++	const uint8_t *const *candidates, const size_t *candidate_lens, size_t candidate_count,
++	const uint8_t *const *roots, const size_t *root_lens, size_t root_count, ChiakiLog *log)
++{
++	return chiaki_aia_verify_with_store(leaf_der, leaf_len, candidates, candidate_lens, candidate_count,
++		roots, root_lens, root_count, log, NULL, NULL, NULL);
++}
++
++bool chiaki_aia_verified_pem(
++	const uint8_t *leaf_der, size_t leaf_len,
++	const uint8_t *const *candidates, const size_t *candidate_lens, size_t candidate_count,
++	const uint8_t *const *roots, const size_t *root_lens, size_t root_count,
++	char **pem_out, size_t *pem_len_out, ChiakiLog *log)
++{
++	return chiaki_aia_verify_with_store(leaf_der, leaf_len, candidates, candidate_lens, candidate_count,
++		roots, root_lens, root_count, log, pem_out, pem_len_out, NULL);
++}
++
++char *chiaki_aia_der_to_pem(const uint8_t *der, size_t der_len, size_t *pem_len_out)
++{
++	X509 *cert = aia_der_to_x509(der, der_len);
++	if(!cert)
++		return NULL;
++
++	BIO *bio = BIO_new(BIO_s_mem());
++	if(!bio)
++	{
++		X509_free(cert);
++		return NULL;
++	}
++
++	char *out = NULL;
++	if(PEM_write_bio_X509(bio, cert) == 1)
++	{
++		char *data = NULL;
++		long n = BIO_get_mem_data(bio, &data);
++		if(n > 0)
++		{
++			out = (char *)malloc((size_t)n + 1);
++			if(out)
++			{
++				memcpy(out, data, (size_t)n);
++				out[n] = 0;
++				if(pem_len_out)
++					*pem_len_out = (size_t)n;
++			}
++		}
++	}
++
++	BIO_free(bio);
++	X509_free(cert);
++	return out;
++}
++
++bool chiaki_aia_pem_to_der(const char *pem, size_t pem_len, uint8_t **der_out, size_t *der_len_out)
++{
++	if(!pem || pem_len == 0 || !der_out || !der_len_out)
++		return false;
++
++	BIO *bio = BIO_new_mem_buf(pem, (int)pem_len);
++	if(!bio)
++		return false;
++
++	X509 *cert = PEM_read_bio_X509(bio, NULL, NULL, NULL);
++	BIO_free(bio);
++	if(!cert)
++		return false;
++
++	unsigned char *der = NULL;
++	int der_len = i2d_X509(cert, &der);
++	X509_free(cert);
++	if(der_len <= 0 || !der) {
++		OPENSSL_free(der);
++		return false;
++	}
++
++	// Callers own the result through malloc/free, not OpenSSL's allocator.
++	uint8_t *copy = malloc((size_t)der_len);
++	if(copy)
++		memcpy(copy, der, (size_t)der_len);
++	OPENSSL_free(der);
++	if(!copy)
++		return false;
++	*der_out = copy;
++	*der_len_out = (size_t)der_len;
++	return true;
++}
++
++bool chiaki_aia_peek_leaf(const char *host, uint8_t **der_out, size_t *der_len_out, ChiakiLog *log,
++	const ChiakiAiaControl *control)
++{
++	if(!host || !der_out || !der_len_out)
++		return false;
++
++	char url[256];
++	snprintf(url, sizeof(url), "https://%s/", host);
++
++	CURL *curl = curl_easy_init();
++	if(!curl)
++		return false;
++
++	curl_easy_setopt(curl, CURLOPT_URL, url);
++	curl_easy_setopt(curl, CURLOPT_CERTINFO, 1L);
++	curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1L);
++	if(!chiaki_aia_configure_transfer(curl, control)) {
++		curl_easy_cleanup(curl);
++		return false;
++	}
++	curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
++	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
++	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
++
++	CURLcode res = curl_easy_perform(curl);
++	struct curl_certinfo *ci = NULL;
++	bool ok = false;
++
++	if(!chiaki_aia_should_stop(control) && res == CURLE_OK &&
++		curl_easy_getinfo(curl, CURLINFO_CERTINFO, &ci) == CURLE_OK && ci && ci->num_of_certs > 0)
++	{
++		for(struct curl_slist *e = ci->certinfo[0]; e && !ok; e = e->next)
++		{
++			if(strncmp(e->data, "Cert:", 5) == 0)
++				ok = chiaki_aia_pem_to_der(e->data + 5, strlen(e->data + 5), der_out, der_len_out);
++		}
++	}
++
++	if(!ok)
++		CHIAKI_LOGW(log, "aia: could not read the certificate served by %s: %s",
++			host, curl_easy_strerror(res));
++
++	curl_easy_cleanup(curl);
++	return ok;
++}
++
++char *chiaki_aia_cert_describe(const uint8_t *der, size_t der_len)
++{
++	X509 *cert = aia_der_to_x509(der, der_len);
++	if(!cert)
++		return NULL;
++
++	char subject[256] = { 0 };
++	char issuer[256] = { 0 };
++	X509_NAME_oneline(X509_get_subject_name(cert), subject, (int)sizeof(subject) - 1);
++	X509_NAME_oneline(X509_get_issuer_name(cert), issuer, (int)sizeof(issuer) - 1);
++	X509_free(cert);
++
++	size_t len = strlen(subject) + strlen(issuer) + 32;
++	char *out = (char *)malloc(len);
++	if(out)
++		snprintf(out, len, "%s (issued by %s)", subject, issuer);
++	return out;
++}
+diff --git a/lib/src/common.c b/lib/src/common.c
+index adb0fc6..ce4e3c8 100644
+--- a/lib/src/common.c
++++ b/lib/src/common.c
+@@ -1,6 +1,8 @@
+ // SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
+ 
+ #include <chiaki/common.h>
++
++#include "aia.h"
+ #include <chiaki/fec.h>
+ #include <chiaki/random.h>
+ 
+@@ -103,6 +105,10 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_lib_init()
+ 	}
+ #endif
+ 
++	ChiakiErrorCode aia_err = chiaki_aia_init();
++	if(aia_err != CHIAKI_ERR_SUCCESS)
++		return aia_err;
++
+ 	return CHIAKI_ERR_SUCCESS;
+ }
+ 
+diff --git a/lib/src/remote/holepunch.c b/lib/src/remote/holepunch.c
+index 9a5bc69..74c24a6 100644
+--- a/lib/src/remote/holepunch.c
++++ b/lib/src/remote/holepunch.c
+@@ -51,6 +51,8 @@
+ #endif
+ 
+ #include <curl/curl.h>
++
++#include "../aia.h"
+ #if !defined(__SWITCH__) && !defined(__ANDROID__)
+ #include <event2/event.h>
+ #endif
+@@ -229,7 +231,8 @@ typedef enum session_state_t
+     SESSION_STATE_DATA_CONSOLE_ACCEPTED = 1 << 15,
+     SESSION_STATE_DATA_CLIENT_ACCEPTED = 1 << 16,
+     SESSION_STATE_DATA_ESTABLISHED = 1 << 17,
+-    SESSION_STATE_DELETED = 1 << 18
++    SESSION_STATE_DELETED = 1 << 18,
++    SESSION_STATE_WS_FAILED = 1 << 19
+ } SessionState;
+ 
+ typedef struct upnp_gateway_info_t
+@@ -347,7 +350,9 @@ typedef struct session_t
+     CURLSH* curl_share;
+ 
+     char* ws_fqdn;
++    char* ws_fqdn_override;
+     ChiakiThread ws_thread;
++    bool ws_thread_created;
+     NotificationQueue* ws_notification_queue;
+     bool ws_thread_should_stop;
+     bool ws_open;
+@@ -384,6 +389,18 @@ static ChiakiErrorCode hex_to_bytes(const char* hex_str, uint8_t* bytes, size_t
+ static void bytes_to_hex(const uint8_t* bytes, size_t len, char* hex_str, size_t max_len);
+ static void random_uuidv4(char* out);
+ static void *websocket_thread_func(void *user);
++
++static void stop_websocket_thread(Session *session)
++{
++    if(!session->ws_thread_created)
++        return;
++    chiaki_mutex_lock(&session->stop_mutex);
++    session->ws_thread_should_stop = true;
++    chiaki_mutex_unlock(&session->stop_mutex);
++    chiaki_stop_pipe_stop(&session->select_pipe);
++    chiaki_thread_join(&session->ws_thread, NULL);
++    session->ws_thread_created = false;
++}
+ static NotificationType parse_notification_type(ChiakiLog *log, json_object* json);
+ static ChiakiErrorCode send_offer(Session *session);
+ static ChiakiErrorCode send_accept(Session *session, int req_id, Candidate *selected_candidate);
+@@ -742,6 +759,7 @@ CHIAKI_EXPORT Session* chiaki_holepunch_session_init(
+     session->log = log;
+ 
+     session->ws_fqdn = NULL;
++    session->ws_fqdn_override = NULL;
+     session->ws_notification_queue = createNq();
+     if(!session->ws_notification_queue)
+     {
+@@ -751,6 +769,7 @@ CHIAKI_EXPORT Session* chiaki_holepunch_session_init(
+     session->local_candidates = NULL;
+     session->our_offer_msg = NULL;
+     session->ws_open = false;
++    session->ws_thread_created = false;
+     session->online_id = NULL;
+     memset(&session->session_id, 0, sizeof(session->session_id));
+     memset(&session->console_uid, 0, sizeof(session->console_uid));
+@@ -894,9 +913,22 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_holepunch_upnp_discover(Session *session)
+ 
+ CHIAKI_EXPORT ChiakiErrorCode chiaki_holepunch_session_create(Session* session)
+ {
+-    ChiakiErrorCode err = get_websocket_fqdn(session, &session->ws_fqdn);
+-    if (err != CHIAKI_ERR_SUCCESS)
+-        return err;
++    ChiakiErrorCode err = CHIAKI_ERR_SUCCESS;
++    if(session->ws_fqdn_override)
++    {
++        if(session->ws_fqdn)
++            free(session->ws_fqdn);
++        session->ws_fqdn = strdup(session->ws_fqdn_override);
++        if(!session->ws_fqdn)
++            return CHIAKI_ERR_MEMORY;
++        CHIAKI_LOGW(session->log, "chiaki_holepunch_session_create: using overridden websocket FQDN %s", session->ws_fqdn);
++    }
++    else
++    {
++        err = get_websocket_fqdn(session, &session->ws_fqdn);
++        if (err != CHIAKI_ERR_SUCCESS)
++            return err;
++    }
+     chiaki_mutex_lock(&session->stop_mutex);
+     if(session->main_should_stop)
+     {
+@@ -911,18 +943,41 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_holepunch_session_create(Session* session)
+     err = chiaki_thread_create(&session->ws_thread, websocket_thread_func, session);
+     if (err != CHIAKI_ERR_SUCCESS)
+         return err;
++    session->ws_thread_created = true;
+     chiaki_thread_set_name(&session->ws_thread, "Chiaki Holepunch WS");
+     CHIAKI_LOGV(session->log, "chiaki_holepunch_session_create: Created websocket thread");
+ 
+     chiaki_mutex_lock(&session->state_mutex);
+-    while (!(session->state & SESSION_STATE_WS_OPEN))
++    bool ws_wait_timed_out = false;
++    while (!(session->state & (SESSION_STATE_WS_OPEN | SESSION_STATE_WS_FAILED)))
+     {
+         CHIAKI_LOGV(session->log, "chiaki_holepunch_session_create: Waiting for websocket to open...");
+-        err = chiaki_cond_wait(&session->state_cond, &session->state_mutex);
+-        assert(err == CHIAKI_ERR_SUCCESS);
++        err = chiaki_cond_timedwait(&session->state_cond, &session->state_mutex,
++            SESSION_CREATION_TIMEOUT_SEC * 1000);
++        if(err == CHIAKI_ERR_TIMEOUT)
++        {
++            ws_wait_timed_out = true;
++            break;
++        }
++
++        chiaki_mutex_unlock(&session->state_mutex);
++        chiaki_mutex_lock(&session->stop_mutex);
++        bool should_stop = session->main_should_stop;
++        chiaki_mutex_unlock(&session->stop_mutex);
++        chiaki_mutex_lock(&session->state_mutex);
++        if(should_stop)
++            break;
+     }
++    bool ws_open = (session->state & SESSION_STATE_WS_OPEN) != 0;
+     chiaki_mutex_unlock(&session->state_mutex);
+ 
++    if(ws_wait_timed_out)
++    {
++        CHIAKI_LOGE(session->log, "chiaki_holepunch_session_create: Timed out after %d seconds waiting for the push notification websocket to open", SESSION_CREATION_TIMEOUT_SEC);
++        stop_websocket_thread(session);
++        return CHIAKI_ERR_TIMEOUT;
++    }
++
+     chiaki_mutex_lock(&session->stop_mutex);
+     if(session->main_should_stop)
+     {
+@@ -933,6 +988,12 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_holepunch_session_create(Session* session)
+         return err;
+     }
+     chiaki_mutex_unlock(&session->stop_mutex);
++
++    if(!ws_open)
++    {
++        CHIAKI_LOGE(session->log, "chiaki_holepunch_session_create: Push notification websocket failed to open");
++        return CHIAKI_ERR_NETWORK;
++    }
+     err = http_create_session(session);
+     if (err != CHIAKI_ERR_SUCCESS)
+         return err;
+@@ -1719,6 +1780,17 @@ CHIAKI_EXPORT void chiaki_holepunch_session_force_port_guessing(Session *session
+     session->force_port_guessing = enabled;
+ }
+ 
++CHIAKI_EXPORT void chiaki_holepunch_session_set_ws_fqdn_override(Session *session, const char *fqdn)
++{
++    if(session->ws_fqdn_override)
++    {
++        free(session->ws_fqdn_override);
++        session->ws_fqdn_override = NULL;
++    }
++    if(fqdn && *fqdn)
++        session->ws_fqdn_override = strdup(fqdn);
++}
++
+ CHIAKI_EXPORT void chiaki_holepunch_session_set_port_guessing_ports(Session* session, int count)
+ {
+     if(count > 0)
+@@ -1733,7 +1805,10 @@ CHIAKI_EXPORT void chiaki_holepunch_session_set_port_guessing_socks(Session* ses
+ 
+ CHIAKI_EXPORT void chiaki_holepunch_session_fini(Session* session)
+ {
+-    if(session->ws_open)
++    chiaki_mutex_lock(&session->state_mutex);
++    bool ws_open = session->ws_open;
++    chiaki_mutex_unlock(&session->state_mutex);
++    if(ws_open && session->ws_thread_created)
+     {
+         ChiakiErrorCode err = deleteSession(session);
+         if(err != CHIAKI_ERR_SUCCESS)
+@@ -1772,12 +1847,8 @@ CHIAKI_EXPORT void chiaki_holepunch_session_fini(Session* session)
+             }
+             clear_notification(session, notif);
+         }
+-        chiaki_mutex_lock(&session->stop_mutex);
+-        session->ws_thread_should_stop = true;
+-        chiaki_mutex_unlock(&session->stop_mutex);
+-        chiaki_stop_pipe_stop(&session->select_pipe);
+-        chiaki_thread_join(&session->ws_thread, NULL);
+     }
++    stop_websocket_thread(session);
+     if(session->upnp_thread_running)
+     {
+         CHIAKI_LOGI(session->log, "Waiting for UPnP discovery thread to finish...");
+@@ -1813,6 +1884,8 @@ CHIAKI_EXPORT void chiaki_holepunch_session_fini(Session* session)
+         curl_share_cleanup(session->curl_share);
+     if (session->ws_fqdn)
+         free(session->ws_fqdn);
++    if (session->ws_fqdn_override)
++        free(session->ws_fqdn_override);
+     if (session->ws_notification_queue)
+     {
+         chiaki_mutex_lock(&session->notif_mutex);
+@@ -2062,8 +2135,29 @@ static void random_uuidv4(char* out)
+  *
+  * @param user Pointer to the session context
+ */
++static bool websocket_recovery_canceled(void *user)
++{
++    Session *session = user;
++    chiaki_mutex_lock(&session->stop_mutex);
++    bool stop = session->ws_thread_should_stop || session->main_should_stop;
++    chiaki_mutex_unlock(&session->stop_mutex);
++    return stop;
++}
++
++static int websocket_transfer_progress(void *user, curl_off_t total_down, curl_off_t down,
++    curl_off_t total_up, curl_off_t up)
++{
++    (void)total_down; (void)down; (void)total_up; (void)up;
++    return chiaki_aia_should_stop(user) ? 1 : 0;
++}
++
+ static void* websocket_thread_func(void *user) {
+     Session* session = (Session*) user;
++    ChiakiAiaControl recovery_control = {
++        .canceled = websocket_recovery_canceled,
++        .user = session,
++        .deadline_ms = chiaki_time_now_monotonic_ms() + SESSION_CREATION_TIMEOUT_SEC * 1000,
++    };
+     chiaki_thread_set_affinity(CHIAKI_THREAD_NAME_HOLEPUNCH);
+ 
+     char ws_url[128] = {0};
+@@ -2076,6 +2170,11 @@ static void* websocket_thread_func(void *user) {
+         return NULL;
+     }
+     struct curl_slist *headers = NULL;
++    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
++    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, websocket_transfer_progress);
++    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &recovery_control);
++    recovery_control.connection = curl;
++    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, (long)SESSION_CREATION_TIMEOUT_SEC);
+     headers = curl_slist_append(headers, session->oauth_header);
+     headers = curl_slist_append(headers, "Sec-WebSocket-Protocol: np-pushpacket");
+     headers = curl_slist_append(headers, "User-Agent: WebSocket++/0.8.2");
+@@ -2101,11 +2200,145 @@ static void* websocket_thread_func(void *user) {
+     res = curl_easy_setopt(curl, CURLOPT_URL, ws_url);
+     if(res != CURLE_OK)
+         CHIAKI_LOGW(session->log, "websocket_thread_func: CURL setopt CURLOPT_URL failed with CURL error %s", curl_easy_strerror(res));
++    curl_easy_setopt(curl, CURLOPT_CERTINFO, 1L);
+     res = curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 2L);
+     if(res != CURLE_OK)
+         CHIAKI_LOGW(session->log, "websocket_thread_func: CURL setopt CURLOPT_CONNECT_ONLY failed with CURL error %s", curl_easy_strerror(res));
++    bool aia_attempted = false;
++    bool aia_blob_supported =
++        curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, NULL) == CURLE_OK;
++    const curl_version_info_data *curl_version = curl_version_info(CURLVERSION_NOW);
++    bool schannel_aia = false;
++    if(curl_version && curl_version->ssl_version && strstr(curl_version->ssl_version, "Schannel"))
++    {
++#ifdef CHIAKI_CURL_SCHANNEL_AIA
++        schannel_aia = true;
++        CHIAKI_LOGI(session->log, "websocket_thread_func: Schannel AIA recovery uses untrusted issuers and native Windows roots");
++#else
++        // Schannel treats CAINFO_BLOB as an exclusive root store. Keep native
++        // verification until recovered issuers can be supplied as untrusted data.
++        aia_blob_supported = false;
++        CHIAKI_LOGI(session->log, "websocket_thread_func: custom chain recovery disabled for Schannel to preserve Windows certificate trust");
++#endif
++    }
++#ifdef CHIAKI_LIB_ENABLE_MBEDTLS
++    // Certificate-chain recovery currently requires the OpenSSL implementation.
++    aia_blob_supported = false;
++#endif
++    if(!aia_blob_supported)
++        CHIAKI_LOGW(session->log, "websocket_thread_func: custom chain repair unavailable for this TLS backend");
++
++ws_connect_attempt:
++    if(chiaki_aia_should_stop(&recovery_control)) {
++        res = CURLE_ABORTED_BY_CALLBACK;
++        goto ws_after_recovery;
++    }
++    {
++        size_t aia_blob_len = 0;
++        char *aia_blob = NULL;
++        if(aia_blob_supported && chiaki_aia_blob_len() > 0)
++        {
++            if(schannel_aia)
++                aia_blob = chiaki_aia_blob_take(&aia_blob_len);
++            else {
++                const char *ca_path = NULL;
++                CURLcode ca_info_res = curl_easy_getinfo(curl, CURLINFO_CAINFO, &ca_path);
++                FILE *ca_file = ca_path ? fopen(ca_path, "rb") : NULL;
++                if(ca_info_res == CURLE_OK && (!ca_path || ca_file))
++                    aia_blob = chiaki_aia_blob_with_ca(ca_file, &aia_blob_len);
++                if(ca_file)
++                    fclose(ca_file);
++            }
++            if(!aia_blob)
++            {
++                CHIAKI_LOGW(session->log, "websocket_thread_func: cannot preserve the configured CA bundle, skipping chain repair");
++                aia_blob_supported = false;
++            }
++        }
++        if(aia_blob)
++        {
++            struct curl_blob ca_blob;
++            ca_blob.data = aia_blob;
++            ca_blob.len = aia_blob_len;
++            ca_blob.flags = CURL_BLOB_COPY;
++            // Cached intermediates must not terminate verification before a root.
++            long ssl_options = CURLSSLOPT_NO_PARTIALCHAIN;
++#ifdef CHIAKI_CURL_SCHANNEL_AIA
++            if(schannel_aia)
++                ssl_options |= CURLSSLOPT_SCHANNEL_AIA;
++#endif
++            CURLcode blob_res = curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, ssl_options);
++            if(blob_res == CURLE_OK)
++                blob_res = curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &ca_blob);
++            if(blob_res != CURLE_OK)
++            {
++                CHIAKI_LOGE(session->log, "websocket_thread_func: could not apply the repaired chain: %s",
++                    curl_easy_strerror(blob_res));
++                aia_blob_supported = false;
++            }
++            free(aia_blob);
++        }
++    }
++    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
++    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
++    CHIAKI_LOGI(session->log, "websocket_thread_func: connecting to %s with peer verification ENABLED (aia blob %zu bytes, gen %u)",
++        session->ws_fqdn, chiaki_aia_blob_len(), chiaki_aia_blob_generation());
+ 
+     res = curl_easy_perform(curl);
++
++    if(res != CURLE_OK && res != CURLE_HTTP_RETURNED_ERROR && !aia_attempted && !aia_blob_supported)
++    {
++        aia_attempted = true;
++        CHIAKI_LOGE(session->log, "websocket_thread_func: %s failed; custom certificate chain repair is disabled or unavailable, keeping the original TLS trust configuration",
++            session->ws_fqdn);
++    }
++    else if(res != CURLE_OK && res != CURLE_HTTP_RETURNED_ERROR && !aia_attempted)
++    {
++        aia_attempted = true;
++
++        long verify_result = 0;
++        curl_easy_getinfo(curl, CURLINFO_SSL_VERIFYRESULT, &verify_result);
++        bool certificate_failure =
++            res == CURLE_PEER_FAILED_VERIFICATION ||
++            res == CURLE_SSL_CERTPROBLEM ||
++            res == CURLE_SSL_CACERT ||
++            verify_result != 0;
++
++        if(!certificate_failure)
++        {
++            CHIAKI_LOGE(session->log, "websocket_thread_func: %s failed with %s, not a certificate problem, not attempting chain recovery",
++                session->ws_fqdn, curl_easy_strerror(res));
++            goto ws_after_recovery;
++        }
++
++        uint8_t *leaf_der = NULL;
++        size_t leaf_len = 0;
++        if(!chiaki_aia_peek_leaf(session->ws_fqdn, &leaf_der, &leaf_len, session->log, &recovery_control))
++            CHIAKI_LOGE(session->log, "websocket_thread_func: %s served no certificate to walk from", session->ws_fqdn);
++        else
++        {
++            char *recovered = NULL;
++            size_t recovered_len = 0;
++            ChiakiErrorCode aia_err = chiaki_aia_recover(leaf_der, leaf_len,
++                &recovered, &recovered_len, session->log, &recovery_control);
++            free(leaf_der);
++
++            if(aia_err == CHIAKI_ERR_SUCCESS && recovered)
++            {
++                bool cached = chiaki_aia_blob_add_pem(recovered, recovered_len);
++                free(recovered);
++                if(cached)
++                    goto ws_connect_attempt;
++            }
++            else
++                free(recovered);
++        }
++
++        CHIAKI_LOGE(session->log, "websocket_thread_func: chain recovery failed for %s, failing closed", session->ws_fqdn);
++    }
++
++ws_after_recovery:
++
+     curl_slist_free_all(headers);
+     if (res != CURLE_OK)
+     {
+@@ -2119,10 +2352,10 @@ static void* websocket_thread_func(void *user) {
+         }
+         goto cleanup;
+     }
+-    session->ws_open = true;
+     CHIAKI_LOGV(session->log, "websocket_thread_func: Connected to push notification WebSocket %s", ws_url);
+     ChiakiErrorCode err = chiaki_mutex_lock(&session->state_mutex);
+     assert(err == CHIAKI_ERR_SUCCESS);
++    session->ws_open = true;
+     session->state |= SESSION_STATE_WS_OPEN;
+     log_session_state(session);
+     err = chiaki_cond_signal(&session->state_cond);
+@@ -2298,12 +2531,36 @@ static void* websocket_thread_func(void *user) {
+                 }
+                 session_message_free(msg);
+             }
++            bool session_deleted = false;
++            if (notif->type == NOTIFICATION_TYPE_SESSION_DELETED)
++            {
++                const char *deleted_id = NULL;
++                json_object *body_json = NULL, *data_json = NULL, *sid_json = NULL;
++                if(notif->json
++                    && json_object_object_get_ex(notif->json, "body", &body_json)
++                    && json_object_object_get_ex(body_json, "data", &data_json)
++                    && json_object_object_get_ex(data_json, "sessionId", &sid_json)
++                    && json_object_is_type(sid_json, json_type_string))
++                {
++                    deleted_id = json_object_get_string(sid_json);
++                }
++
++                if(deleted_id && session->session_id[0]
++                    && strcmp(deleted_id, session->session_id) != 0)
++                {
++                    CHIAKI_LOGI(session->log, "websocket_thread_func: ignoring deletion of unrelated session %s (ours is %s)",
++                        deleted_id, session->session_id);
++                }
++                else
++                    session_deleted = true;
++            }
++            // Publishing transfers ownership to consumers, which may free notif immediately.
+             ChiakiErrorCode mutex_err = chiaki_mutex_lock(&session->notif_mutex);
+             assert(mutex_err == CHIAKI_ERR_SUCCESS);
+             enqueueNq(session->ws_notification_queue, notif);
+             chiaki_cond_signal(&session->notif_cond);
+             chiaki_mutex_unlock(&session->notif_mutex);
+-            if (notif->type == NOTIFICATION_TYPE_SESSION_DELETED)
++            if (session_deleted)
+             {
+                 CHIAKI_LOGI(session->log, "websocket_thread_func: Holepunch session was deleted on PSN server, exiting....");
+                 goto cleanup_json;
+@@ -2316,7 +2573,14 @@ cleanup_json:
+     free(buf);
+ cleanup:
+     curl_easy_cleanup(curl);
++    chiaki_mutex_lock(&session->state_mutex);
+     session->ws_open = false;
++    if(!(session->state & SESSION_STATE_WS_OPEN))
++    {
++        session->state |= SESSION_STATE_WS_FAILED;
++        chiaki_cond_signal(&session->state_cond);
++    }
++    chiaki_mutex_unlock(&session->state_mutex);
+ 
+     return NULL;
+ }

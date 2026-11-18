@@ -1,0 +1,24 @@
+diff --git a/android/app/src/main/java/com/metallic/chiaki/common/LogManager.kt b/android/app/src/main/java/com/metallic/chiaki/common/LogManager.kt
+--- a/android/app/src/main/java/com/metallic/chiaki/common/LogManager.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/common/LogManager.kt
+@@ -3,13 +3,19 @@
+ package com.metallic.chiaki.common
+ 
+ import android.content.Context
++import com.metallic.chiaki.BuildConfig
+ import java.io.File
+ import java.io.FilenameFilter
+ import java.text.SimpleDateFormat
+ import java.util.*
+ import java.util.regex.Pattern
+ 
+-val fileProviderAuthority = "com.metallic.chiaki.fileprovider"
++// Autoridade de ContentProvider e unica no aparelho inteiro, nao por pacote:
++// duas instalacoes que declarem a mesma nao coexistem, e a segunda e recusada
++// na instalacao. Enquanto isto era a constante do chiaki, quem ja tinha o
++// Chiaki carregado por fora esbarrava nisso ao instalar o P5M e precisava
++// desinstalar o outro app antes. Derivar do applicationId elimina a colisao.
++val fileProviderAuthority = BuildConfig.APPLICATION_ID + ".fileprovider"
+ private const val baseDirName = "session_logs" // must be in sync with filepaths.xml
+ private val dateFormat = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss-SSS", Locale.US)
+ private const val filePrefix = "chiaki_session_"

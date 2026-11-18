@@ -14,7 +14,6 @@ import android.webkit.CookieManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -57,12 +56,14 @@ class PsnRemoteActivity: Activity()
 		super.onCreate(savedInstanceState)
 		root = LinearLayout(this).apply {
 			orientation = LinearLayout.VERTICAL
-			gravity = Gravity.CENTER_HORIZONTAL
-			setBackgroundColor(BACKGROUND)
-			setPadding(64, 64, 64, 64)
+			// O visual de todas as telas, em Estilo (dev.213). Esta era a unica
+			// com o Button padrao do Android, sem contorno de foco: com o
+			// controle nao se via o que estava selecionado.
+			setPadding(Estilo.dp(context, 24), Estilo.dp(context, 20),
+					Estilo.dp(context, 24), Estilo.dp(context, 20))
 		}
 		scroll = ScrollView(this).apply {
-			setBackgroundColor(BACKGROUND)
+			background = Estilo.fundoDaTela()
 			addView(root)
 		}
 		showHome()
@@ -85,12 +86,27 @@ class PsnRemoteActivity: Activity()
 		// ligado num aparelho de uso doméstico é risco sem contrapartida.
 		relay?.stop()
 		relay = null
+		destruirWeb(web)
+		web = null
+	}
+
+	/**
+	 * Solta o WebView de verdade. Só desligar a referência deixava cada ida e
+	 * volta ao login com um WebView vivo -- JavaScript, armazenamento e os
+	 * cookies da Sony -- até o processo morrer.
+	 */
+	private fun destruirWeb(w: WebView?)
+	{
+		w ?: return
+		(w.parent as? android.view.ViewGroup)?.removeView(w)
+		w.destroy()
 	}
 
 	// ---------------------------------------------------------------- telas
 
 	private fun showHome()
 	{
+		destruirWeb(web)
 		web = null
 		root.removeAllViews()
 		setContentView(scroll)
@@ -103,10 +119,9 @@ class PsnRemoteActivity: Activity()
 				"through your PSN account, which works from anywhere."))
 
 		status = TextView(this).apply {
-			setTextColor(Color.parseColor("#9aa0a6"))
-			setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-			gravity = Gravity.CENTER
-			setPadding(0, 16, 0, 16)
+			setTextColor(Estilo.SECUNDARIO)
+			setTextSize(TypedValue.COMPLEX_UNIT_SP, Estilo.TAM_APOIO)
+			setPadding(Estilo.dp(context, 4), Estilo.dp(context, 8), 0, Estilo.dp(context, 8))
 		}
 		root.addView(status)
 
@@ -159,10 +174,9 @@ class PsnRemoteActivity: Activity()
 		val endereco = ponte.shortAddress
 
 		status = TextView(this).apply {
-			setTextColor(Color.parseColor("#9aa0a6"))
-			setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-			gravity = Gravity.CENTER
-			setPadding(0, 8, 0, 8)
+			setTextColor(Estilo.SECUNDARIO)
+			setTextSize(TypedValue.COMPLEX_UNIT_SP, Estilo.TAM_APOIO)
+			setPadding(Estilo.dp(context, 4), Estilo.dp(context, 8), 0, Estilo.dp(context, 8))
 		}
 
 		if(dePe && endereco != null && !endereco.startsWith("?"))
@@ -200,7 +214,11 @@ class PsnRemoteActivity: Activity()
 			// proprio, e um `hint = ...` dentro de apply e ambiguidade a toa.
 			setHint("https://remoteplay.dl.playstation.net/...")
 			setTextColor(Color.WHITE)
-			setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+			setHintTextColor(Estilo.SECAO)
+			setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+			background = Estilo.vidro(context, 1)
+			val p = Estilo.dp(context, 14)
+			setPadding(p, p, p, p)
 			layoutParams = LinearLayout.LayoutParams(
 				LinearLayout.LayoutParams.MATCH_PARENT,
 				LinearLayout.LayoutParams.WRAP_CONTENT)
@@ -234,7 +252,7 @@ class PsnRemoteActivity: Activity()
 		root.addView(title("Remote connection"))
 		status = TextView(this).apply {
 			text = "Finishing the sign-in…"
-			setTextColor(Color.parseColor("#9aa0a6"))
+			setTextColor(Estilo.SECUNDARIO)
 			setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
 			gravity = Gravity.CENTER
 		}
@@ -333,7 +351,11 @@ class PsnRemoteActivity: Activity()
 			return true
 		}
 		Log.i(TAG, "PSN: authorization code received")
+		// Fora deste callback: destruir o WebView de dentro de um método dele
+		// é pedir para ele terminar o método sobre si mesmo destruído.
+		val usado = web
 		web = null
+		ui.post { destruirWeb(usado) }
 		concludeLogin(code)
 		return true
 	}
@@ -461,36 +483,24 @@ class PsnRemoteActivity: Activity()
 		return null
 	}
 
-	private fun title(text: String) = TextView(this).apply {
-		this.text = text
-		setTextColor(Color.WHITE)
-		setTextSize(TypedValue.COMPLEX_UNIT_SP, 28f)
-		gravity = Gravity.CENTER
-		setTypeface(typeface, Typeface.BOLD)
-		setPadding(0, 0, 0, 16)
+	/** A marca e o nome da tela, como no topo de todas as outras. */
+	private fun title(text: String) = Estilo.marca(this, text, 26f).apply {
+		setPadding(0, 0, 0, Estilo.dp(context, 14))
 	}
 
-	private fun hint(text: String) = TextView(this).apply {
-		this.text = text
-		setTextColor(Color.parseColor("#9aa0a6"))
-		setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-		gravity = Gravity.CENTER
-		setPadding(0, 8, 0, 24)
+	private fun hint(text: String) = Estilo.apoio(this, text).apply {
+		setPadding(Estilo.dp(context, 4), Estilo.dp(context, 4), Estilo.dp(context, 4), Estilo.dp(context, 16))
 	}
 
-	private fun bigButton(label: String, onClick: () -> Unit) = Button(this).apply {
-		text = label
-		setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
-		setOnClickListener { onClick() }
+	private fun bigButton(label: String, onClick: () -> Unit) = Estilo.botao(this, label, onClick).apply {
 		layoutParams = LinearLayout.LayoutParams(
 			LinearLayout.LayoutParams.MATCH_PARENT,
 			LinearLayout.LayoutParams.WRAP_CONTENT
-		).apply { setMargins(0, 12, 0, 12) }
+		).apply { setMargins(0, Estilo.dp(context, 6), 0, Estilo.dp(context, 6)) }
 	}
 
 	companion object
 	{
 		private const val TAG = "P5MVR"
-		private val BACKGROUND = Color.parseColor("#101014")
 	}
 }

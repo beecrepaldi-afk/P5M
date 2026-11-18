@@ -1,0 +1,130 @@
+--- a/android/app/src/main/cpp/audio-output.cpp
++++ b/android/app/src/main/cpp/audio-output.cpp
+@@ -104,6 +104,15 @@
+ 	std::atomic<uint32_t> p5m_trimmed_ms{0};
+ 	std::atomic<uint32_t> p5m_underruns{0};
+ 
++	// P5M: o sistema parou de pedir som (headset fora da cabeca, app em
++	// segundo plano) e o console segue mandando. Sem isto o buffer enchia em
++	// 170 ms e cada pacote seguinte virava um aviso de estouro -- mil por
++	// janela de dez segundos, afogando o diario -- e na volta o que tocava
++	// primeiro era o som velho de antes da pausa.
++	std::atomic<uint64_t> p5m_last_pull_ns{0};
++	std::atomic<uint32_t> p5m_paused_drops{0};
++	bool p5m_paused_logged = false; // so na thread de entrega
++
+ 	AudioOutput() : stream_callback(this) {}
+ };
+ 
+@@ -192,15 +201,34 @@
+ 	auto ao = reinterpret_cast<AudioOutput *>(audio_output);
+ 
+ 	size_t buf_size = samples_count * sizeof(int16_t);
+-	size_t pushed = ao->buf.Push(reinterpret_cast<uint8_t *>(buf), buf_size);
+-	ao->p5m_pushed.fetch_add(pushed, std::memory_order_relaxed);
+-	if(pushed < buf_size)
++	const uint64_t agora = p5m_now_ns();
++
++	// P5M: 250 ms sem o sistema pedir som e a saida parada, nao atrasada --
++	// o callback do Oboe roda a cada poucos milissegundos enquanto toca.
++	const uint64_t ultimo_pedido = ao->p5m_last_pull_ns.load(std::memory_order_relaxed);
++	const bool parada = ultimo_pedido != 0 && agora - ultimo_pedido > 250000000ULL;
++	if(parada)
+ 	{
+-		CHIAKI_LOGW(ao->log, "Audio Output Buffer Overflow!");
+-		ao->p5m_overflows++;
++		if(!ao->p5m_paused_logged)
++		{
++			ao->p5m_paused_logged = true;
++			__android_log_print(ANDROID_LOG_INFO, "P5MVR",
++					"Audio: the system stopped pulling sound (stream paused); dropping it until playback resumes");
++		}
++		ao->p5m_paused_drops.fetch_add(1, std::memory_order_relaxed);
+ 	}
++	else
++	{
++		ao->p5m_paused_logged = false;
++		size_t pushed = ao->buf.Push(reinterpret_cast<uint8_t *>(buf), buf_size);
++		ao->p5m_pushed.fetch_add(pushed, std::memory_order_relaxed);
++		if(pushed < buf_size)
++		{
++			CHIAKI_LOGW(ao->log, "Audio Output Buffer Overflow!");
++			ao->p5m_overflows++;
++		}
++	}
+ 
+-	const uint64_t agora = p5m_now_ns();
+ 	if(ao->p5m_window_ns == 0)
+ 		ao->p5m_window_ns = agora;
+ 	else if(agora - ao->p5m_window_ns >= 10000000000ULL)
+@@ -211,10 +239,10 @@
+ 		const uint32_t nivel_min = ao->p5m_level_min_us.exchange(UINT32_MAX);
+ 		const uint32_t nivel_max = ao->p5m_level_max_us.exchange(0);
+ 		__android_log_print(ANDROID_LOG_INFO, "P5MVR",
+-				"Audio 10s: %u buffer overruns, %u underruns | waiting in the buffer %.1f..%.1f ms | trimmed %u ms",
++				"Audio 10s: %u buffer overruns, %u underruns | waiting in the buffer %.1f..%.1f ms | trimmed %u ms | %u packets dropped while paused",
+ 				ao->p5m_overflows, ao->p5m_underruns.exchange(0),
+ 				nivel_min == UINT32_MAX ? 0.0 : nivel_min / 1000.0, nivel_max / 1000.0,
+-				ao->p5m_trimmed_ms.exchange(0));
++				ao->p5m_trimmed_ms.exchange(0), ao->p5m_paused_drops.exchange(0));
+ 		ao->p5m_overflows = 0;
+ 		ao->p5m_window_ns = agora;
+ 	}
+@@ -286,6 +314,23 @@
+ 	size_t buf_size_requested = static_cast<size_t>(bytes_per_frame * num_frames);
+ 	auto buf = reinterpret_cast<uint8_t *>(audio_data);
+ 
++	// P5M: voltando de uma pausa, o que esta no buffer e som de antes dela.
++	// Quem esvazia e este lado, o que consome -- o buffer e de um produtor e
++	// um consumidor, e o produtor nao pode mexer no lado de ca.
++	const uint64_t agora_pedido = p5m_now_ns();
++	const uint64_t pedido_anterior = audio_output->p5m_last_pull_ns.exchange(agora_pedido, std::memory_order_relaxed);
++	if(pedido_anterior != 0 && agora_pedido - pedido_anterior > 250000000ULL)
++	{
++		uint8_t lixo[1024];
++		size_t velho = 0, saiu;
++		while((saiu = audio_output->buf.Pop(lixo, sizeof(lixo))) > 0)
++			velho += saiu;
++		audio_output->p5m_popped.fetch_add(velho, std::memory_order_relaxed);
++		__android_log_print(ANDROID_LOG_INFO, "P5MVR",
++				"Audio: playback resumed after %llu ms; %zu bytes of sound from before the pause dropped",
++				(unsigned long long)((agora_pedido - pedido_anterior) / 1000000ULL), velho);
++	}
++
+ 	size_t buf_size_delivered = audio_output->buf.Pop(buf, buf_size_requested);
+ 	//CHIAKI_LOGW(audio_output->log, "Delivered %llu", (unsigned long long)buf_size_delivered);
+ 	p5m_trim_audio(audio_output, stream, buf_size_delivered);
+--- a/android/app/src/main/cpp/video-decoder.c
++++ b/android/app/src/main/cpp/video-decoder.c
+@@ -153,7 +153,17 @@
+ 
+ 	// Sem o mutex, porque a thread de saida precisa dele para ler o
+ 	// shutdown_output e perceber que e hora de sair.
+-	chiaki_thread_join(&decoder->output_thread, NULL);
++	//
++	// P5M: com prazo so para o diario. Ela nao pode ser abandonada como a do
++	// audio (usa o decodificador inteiro, que e liberado logo depois), entao
++	// a espera continua -- mas se passar de 1 s, a linha diz onde parou, em
++	// vez de o encerramento sumir sem rastro.
++	if(chiaki_thread_timedjoin(&decoder->output_thread, NULL, 1000) != CHIAKI_ERR_SUCCESS)
++	{
++		__android_log_print(ANDROID_LOG_WARN, "P5MVR",
++				"Video decoder release: the output thread has not exited after 1 s; still waiting for it");
++		chiaki_thread_join(&decoder->output_thread, NULL);
++	}
+ 
+ 	chiaki_mutex_lock(&decoder->codec_mutex);
+ 	AMediaCodec_delete(decoder->codec);
+@@ -560,7 +570,11 @@
+ 	while(1)
+ 	{
+ 		AMediaCodecBufferInfo info;
+-		ssize_t status = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, -1);
++		// P5M: 100 ms, e nao sem prazo. Quadro pronto volta na hora do mesmo
++		// jeito; a diferenca e que, sem quadro, a thread acorda sozinha para
++		// ver o shutdown_output, em vez de depender do AMediaCodec_stop a
++		// tirar de dentro da espera.
++		ssize_t status = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, 100 * 1000);
+ 		// P5M: o formato real so e conhecido depois que o codec decide, e sem
+ 		// ele nao da para saber se o Main10 pedido foi aceito ou se o codec caiu
+ 		// para 8 bits em silencio -- nem se o mapeamento de tons aconteceu. Uma

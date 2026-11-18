@@ -1,0 +1,189 @@
+diff --git a/android/app/src/main/java/com/metallic/chiaki/main/MainActivity.kt b/android/app/src/main/java/com/metallic/chiaki/main/MainActivity.kt
+index be895da..f4e8651 100644
+--- a/android/app/src/main/java/com/metallic/chiaki/main/MainActivity.kt
++++ b/android/app/src/main/java/com/metallic/chiaki/main/MainActivity.kt
+@@ -53,6 +53,9 @@ class MainActivity : AppCompatActivity()
+ 
+ 		binding.registerButton.setOnClickListener { showRegistration() }
+ 		binding.registerLabelButton.setOnClickListener { showRegistration() }
++		// P5M: os mesmos dois caminhos, em cartoes a vista (dev.213).
++		binding.p5mRegistrar.setOnClickListener { showRegistration() }
++		binding.p5mManual.setOnClickListener { addManualConsole() }
+ 
+ 		viewModel = ViewModelProvider(this, viewModelFactory { MainViewModel(getDatabase(this), Preferences(this)) })
+ 			.get(MainViewModel::class.java)
+diff --git a/android/app/src/main/res/layout/activity_main.xml b/android/app/src/main/res/layout/activity_main.xml
+index 7f33cfc..281c263 100644
+--- a/android/app/src/main/res/layout/activity_main.xml
++++ b/android/app/src/main/res/layout/activity_main.xml
+@@ -137,29 +137,107 @@
+         app:srcCompat="@drawable/selector_add_fab"
+         android:layout_margin="16dp"
+         android:layout_gravity="bottom|end"
++        android:visibility="gone"
+         app:fabSize="normal" />
+ 
++    <!-- P5M: os dois caminhos do botao flutuante, em cartoes de vidro a vista.
++         O botao flutuante abria um mini-menu pensado para o dedo, e com o
++         controle o registro ficava escondido (revisao de design, dev.213). -->
++    <LinearLayout
++        android:id="@+id/p5mAcoes"
++        android:layout_width="match_parent"
++        android:layout_height="wrap_content"
++        android:layout_gravity="bottom"
++        android:orientation="horizontal"
++        android:padding="16dp">
++
++        <TextView
++            android:id="@+id/p5mRegistrar"
++            android:layout_width="0dp"
++            android:layout_height="wrap_content"
++            android:layout_weight="1"
++            android:layout_marginEnd="8dp"
++            android:background="@drawable/p5m_vidro"
++            android:focusable="true"
++            android:clickable="true"
++            android:gravity="center"
++            android:minHeight="52dp"
++            android:padding="14dp"
++            android:text="Register a console"
++            android:textColor="#FFFFFF"
++            android:textSize="18sp"
++            android:fontFamily="sans-serif-medium" />
++
++        <TextView
++            android:id="@+id/p5mManual"
++            android:layout_width="0dp"
++            android:layout_height="wrap_content"
++            android:layout_weight="1"
++            android:layout_marginStart="8dp"
++            android:background="@drawable/p5m_vidro"
++            android:focusable="true"
++            android:clickable="true"
++            android:gravity="center"
++            android:minHeight="52dp"
++            android:padding="14dp"
++            android:text="Add by address"
++            android:textColor="#FFFFFF"
++            android:textSize="18sp"
++            android:fontFamily="sans-serif-medium" />
++    </LinearLayout>
++
+ 
+     <com.google.android.material.appbar.AppBarLayout
+         android:id="@+id/appBarLayout"
+         android:layout_height="wrap_content"
+-        android:layout_width="match_parent">
++        android:layout_width="match_parent"
++        android:background="@android:color/transparent"
++        app:elevation="0dp">
+         <com.google.android.material.appbar.MaterialToolbar
+             android:id="@+id/toolbar"
+             android:layout_height="wrap_content"
+             android:layout_width="match_parent"
+-            android:background="?attr/colorPrimarySurface"
++            android:background="@android:color/transparent"
+             app:layout_scrollFlags="scroll|enterAlways"
+             android:theme="@style/AppTheme.Toolbar">
+ 
+-            <androidx.appcompat.widget.AppCompatTextView
++            <!-- P5M: a marca, como no topo das telas do lancador. -->
++            <LinearLayout
+                 android:layout_width="wrap_content"
+                 android:layout_height="wrap_content"
+-                android:layout_gravity="center"
+-                android:fontFamily="sans-serif-condensed"
+-                android:text="@string/title_main"
+-                android:textColor="?attr/colorOnPrimary"
+-                android:textSize="20dp" />
++                android:layout_gravity="start|center_vertical"
++                android:gravity="center_vertical"
++                android:orientation="horizontal">
++
++                <ImageView
++                    android:layout_width="36dp"
++                    android:layout_height="36dp"
++                    android:layout_marginEnd="12dp"
++                    android:src="@mipmap/ic_p5m" />
++
++                <androidx.appcompat.widget.AppCompatTextView
++                    android:layout_width="wrap_content"
++                    android:layout_height="wrap_content"
++                    android:text="@string/title_main"
++                    android:textColor="#FFFFFF"
++                    android:textStyle="bold"
++                    android:textSize="24sp" />
++
++                <View
++                    android:layout_width="1dp"
++                    android:layout_height="22dp"
++                    android:layout_marginStart="14dp"
++                    android:layout_marginEnd="14dp"
++                    android:background="#46FFFFFF" />
++
++                <androidx.appcompat.widget.AppCompatTextView
++                    android:layout_width="wrap_content"
++                    android:layout_height="wrap_content"
++                    android:fontFamily="sans-serif-light"
++                    android:text="Consoles"
++                    android:textColor="#A9B1BF"
++                    android:textSize="20sp" />
++            </LinearLayout>
+ 
+         </com.google.android.material.appbar.MaterialToolbar>
+     </com.google.android.material.appbar.AppBarLayout>
+diff --git a/android/app/src/main/res/layout/item_display_host.xml b/android/app/src/main/res/layout/item_display_host.xml
+index 116e0bd..7ec3e3d 100644
+--- a/android/app/src/main/res/layout/item_display_host.xml
++++ b/android/app/src/main/res/layout/item_display_host.xml
+@@ -6,12 +6,14 @@
+     xmlns:tools="http://schemas.android.com/tools"
+     android:layout_width="match_parent"
+     android:layout_height="250dp"
+-    app:cardCornerRadius="4dp"
++    app:cardCornerRadius="18dp"
++    app:cardBackgroundColor="#1CFFFFFF"
++    app:cardElevation="0dp"
+     android:layout_marginTop="8dp"
+     android:layout_marginLeft="8dp"
+     android:layout_marginRight="8dp"
+     android:layout_marginBottom="0dp"
+-    android:elevation="8dp"
++    android:elevation="0dp"
+     android:foreground="?android:attr/selectableItemBackground">
+ 
+     <FrameLayout
+diff --git a/android/app/src/main/res/values/colors.xml b/android/app/src/main/res/values/colors.xml
+index 2ee5181..f1197e6 100644
+--- a/android/app/src/main/res/values/colors.xml
++++ b/android/app/src/main/res/values/colors.xml
+@@ -1,8 +1,8 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <resources>
+-    <color name="primary">#162d50</color>
+-    <color name="primary_dark">#000128</color>
+-    <color name="accent">#ffaaee</color>
++    <color name="primary">#0A1428</color>
++    <color name="primary_dark">#05070D</color>
++    <color name="accent">#0070D1</color>
+ 
+     <color name="stream_text">@android:color/white</color>
+     <color name="stream_background">@android:color/black</color>
+diff --git a/android/app/src/main/res/values/styles.xml b/android/app/src/main/res/values/styles.xml
+index 1f632b9..8b1f406 100644
+--- a/android/app/src/main/res/values/styles.xml
++++ b/android/app/src/main/res/values/styles.xml
+@@ -5,9 +5,12 @@
+         <item name="colorAccent">@color/accent</item>
+         <item name="colorOnPrimary">#ffffff</item>
+         <item name="colorSecondary">@color/accent</item>
+-        <item name="colorOnSecondary">#000000</item>
++        <item name="colorOnSecondary">#ffffff</item>
+         <item name="android:statusBarColor">?attr/colorPrimarySurface</item>
+         <item name="android:navigationBarColor">?attr/colorPrimarySurface</item>
++        <!-- P5M: o fundo do app, o mesmo do lancador (dev.213). -->
++        <item name="android:windowBackground">@drawable/p5m_fundo</item>
++        <item name="colorSurface">#141B2B</item>
+         <item name="materialAlertDialogTheme">@style/AppTheme.AlertDialog</item>
+         <item name="alertDialogTheme">@style/AppTheme.AlertDialog.NonMaterial</item>
+ 
