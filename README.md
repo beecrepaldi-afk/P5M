@@ -6,7 +6,8 @@
 
 <p align="center">
   PS5 Remote Play in VR, on the Quest 3.<br>
-  A big screen floating in your room, with as little lag as I could squeeze out.
+  A big screen floating in your room, with as little lag as I could squeeze out,<br>
+  and 30 fps games shown at 120 Hz.
 </p>
 
 <p align="center">
@@ -46,7 +47,7 @@ chiaki-ng's Android app runs on the Quest as a floating 2D window, because it
 was written for phones. P5M throws that away and hands the video straight to
 the Horizon OS compositor, which draws it as a real screen in your room.
 
-That's about lag, not looks. The video goes:
+That's about lag, not looks. In direct mode the video goes:
 
 ```
 PS5 → network → MediaCodec → compositor swapchain → your eyes
@@ -55,27 +56,45 @@ PS5 → network → MediaCodec → compositor swapchain → your eyes
 No intermediate texture, no GPU work from the app, nothing copying frames
 around. It works because `XR_KHR_android_surface_swapchain` gives you a
 swapchain that literally *is* an `android.view.Surface`, so the hardware
-decoder writes right into the thing you're looking at.
+decoder writes right into the thing you're looking at. Frame generation, 3D and
+HDR tone mapping need the GPU, so they take a short detour through a shader,
+and only when you turn them on.
 
-Other things it does:
+### Frame generation, for the 30 fps games
+
+A lot of the big games run at 30 fps in their best looking mode, and GTA 6 is
+one of them. P5M can show those at 120 Hz. The PS5 always streams at 60 and
+fills the gaps with repeated frames; P5M tells the real frames from the repeats,
+learns the game's rhythm (30, 40, or whatever it drops to in a busy scene) and
+predicts the frames in between with the Quest's own frame extrapolation. It only
+predicts the parts of the picture that are moving, so the HUD and the still
+parts of the scene stay sharp, and it resets on a scene cut instead of smearing
+it. In immersive mode, set **Advanced > Video path** to **shader + frames**.
+
+### Everything else
 
 - A curved screen you resize, move and bend without leaving the game.
 - Passthrough on by default, so your room stays around the screen. You can dim
   it if you want the cinema feel.
-- 120 Hz panel for a 60 fps source. It's an exact multiple, so every console
-  frame gets exactly two panel frames and nothing stutters from bad math.
-- Rec.709 color, forced. Horizon OS defaults to Display P3 and it wrecks reds
-  and greens.
+- 120 Hz panel by default, with one decoded frame per panel pass, so nothing
+  stutters from bad math. 180 Hz is there too, under Advanced.
+- 3D from any game. A small depth model runs on the headset, reads the flat
+  picture and builds a second eye from it. There's a pop-out mode that brings
+  things in front of the screen.
+- 10-bit HDR with a proper tone mapper, and Rec.709 color for SDR. Horizon OS
+  defaults to Display P3 and it wrecks reds and greens.
 - MQSR sharpening through the compositor, plus a CAS shader for the cases where
   MQSR doesn't apply.
-- Fake 3D. The app guesses depth from the flat picture and builds a second eye
-  out of it. It's a guess and you can tell, but the sense of depth is real.
+- Bitrate up to 100 Mbps. Auto bitrate can lower it after a session with packet
+  loss and raise it again after clean ones, or you can switch it off and keep
+  the lowest lag.
 - The DualSense behaves like it does on the PS5: adaptive triggers, the
-  lightbar colour the game picks, your player LEDs, and the trigger and
-  vibration intensity you chose in the PS5 settings. Triggers turn off and on
-  mid-game from the settings panel (R3). Immersive mode only for now, and new
-  enough that it hasn't been tested with many games yet.
-- Remote Play over PSN, for when you're not home.
+  lightbar colour the game picks, your player LEDs, gyro, touchpad, and the
+  Quest mic for voice chat with echo cancellation. Vibration has several modes,
+  and also works on 8BitDo and Xbox pads.
+- Wake your PS5 from rest with one tap, and Remote Play over PSN for when
+  you're not home.
+- New versions show up inside the app, and install with one tap.
 - Diagnostics you can read inside the headset, because your Quest is never
   sitting next to your PC when something breaks.
 
@@ -84,7 +103,8 @@ Other things it does:
 You need a Quest 3 with developer mode on, and a PS5 (PS4 works too) with
 Remote Play enabled.
 
-1. Grab the APK from [Releases](../../releases).
+1. Grab the APK from [Releases](../../releases). Coming from 0.2.0? Uninstall
+   it once first; later versions install over it.
 2. Sideload it. SideQuest, or `adb install -r p5m.apk`. You can also just open
    the release page in the Quest browser and install the download.
 3. It shows up under **Unknown Sources** in your library.
@@ -117,14 +137,15 @@ screen will tell you that's what happened.
 
 Writing this out because a beta that hides it wastes your time:
 
-- **The 3D is guesswork.** Depth comes from things like "the ground is usually
-  at the bottom of the frame" and "far away stuff is hazier". Text and HUDs are
-  the hard part and get special handling, but 2D games and fixed camera angles
-  break the whole idea.
-- **3D makes the headset warm.** Frame times stay fine, but it heats up faster
-  and the compositor starts dropping frames on a long session.
-- **Frame pacing wobbles.** Most ten second windows deliver 590-something of
-  600 frames on time. Some drop to half that, in bursts. I don't know why yet.
+- **The 3D is still an estimate.** The depth model is much better than the old
+  rules of thumb, but it can't know what's behind things. 2D games and fixed
+  camera angles still get odd depth.
+- **3D costs latency and heat.** With 3D on, the picture reaches your eyes
+  about 15 ms later, and the headset warms up faster. With 3D and frame
+  generation together, the depth refreshes less often to keep things smooth.
+- **Frame generation guesses.** Fast, unpredictable motion can show a little
+  wobble at the edges of moving things. If it bothers you in a game, turn it
+  off; the game still runs at 30 like it would on a TV.
 - **Quest Touch controllers do nothing.** You need a real gamepad.
 - **The touchpad click is only tested on the DualSense.** The driver hands the
   touchpad over as a separate mouse device rather than a gamepad button, and
