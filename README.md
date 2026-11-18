@@ -103,11 +103,18 @@ it. In immersive mode, set **Advanced > Video path** to **shader + frames**.
 You need a Quest 3 with developer mode on, and a PS5 (PS4 works too) with
 Remote Play enabled.
 
-1. Grab the APK from [Releases](../../releases). Coming from 0.2.0? Uninstall
-   it once first; later versions install over it.
-2. Sideload it. SideQuest, or `adb install -r p5m.apk`. You can also just open
-   the release page in the Quest browser and install the download.
-3. It shows up under **Unknown Sources** in your library.
+No PC needed, it all happens in the headset:
+
+1. Open the [Releases](../../releases) page in the Quest browser and download
+   the APK.
+2. Open the **Files** app on the Quest and go to **Downloads**.
+3. Tap the three dots next to the APK and choose **Install**.
+4. P5M shows up in your library under **Unknown Sources**.
+
+After that, new versions show up inside the app and install with one tap.
+Coming from 0.2.0? Uninstall it once first; later versions install over it.
+
+Prefer a PC? SideQuest works, or `adb install -r p5m.apk`.
 
 ### Press L3 + R3 + R1 while you play
 

@@ -345,9 +345,14 @@ jobs:
 
             ## Installing
 
-            Open this page in the Quest browser and install
-            `p5m-${{ steps.version.outputs.version }}.apk`. No PC needed. From a
-            PC: `adb install -r p5m-${{ steps.version.outputs.version }}.apk`.
+            No PC needed:
+
+            1. Open this page in the Quest browser and download
+               `p5m-${{ steps.version.outputs.version }}.apk`.
+            2. Open the **Files** app on the Quest and go to **Downloads**.
+            3. Tap the three dots next to the APK and choose **Install**.
+
+            From a PC: `adb install -r p5m-${{ steps.version.outputs.version }}.apk`.
 
             It shows up in your library under **Unknown Sources**, as "P5M".
 
